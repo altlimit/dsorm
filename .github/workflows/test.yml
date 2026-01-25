@@ -14,12 +14,12 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: 1.21
+        go-version: 1.24
 
     - name: Start Services
       run: |
         cd test
-        docker-compose up -d
+        docker compose up -d
 
     - name: Wait for services
       run: sleep 10
@@ -34,4 +34,4 @@ jobs:
       if: always()
       run: |
         cd test
-        docker-compose down
+        docker compose down
