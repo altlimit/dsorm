@@ -1,3 +1,5 @@
+![Run Tests](https://github.com/altlimit/dsorm/actions/workflows/test.yml/badge.svg)
+
 # dsorm
 
 `dsorm` is a high-performance Go ORM for Google Cloud Datastore with built-in caching support (Memory, Redis, Memcache). It extends the official client with lifecycle hooks, struct tags for keys, field encryption, and a robust caching layer to minimize Datastore costs and latency.
