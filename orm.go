@@ -676,12 +676,12 @@ func (db *Client) Query(ctx context.Context, q *datastore.Query, cursor string, 
 	var v reflect.Value
 	if vals != nil {
 		v = reflect.ValueOf(vals)
-	}
-	if v.Kind() != reflect.Ptr {
-		return nil, "", fmt.Errorf("datastore.DB.Query: must be pointer type not '%v'", v.Kind())
-	}
-	if v.Elem().Kind() != reflect.Slice {
-		return nil, "", fmt.Errorf("datastore.DB.Query: must be slice type not '%v'", v.Elem().Kind())
+		if v.Kind() != reflect.Ptr {
+			return nil, "", fmt.Errorf("datastore.DB.Query: must be pointer type not '%v'", v.Kind())
+		}
+		if v.Elem().Kind() != reflect.Slice {
+			return nil, "", fmt.Errorf("datastore.DB.Query: must be slice type not '%v'", v.Elem().Kind())
+		}
 	}
 
 	if cursor != "" {
