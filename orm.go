@@ -129,6 +129,16 @@ func (b *Base) LoadKey(k *datastore.Key) error {
 					k.Namespace = p.Namespace
 				}
 				vv.Set(reflect.ValueOf(k.Parent))
+			} else if k.Parent != nil && vv.Kind() == reflect.Ptr && vv.Type().Elem().Kind() == reflect.Struct {
+				if vv.IsNil() {
+					vv.Set(reflect.New(vv.Type().Elem()))
+				}
+				if m, ok := vv.Interface().(Model); ok {
+					m.Init(b.ctx, vv.Interface())
+				}
+				if kl, ok := vv.Interface().(datastore.KeyLoader); ok {
+					kl.LoadKey(k.Parent)
+				}
 			}
 		case "ns":
 			if k.Namespace == "" {
@@ -417,7 +427,14 @@ func (db *Client) Key(val interface{}) *datastore.Key {
 				key.ID = vv.Int()
 			}
 		case "parent":
+			vv := v.Field(field.Index)
 			if p, ok := vv.Interface().(*datastore.Key); ok {
+				key.Parent = p
+				if p != nil && p.Namespace != "" {
+					key.Namespace = p.Namespace
+				}
+			} else if vv.Kind() == reflect.Ptr && !vv.IsNil() && vv.Elem().Kind() == reflect.Struct {
+				p := db.Key(vv.Interface())
 				key.Parent = p
 				if p != nil && p.Namespace != "" {
 					key.Namespace = p.Namespace

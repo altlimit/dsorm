@@ -55,7 +55,7 @@ type User struct {
     dsorm.Base
     ID        string         `model:"id"`       // Auto-used for Key Name
     Namespace string         `model:"ns"`       // Auto-used for Key Namespace
-    Parent    *datastore.Key `model:"parent"`   // Auto-used for Key Parent
+    Parent    *datastore.Key `model:"parent"`   // Auto-used for Key Parent (can also use *ParentModel)
     Username  string
     Email     string    `datastore:"email"`
     Secret    string    `encrypt:""`

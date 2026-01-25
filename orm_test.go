@@ -461,3 +461,77 @@ func TestTransactions(t *testing.T) {
 		t.Errorf("Value should not ensure updated. Got %s", m.Value)
 	}
 }
+
+type ParentModel struct {
+	dsorm.Base
+	ID string `model:"id"`
+}
+
+type ChildModel struct {
+	dsorm.Base
+	ID     string       `model:"id"`
+	Parent *ParentModel `model:"parent" datastore:"-"`
+}
+
+func TestStructParent(t *testing.T) {
+	ctx := context.Background()
+
+	parent := &ParentModel{ID: "parent-1"}
+	child := &ChildModel{
+		ID:     "child-1",
+		Parent: parent,
+	}
+
+	// Verify Key Generation
+	key := testDB.Key(child)
+	if key.Parent == nil {
+		t.Fatal("Child key should have a parent")
+	}
+	if key.Parent.Name != "parent-1" {
+		t.Errorf("Expected parent key name 'parent-1', got '%s'", key.Parent.Name)
+	}
+	if key.Parent.Kind != "ParentModel" {
+		t.Errorf("Expected parent key kind 'ParentModel', got '%s'", key.Parent.Kind)
+	}
+
+	// Save
+	if err := testDB.Put(ctx, child); err != nil {
+		t.Fatalf("Put child failed: %v", err)
+	}
+
+	// Load
+	// Wait, if I just do &ChildModel{ID: "child-1"}, the key doesn't know the parent!
+	// Datastore keys differ if parent is different.
+	// So to GET, we must supply the parent key info somehow if we are constructing the key from the struct.
+	// The testDB.Key(fetched) needs to know the parent to form the correct key.
+	// In this new model, we naturally put the parent struct in.
+
+	// To Get, we usually pass a struct. The struct must allow Key() to generate the full key.
+	// So we need to populate the Parent in the struct we are fetching into, OR we need to use a key query.
+	// Let's populate the parent in the struct we use for lookup.
+	lookup := &ChildModel{
+		ID:     "child-1",
+		Parent: &ParentModel{ID: "parent-1"},
+	}
+
+	if err := testDB.Get(ctx, lookup); err != nil {
+		t.Fatalf("Get child failed: %v", err)
+	}
+
+	// Verify loaded parent
+	// The Get() should populate lookup.Parent's key fields from the loaded Key (which is redundant but checks logic)
+	// Actually, Get() calls Load() which calls LoadKey().
+	// LoadKey() should populate the parent struct fields from the Key's parent.
+
+	// Better test: check if LoadKey worked on a fresh struct if we manually load it?
+	// But Get() writes to the struct we passed.
+
+	if lookup.Parent == nil {
+		t.Error("Loaded struct should have Parent field populated")
+	} else {
+		// Parent ID should be set from the key
+		if lookup.Parent.ID != "parent-1" {
+			t.Errorf("Loaded parent ID expected 'parent-1', got '%s'", lookup.Parent.ID)
+		}
+	}
+}
