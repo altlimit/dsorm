@@ -69,6 +69,23 @@ func (u *User) BeforeSave(ctx context.Context, m dsorm.Model) error {
     u.Namespace = "my-app" // Set defaults
     return nil
 }
+
+func (u *User) AfterSave(ctx context.Context, old dsorm.Model) error {
+    // old is nil if creating new entity
+    if old != nil {
+        oldUser := old.(*User)
+        fmt.Printf("Changed from %s to %s\n", oldUser.Username, u.Username)
+    }
+    return nil
+}
+
+func (u *User) BeforeDelete(ctx context.Context) error {
+    return nil
+}
+
+func (u *User) AfterDelete(ctx context.Context) error {
+    return nil
+}
 ```
 
 ### 3. CRUD Operations

@@ -25,9 +25,13 @@ import (
 type (
 	// Model defines the basic methods required for a struct to be managed by dsorm.
 	Model interface {
-		Init(context.Context, any)
-		InitProps([]datastore.Property)
 		IsNew() bool
+	}
+
+	modeler interface {
+		initModel(context.Context, any)
+		setInitProps([]datastore.Property)
+		getInitProps() []datastore.Property
 	}
 
 	OnLoad interface {
@@ -38,8 +42,16 @@ type (
 		BeforeSave(context.Context, Model) error
 	}
 
+	BeforeDelete interface {
+		BeforeDelete(context.Context) error
+	}
+
+	AfterDelete interface {
+		AfterDelete(context.Context) error
+	}
+
 	AfterSave interface {
-		AfterSave(context.Context) error
+		AfterSave(context.Context, Model) error
 	}
 
 	// Base provides default implementation for Model interface and common fields.
@@ -53,7 +65,7 @@ type (
 	}
 )
 
-func (b *Base) Init(ctx context.Context, e any) {
+func (b *Base) initModel(ctx context.Context, e any) {
 	b.ctx = ctx
 	if b.entity == nil {
 		b.entity = e
@@ -63,6 +75,40 @@ func (b *Base) Init(ctx context.Context, e any) {
 			kl.LoadKey(b.Key)
 		}
 	}
+}
+
+// initHelpers
+func initModel(ctx context.Context, v any) {
+	if m, ok := v.(modeler); ok {
+		m.initModel(ctx, v)
+	}
+}
+
+func reconstructOldModel(ctx context.Context, val any, k *datastore.Key) (Model, error) {
+	if m, ok := val.(Model); ok && !m.IsNew() {
+		if pg, ok := val.(modeler); ok {
+			initProps := pg.getInitProps()
+			if len(initProps) > 0 {
+				oldVal := reflect.New(reflect.ValueOf(val).Elem().Type()).Interface()
+				if oldM, ok := oldVal.(Model); ok {
+					if err := loadModel(oldVal, initProps); err != nil {
+						return nil, err
+					}
+					if om, ok := oldVal.(modeler); ok {
+						om.initModel(ctx, oldVal)
+					}
+					// LoadKey as well to ensure full state
+					if kl, ok := oldVal.(datastore.KeyLoader); ok {
+						if err := kl.LoadKey(k); err != nil {
+							return nil, err
+						}
+					}
+					return oldM, nil
+				}
+			}
+		}
+	}
+	return nil, nil
 }
 
 // Load implements datastore.PropertyLoadSaver.
@@ -82,10 +128,7 @@ func (b *Base) Save() ([]datastore.Property, error) {
 	if bs, ok := b.entity.(BeforeSave); ok {
 		val := reflect.New(reflect.ValueOf(b.entity).Elem().Type()).Interface()
 		ctx := b.ctx
-		m, ok := val.(Model)
-		if ok {
-			m.Init(ctx, val)
-		}
+		initModel(ctx, val)
 		if len(b.initProps) > 0 {
 			if err := loadModel(val, b.initProps); err != nil {
 				return nil, err
@@ -94,7 +137,7 @@ func (b *Base) Save() ([]datastore.Property, error) {
 				v.LoadKey(b.Key)
 			}
 		}
-		if err := bs.BeforeSave(ctx, m); err != nil {
+		if err := bs.BeforeSave(ctx, val.(Model)); err != nil {
 			return nil, err
 		}
 	}
@@ -133,9 +176,10 @@ func (b *Base) LoadKey(k *datastore.Key) error {
 				if vv.IsNil() {
 					vv.Set(reflect.New(vv.Type().Elem()))
 				}
-				if m, ok := vv.Interface().(Model); ok {
-					m.Init(b.ctx, vv.Interface())
+				if vv.IsNil() {
+					vv.Set(reflect.New(vv.Type().Elem()))
 				}
+				initModel(b.ctx, vv.Interface())
 				if kl, ok := vv.Interface().(datastore.KeyLoader); ok {
 					kl.LoadKey(k.Parent)
 				}
@@ -162,9 +206,13 @@ func (b *Base) LoadKey(k *datastore.Key) error {
 	return nil
 }
 
-// InitProps stores initial properties for change tracking access.
-func (b *Base) InitProps(props []datastore.Property) {
+// setInitProps stores initial properties for change tracking access.
+func (b *Base) setInitProps(props []datastore.Property) {
 	b.initProps = props
+}
+
+func (b *Base) getInitProps() []datastore.Property {
+	return b.initProps
 }
 
 func (b *Base) IsNew() bool {
@@ -172,8 +220,8 @@ func (b *Base) IsNew() bool {
 }
 
 func loadModel(e any, ps []datastore.Property) error {
-	if m, ok := e.(Model); ok {
-		m.InitProps(ps)
+	if m, ok := e.(modeler); ok {
+		m.setInitProps(ps)
 	}
 	fields := make(map[string]*structtag.StructField)
 	for _, field := range structtag.GetFieldsByTag(e, "marshal") {
@@ -457,9 +505,7 @@ func (db *Client) Key(val interface{}) *datastore.Key {
 
 // Get loads the entity for the given key/struct into the struct.
 func (db *Client) Get(ctx context.Context, val interface{}) error {
-	if m, ok := val.(Model); ok {
-		m.Init(ctx, val)
-	}
+	initModel(ctx, val)
 	key := db.Key(val)
 	if err := db.client.Get(ctx, key, val); err != nil {
 		return err
@@ -481,9 +527,7 @@ func (db *Client) GetMulti(ctx context.Context, keys []*datastore.Key, vals inte
 			vv := v.Index(i)
 			vv.Set(reflect.New(v.Index(i).Type().Elem()))
 			e := vv.Interface()
-			if m, ok := e.(Model); ok {
-				m.Init(ctx, e)
-			}
+			initModel(ctx, e)
 		}
 	}
 	err := db.client.GetMulti(ctx, keys, vals)
@@ -506,9 +550,7 @@ func (db *Client) GetMulti(ctx context.Context, keys []*datastore.Key, vals inte
 
 // Put saves an entity.
 func (db *Client) Put(ctx context.Context, val interface{}) error {
-	if m, ok := val.(Model); ok {
-		m.Init(ctx, val)
-	}
+	initModel(ctx, val)
 	k := db.Key(val)
 	k, err := db.client.Put(ctx, k, val)
 	if err != nil {
@@ -518,7 +560,12 @@ func (db *Client) Put(ctx context.Context, val interface{}) error {
 		v.LoadKey(k)
 	}
 	if as, ok := val.(AfterSave); ok {
-		return as.AfterSave(ctx)
+		// Reconstruct old model using helper
+		old, err := reconstructOldModel(ctx, val, k)
+		if err != nil {
+			return err
+		}
+		return as.AfterSave(ctx, old)
 	}
 	return nil
 }
@@ -529,14 +576,23 @@ func (db *Client) PutMulti(ctx context.Context, vals interface{}) error {
 	if v.Kind() != reflect.Slice {
 		return fmt.Errorf("datastore.DB.PutMulti: must be slice type not '%v'", v.Kind())
 	}
-	var as []AfterSave
+	var as []func() error
 	for i := 0; i < v.Len(); i++ {
 		e := v.Index(i).Interface()
-		if m, ok := e.(Model); ok {
-			m.Init(ctx, e)
-		}
+		initModel(ctx, e)
+
 		if a, ok := e.(AfterSave); ok {
-			as = append(as, a)
+			// capture closure for AfterSave execution later
+			// db.Key(e) gives us current state key
+			k := db.Key(e)
+			old, err := reconstructOldModel(ctx, e, k)
+			if err != nil {
+				return err
+			}
+
+			as = append(as, func() error {
+				return a.AfterSave(ctx, old)
+			})
 		}
 	}
 	keys := db.Keys(vals)
@@ -547,8 +603,8 @@ func (db *Client) PutMulti(ctx context.Context, vals interface{}) error {
 	loadKeys(v, keys)
 
 	if len(as) > 0 {
-		return util.Task(20, as, func(e AfterSave) error {
-			return e.AfterSave(ctx)
+		return util.Task(20, as, func(f func() error) error {
+			return f()
 		})
 	}
 
@@ -556,7 +612,19 @@ func (db *Client) PutMulti(ctx context.Context, vals interface{}) error {
 }
 
 func (db *Client) Delete(ctx context.Context, val interface{}) error {
-	return db.client.Delete(ctx, db.Key(val))
+	if bd, ok := val.(BeforeDelete); ok {
+		if err := bd.BeforeDelete(ctx); err != nil {
+			return err
+		}
+	}
+	err := db.client.Delete(ctx, db.Key(val))
+	if err != nil {
+		return err
+	}
+	if ad, ok := val.(AfterDelete); ok {
+		return ad.AfterDelete(ctx)
+	}
+	return nil
 }
 
 func (db *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
@@ -564,13 +632,43 @@ func (db *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
 	if v.Kind() != reflect.Slice {
 		return fmt.Errorf("datastore.db.DeleteMulti: must be slice type not '%v'", v.Kind())
 	}
+
+	// BeforeDelete Hooks
+	for i := 0; i < v.Len(); i++ {
+		e := v.Index(i).Interface()
+		if bd, ok := e.(BeforeDelete); ok {
+			if err := bd.BeforeDelete(ctx); err != nil {
+				return err
+			}
+		}
+	}
+
 	var keys []*datastore.Key
 	if vKeys, ok := vals.([]*datastore.Key); ok {
 		keys = vKeys
 	} else {
 		keys = db.Keys(vals)
 	}
-	return db.client.DeleteMulti(ctx, keys)
+	if err := db.client.DeleteMulti(ctx, keys); err != nil {
+		return err
+	}
+
+	// AfterDelete Hooks
+	var ads []func() error
+	for i := 0; i < v.Len(); i++ {
+		e := v.Index(i).Interface()
+		if ad, ok := e.(AfterDelete); ok {
+			ads = append(ads, func() error {
+				return ad.AfterDelete(ctx)
+			})
+		}
+	}
+	if len(ads) > 0 {
+		return util.Task(20, ads, func(f func() error) error {
+			return f()
+		})
+	}
+	return nil
 }
 
 func (db *Client) Query(ctx context.Context, q *datastore.Query, cursor string, vals interface{}) ([]*datastore.Key, string, error) {
@@ -626,9 +724,7 @@ type Transaction struct {
 
 // Get loads entity to val within the transaction.
 func (t *Transaction) Get(val interface{}) error {
-	if m, ok := val.(Model); ok {
-		m.Init(t.ctx, val)
-	}
+	initModel(t.ctx, val)
 	key := t.client.Key(val)
 	if err := t.tx.Get(key, val); err != nil {
 		return err
@@ -650,9 +746,7 @@ func (t *Transaction) GetMulti(keys []*datastore.Key, vals interface{}) error {
 			vv := v.Index(i)
 			vv.Set(reflect.New(v.Index(i).Type().Elem()))
 			e := vv.Interface()
-			if m, ok := e.(Model); ok {
-				m.Init(t.ctx, e)
-			}
+			initModel(t.ctx, e)
 		}
 	}
 	err := t.tx.GetMulti(keys, vals)
@@ -675,9 +769,7 @@ func (t *Transaction) GetMulti(keys []*datastore.Key, vals interface{}) error {
 
 // Put saves an entity within the transaction.
 func (t *Transaction) Put(val interface{}) error {
-	if m, ok := val.(Model); ok {
-		m.Init(t.ctx, val)
-	}
+	initModel(t.ctx, val)
 	k := t.client.Key(val)
 	if _, err := t.tx.Put(k, val); err != nil {
 		return err
@@ -691,7 +783,11 @@ func (t *Transaction) Put(val interface{}) error {
 		v.LoadKey(k)
 	}
 	if as, ok := val.(AfterSave); ok {
-		return as.AfterSave(t.ctx)
+		old, err := reconstructOldModel(t.ctx, val, k)
+		if err != nil {
+			return err
+		}
+		return as.AfterSave(t.ctx, old)
 	}
 	return nil
 }
@@ -702,14 +798,21 @@ func (t *Transaction) PutMulti(vals interface{}) error {
 	if v.Kind() != reflect.Slice {
 		return fmt.Errorf("dsorm.Transaction.PutMulti: must be slice type not '%v'", v.Kind())
 	}
-	var as []AfterSave
+	var as []func() error
 	for i := 0; i < v.Len(); i++ {
 		e := v.Index(i).Interface()
-		if m, ok := e.(Model); ok {
-			m.Init(t.ctx, e)
-		}
+		initModel(t.ctx, e)
+
 		if a, ok := e.(AfterSave); ok {
-			as = append(as, a)
+			k := t.client.Key(e)
+			old, err := reconstructOldModel(t.ctx, e, k)
+			if err != nil {
+				return err
+			}
+
+			as = append(as, func() error {
+				return a.AfterSave(t.ctx, old)
+			})
 		}
 	}
 	keys := t.client.Keys(vals)
@@ -719,8 +822,8 @@ func (t *Transaction) PutMulti(vals interface{}) error {
 	loadKeys(v, keys)
 
 	if len(as) > 0 {
-		return util.Task(20, as, func(e AfterSave) error {
-			return e.AfterSave(t.ctx)
+		return util.Task(20, as, func(f func() error) error {
+			return f()
 		})
 	}
 	return nil
@@ -728,7 +831,19 @@ func (t *Transaction) PutMulti(vals interface{}) error {
 
 // Delete deletes an entity within the transaction.
 func (t *Transaction) Delete(val interface{}) error {
-	return t.tx.Delete(t.client.Key(val))
+	if bd, ok := val.(BeforeDelete); ok {
+		if err := bd.BeforeDelete(t.ctx); err != nil {
+			return err
+		}
+	}
+	err := t.tx.Delete(t.client.Key(val))
+	if err != nil {
+		return err
+	}
+	if ad, ok := val.(AfterDelete); ok {
+		return ad.AfterDelete(t.ctx)
+	}
+	return nil
 }
 
 // DeleteMulti deletes multiple entities within the transaction.
@@ -743,7 +858,20 @@ func (t *Transaction) DeleteMulti(vals interface{}) error {
 	} else {
 		keys = t.client.Keys(vals)
 	}
-	return t.tx.DeleteMulti(keys)
+	if err := t.tx.DeleteMulti(keys); err != nil {
+		return err
+	}
+	// AfterDelete Hooks ? DeleteMulti in Tx with hooks is tricky if passing keys directly.
+	// t.DeleteMulti accepts vals interface{}.
+	for i := 0; i < v.Len(); i++ {
+		e := v.Index(i).Interface()
+		if ad, ok := e.(AfterDelete); ok {
+			if err := ad.AfterDelete(t.ctx); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Transact runs a function in a transaction.

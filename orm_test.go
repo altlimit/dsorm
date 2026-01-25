@@ -54,8 +54,25 @@ func (m *LifecycleModel) BeforeSave(ctx context.Context, model dsorm.Model) erro
 	return nil
 }
 
-func (m *LifecycleModel) AfterSave(ctx context.Context) error {
+func (m *LifecycleModel) AfterSave(ctx context.Context, old dsorm.Model) error {
 	m.Events = append(m.Events, "AfterSave")
+	if old == nil {
+		m.Events = append(m.Events, "OldIsNil")
+	} else {
+		if oldM, ok := old.(*LifecycleModel); ok {
+			m.Events = append(m.Events, fmt.Sprintf("OldValue=%s", oldM.Value))
+		}
+	}
+	return nil
+}
+
+func (m *LifecycleModel) BeforeDelete(ctx context.Context) error {
+	m.Events = append(m.Events, "BeforeDelete")
+	return nil
+}
+
+func (m *LifecycleModel) AfterDelete(ctx context.Context) error {
+	m.Events = append(m.Events, "AfterDelete")
 	return nil
 }
 
@@ -101,7 +118,7 @@ func TestModelLifecycle(t *testing.T) {
 	ctx := context.Background()
 
 	m := &LifecycleModel{Value: "lifecycle"}
-	m.Init(ctx, m)
+	// m.Init(ctx, m) // Managed by ORM now
 
 	if !m.IsNew() {
 		t.Error("IsNew() should be true for new model")
@@ -112,14 +129,17 @@ func TestModelLifecycle(t *testing.T) {
 		t.Fatalf("Put failed: %v", err)
 	}
 
-	if len(m.Events) != 2 {
-		t.Errorf("Expected 2 events (BeforeSave, AfterSave), got %v", m.Events)
+	if len(m.Events) != 3 { // BeforeSave, AfterSave, OldIsNil
+		t.Errorf("Expected 3 events for new save, got %v", m.Events)
 	} else {
 		if m.Events[0] != "BeforeSave" {
 			t.Errorf("Expected event 0 to be BeforeSave, got %s", m.Events[0])
 		}
 		if m.Events[1] != "AfterSave" {
 			t.Errorf("Expected event 1 to be AfterSave, got %s", m.Events[1])
+		}
+		if m.Events[2] != "OldIsNil" {
+			t.Errorf("Expected event 2 to be OldIsNil, got %s", m.Events[2])
 		}
 	}
 
@@ -141,6 +161,47 @@ func TestModelLifecycle(t *testing.T) {
 	} else {
 		if fetched.Events[0] != "OnLoad" {
 			t.Errorf("Expected event 0 to be OnLoad, got %s", fetched.Events[0])
+		}
+	}
+
+	// Update triggers AfterSave with Old Value
+	fetched.Events = nil // reset events
+	fetched.Value = "updated-lifecycle"
+	if err := testDB.Put(ctx, fetched); err != nil {
+		t.Fatalf("Put update failed: %v", err)
+	}
+
+	// Events: BeforeSave, AfterSave, OldValue=lifecycle
+	if len(fetched.Events) != 3 {
+		t.Errorf("Expected 3 events for update, got %v", fetched.Events)
+	} else {
+		foundOldVal := false
+		for _, e := range fetched.Events {
+			if e == "OldValue=lifecycle" {
+				foundOldVal = true
+			}
+		}
+		if !foundOldVal {
+			t.Error("Expected OldValue=lifecycle event for update")
+		}
+	}
+
+	// Delete triggers Delete Hooks
+	fetched.Events = nil
+	if err := testDB.Delete(ctx, fetched); err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+	// We can't check fetched.Events easily because Delete doesn't reload the struct?
+	// Actually Delete accepts interface{}, so we passed the pointer.
+	// The methods modify the slice on that pointer. So we should see events.
+	if len(fetched.Events) != 2 {
+		t.Errorf("Expected 2 delete events, got %v", fetched.Events)
+	} else {
+		if fetched.Events[0] != "BeforeDelete" {
+			t.Errorf("Expected BeforeDelete, got %s", fetched.Events[0])
+		}
+		if fetched.Events[1] != "AfterDelete" {
+			t.Errorf("Expected AfterDelete, got %s", fetched.Events[1])
 		}
 	}
 }
