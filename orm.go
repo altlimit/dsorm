@@ -573,8 +573,19 @@ func (db *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
 	return db.client.DeleteMulti(ctx, keys)
 }
 
-func (db *Client) QueryKeys(ctx context.Context, q *datastore.Query, cursor string) ([]*datastore.Key, string, error) {
+func (db *Client) Query(ctx context.Context, q *datastore.Query, cursor string, vals interface{}) ([]*datastore.Key, string, error) {
 	var keys []*datastore.Key
+	var v reflect.Value
+	if vals != nil {
+		v = reflect.ValueOf(vals)
+	}
+	if v.Kind() != reflect.Ptr {
+		return nil, "", fmt.Errorf("datastore.DB.Query: must be pointer type not '%v'", v.Kind())
+	}
+	if v.Elem().Kind() != reflect.Slice {
+		return nil, "", fmt.Errorf("datastore.DB.Query: must be slice type not '%v'", v.Elem().Kind())
+	}
+
 	if cursor != "" {
 		c, err := datastore.DecodeCursor(cursor)
 		if err != nil {
@@ -582,6 +593,7 @@ func (db *Client) QueryKeys(ctx context.Context, q *datastore.Query, cursor stri
 		}
 		q = q.Start(c)
 	}
+	q = q.KeysOnly()
 	it := db.client.Run(ctx, q)
 	for {
 		k, err := it.Next(nil)
@@ -595,6 +607,12 @@ func (db *Client) QueryKeys(ctx context.Context, q *datastore.Query, cursor stri
 	next, err := it.Cursor()
 	if err != nil {
 		return nil, "", err
+	}
+	if vals != nil && len(keys) > 0 {
+		v.Elem().Set(reflect.MakeSlice(v.Elem().Type(), len(keys), len(keys)))
+		if err := db.GetMulti(ctx, keys, v.Elem().Interface()); err != nil {
+			return nil, "", err
+		}
 	}
 	return keys, next.String(), nil
 }
@@ -763,21 +781,56 @@ func loadKeys(v reflect.Value, keys []*datastore.Key) {
 }
 
 // Query executes a query and returns a slice of models.
-func Query[T Model](ctx context.Context, db *Client, q *datastore.Query, cursor string, limit int) ([]T, string, error) {
-	if limit == 0 || limit > 100 {
-		limit = 100
-	}
-	q = q.KeysOnly().Limit(limit)
-	keys, next, err := db.QueryKeys(ctx, q, cursor)
+func Query[T Model](ctx context.Context, db *Client, q *datastore.Query, cursor string) ([]T, string, error) {
+	var dst []T
+	_, next, err := db.Query(ctx, q, cursor, &dst)
 	if err != nil {
 		return nil, "", err
 	}
+	return dst, next, nil
+}
+
+// GetMulti loads multiple entities by IDs (int64, string, *datastore.Key) or struct slice.
+func GetMulti[T Model](ctx context.Context, db *Client, ids any) ([]T, error) {
+	v := reflect.ValueOf(ids)
+	if v.Kind() != reflect.Slice {
+		return nil, fmt.Errorf("dsorm.GetMulti: ids must be a slice, got %v", v.Kind())
+	}
+
+	// 1. Determine Kind from T
+	// T is usually *MyModel
+	tType := reflect.TypeOf(new(T)).Elem()
+	if tType.Kind() == reflect.Ptr {
+		tType = tType.Elem()
+	}
+	kind := tType.Name()
+
+	keys := make([]*datastore.Key, v.Len())
+	for i := 0; i < v.Len(); i++ {
+		item := v.Index(i)
+		val := item.Interface()
+		switch k := val.(type) {
+		case *datastore.Key:
+			keys[i] = k
+		case string:
+			keys[i] = datastore.NameKey(kind, k, nil)
+		case int64:
+			keys[i] = datastore.IDKey(kind, k, nil)
+		case int:
+			keys[i] = datastore.IDKey(kind, int64(k), nil)
+		default:
+			// check if it's a struct or ptr to struct, assume it's a Model we can derive key from
+			if item.Kind() == reflect.Struct || (item.Kind() == reflect.Ptr && item.Elem().Kind() == reflect.Struct) {
+				keys[i] = db.Key(val)
+			} else {
+				return nil, fmt.Errorf("dsorm.GetMulti: unsupported ID type at index %d: %T", i, val)
+			}
+		}
+	}
+
 	dst := make([]T, len(keys))
 	if err := db.GetMulti(ctx, keys, dst); err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	if len(dst) < limit {
-		next = ""
-	}
-	return dst, next, nil
+	return dst, nil
 }

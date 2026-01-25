@@ -321,7 +321,7 @@ func TestDatastoreTags(t *testing.T) {
 	// Verify Query behavior
 	// Querying on unindexed field should return nothing
 	q := datastore.NewQuery("DatastoreTagModel").FilterField("NotIndexed", "=", "hidden")
-	results, _, err := dsorm.Query[*DatastoreTagModel](ctx, testDB, q, "", 0)
+	results, _, err := dsorm.Query[*DatastoreTagModel](ctx, testDB, q, "")
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -331,7 +331,7 @@ func TestDatastoreTags(t *testing.T) {
 
 	// Querying on indexed field should find it
 	q2 := datastore.NewQuery("DatastoreTagModel").FilterField("Indexed", "=", "visible")
-	results2, _, err := dsorm.Query[*DatastoreTagModel](ctx, testDB, q2, "", 0)
+	results2, _, err := dsorm.Query[*DatastoreTagModel](ctx, testDB, q2, "")
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -377,7 +377,7 @@ func TestDBOperations(t *testing.T) {
 
 	// Query
 	q := datastore.NewQuery("LifecycleModel").Order("Value")
-	results, _, err := dsorm.Query[*LifecycleModel](ctx, testDB, q, "", 0)
+	results, _, err := dsorm.Query[*LifecycleModel](ctx, testDB, q, "")
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -533,5 +533,108 @@ func TestStructParent(t *testing.T) {
 		if lookup.Parent.ID != "parent-1" {
 			t.Errorf("Loaded parent ID expected 'parent-1', got '%s'", lookup.Parent.ID)
 		}
+	}
+}
+
+func TestGetMultiGeneric(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Test with []string using KeyMappingModel (String ID)
+	var strModels []*KeyMappingModel
+	for i := 0; i < 3; i++ {
+		m := &KeyMappingModel{ID: fmt.Sprintf("gm-%d", i)}
+		strModels = append(strModels, m)
+	}
+	if err := testDB.PutMulti(ctx, strModels); err != nil {
+		t.Fatalf("Setup PutMulti String failed: %v", err)
+	}
+
+	strIDs := []string{"gm-0", "gm-1", "gm-2"}
+	resStr, err := dsorm.GetMulti[*KeyMappingModel](ctx, testDB, strIDs)
+	if err != nil {
+		t.Fatalf("GetMulti string ids failed: %v", err)
+	}
+	if len(resStr) != 3 {
+		t.Errorf("Expected 3 results, got %d", len(resStr))
+	} else {
+		for i, r := range resStr {
+			if r == nil {
+				t.Fatalf("String Result %d is nil", i)
+			}
+			// Note: GetMulti constructs keys with default options.
+			// NameKey("KeyMappingModel", "gm-0", nil).
+			// But our items were saved with Namespace="ns-test" (via NS field mapping to Key.Namespace)!
+			// Wait! KeyMappingModel's ID field is mapped to "id", NS to "ns".
+			// db.Key(m) uses both.
+			// When GetMulti constructs keys from []string, it simply does NameKey(Kind, id, nil).
+			// It generally *cannot* know the namespace unless encoded in the ID or passed separately?
+			// The current GetMulti implementation does NOT handle namespaces for primitive ID slices.
+			// So looking them up by just ID will fail if they have a namespace!
+			// We should ensure NS is empty for this test if we want simple lookup.
+		}
+	}
+
+	// Retry String Test with NO Namespace to simplify
+	var simpleStrModels []*KeyMappingModel
+	for i := 0; i < 3; i++ {
+		m := &KeyMappingModel{ID: fmt.Sprintf("simple-%d", i)} // NS empty
+		simpleStrModels = append(simpleStrModels, m)
+	}
+	if err := testDB.PutMulti(ctx, simpleStrModels); err != nil {
+		t.Fatalf("Setup PutMulti Simple String failed: %v", err)
+	}
+
+	simpleIDs := []string{"simple-0", "simple-1", "simple-2"}
+	resSimple, err := dsorm.GetMulti[*KeyMappingModel](ctx, testDB, simpleIDs)
+	if err != nil {
+		t.Fatalf("GetMulti simple string ids failed: %v", err)
+	}
+	if len(resSimple) != 3 {
+		t.Errorf("Expected 3 simple results, got %d", len(resSimple))
+	} else if resSimple[0] == nil {
+		t.Error("Simple Result 0 is nil")
+	}
+
+	// 2. Test with []int64 using LifecycleModel (Int ID)
+	var intModels []*LifecycleModel
+	for i := 0; i < 3; i++ {
+		m := &LifecycleModel{ID: int64(200 + i), Value: fmt.Sprintf("val-%d", i)}
+		intModels = append(intModels, m)
+	}
+	if err := testDB.PutMulti(ctx, intModels); err != nil {
+		t.Fatalf("Setup PutMulti Int failed: %v", err)
+	}
+
+	intIDs := []int64{200, 201, 202}
+	resInt, err := dsorm.GetMulti[*LifecycleModel](ctx, testDB, intIDs)
+	if err != nil {
+		t.Fatalf("GetMulti int ids failed: %v", err)
+	}
+	if len(resInt) != 3 {
+		t.Errorf("Expected 3 int results, got %d", len(resInt))
+	} else if resInt[0] == nil {
+		t.Error("Int Result 0 is nil")
+	}
+
+	// 3. Test with []*datastore.Key
+	var keys []*datastore.Key
+	for _, m := range intModels {
+		keys = append(keys, m.Key)
+	}
+	resKeys, err := dsorm.GetMulti[*LifecycleModel](ctx, testDB, keys)
+	if err != nil {
+		t.Fatalf("GetMulti keys failed: %v", err)
+	}
+	if len(resKeys) != 3 {
+		t.Errorf("Expected 3 results from keys, got %d", len(resKeys))
+	}
+
+	// 4. Test with Slice of Structs
+	resStructs, err := dsorm.GetMulti[*LifecycleModel](ctx, testDB, intModels)
+	if err != nil {
+		t.Fatalf("GetMulti structs failed: %v", err)
+	}
+	if len(resStructs) != 3 {
+		t.Errorf("Expected 3 results from structs, got %d", len(resStructs))
 	}
 }

@@ -119,7 +119,13 @@ Query keys-only and auto-fetch entities in batches (of 1000) for performance.
 
 ```go
 q := datastore.NewQuery("User").FilterField("Username", "=", "Alice")
-users, nextCursor, err := dsorm.Query[*User](ctx, client, q, "", 0)
+
+// Wrapper helper
+users, nextCursor, err := dsorm.Query[*User](ctx, client, q, "")
+
+// GetMulti Helper (Get by IDs, Keys, or Structs)
+ids := []string{"alice", "bob"}
+users, err := dsorm.GetMulti[*User](ctx, client, ids)
 ```
 
 ## Configuration
