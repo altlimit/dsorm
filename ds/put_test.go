@@ -1,0 +1,279 @@
+package ds_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"testing"
+
+	"cloud.google.com/go/datastore"
+
+	ds "github.com/altlimit/dsorm/ds"
+)
+
+func TestPutSuite(t *testing.T) {
+	for _, item := range cachers {
+		t.Run(fmt.Sprintf("cacher=%T", item.cacher), func(t *testing.T) {
+			t.Run("TestPutMulti", PutMultiTest(item.ctx, item.cacher))
+			t.Run("TestPutMultiError", PutMultiErrorTest(item.ctx, item.cacher))
+			t.Run("TestPutMultiNoPropertyList", PutMultiNoPropertyListTest(item.ctx, item.cacher))
+			t.Run("TestPutPropertyLoadSaver", PutPropertyLoadSaverTest(item.ctx, item.cacher))
+			t.Run("TestPutNilArgs", PutNilArgsTest(item.ctx, item.cacher))
+			t.Run("TestPutMultiLockFailure", PutMultiLockFailureTest(item.ctx, item.cacher))
+			t.Run("TestPutMultiUnlockCacheSuccess", PutMultiUnlockCacheSuccessTest(item.ctx, item.cacher))
+			t.Run("TestPutDatastoreMultiError", PutDatastoreMultiErrorTest(item.ctx, item.cacher))
+			t.Run("TestPutMultiZeroKeys", PutMultiZeroKeysTest(item.ctx, item.cacher))
+		})
+	}
+}
+
+func PutMultiTest(ctx context.Context, cacher ds.Cache) func(t *testing.T) {
+	return func(t *testing.T) {
+		dsoClient, err := NewClient(ctx, cacher, t, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		type TestEntity struct {
+			Value int
+		}
+
+		for _, count := range []int{499, 500, 501} {
+			keys := make([]*datastore.Key, count)
+			entities := make([]TestEntity, count)
+
+			for i := range keys {
+				keys[i] = datastore.NameKey("TestEntity", strconv.Itoa(i), nil)
+				entities[i] = TestEntity{i}
+			}
+
+			if _, err := dsoClient.PutMulti(ctx, keys, entities); err != nil {
+				t.Fatal(err)
+			}
+
+			entities = make([]TestEntity, count)
+			if err := dsoClient.GetMulti(ctx, keys, entities); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func PutMultiErrorTest(ctx context.Context, cacher ds.Cache) func(t *testing.T) {
+	return func(t *testing.T) {
+		dsoClient, err := NewClient(ctx, cacher, t, func(err error) bool {
+			return strings.Contains(err.Error(), "expected error")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectedErrs := datastore.MultiError{
+			nil,
+			errors.New("expected error"),
+		}
+
+		ds.SetDatastorePutMultiHook(func() error {
+			return expectedErrs
+		})
+		defer ds.SetDatastorePutMultiHook(nil)
+
+		keys := []*datastore.Key{
+			datastore.IDKey("Test", 1, nil),
+			datastore.IDKey("Test", 2, nil),
+		}
+
+		type TestEntity struct {
+			Value int
+		}
+		entities := []TestEntity{
+			{1},
+			{2},
+		}
+
+		_, err = dsoClient.PutMulti(ctx, keys, entities)
+		me, ok := err.(datastore.MultiError)
+		if !ok {
+			t.Fatal("expected datastore.MultiError")
+		}
+		for i, e := range me {
+			if e != expectedErrs[i] {
+				t.Fatal("error incorrect")
+			}
+		}
+	}
+}
+
+func PutMultiNoPropertyListTest(ctx context.Context, cacher ds.Cache) func(t *testing.T) {
+	return func(t *testing.T) {
+		dsoClient, err := NewClient(ctx, cacher, t, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		keys := []*datastore.Key{datastore.IDKey("Test", 1, nil)}
+		pl := datastore.PropertyList{datastore.Property{}}
+
+		if _, err := dsoClient.PutMulti(ctx, keys, pl); err == nil {
+			t.Fatal("expecting no PropertyList error")
+		}
+	}
+}
+
+func PutPropertyLoadSaverTest(ctx context.Context, cacher ds.Cache) func(t *testing.T) {
+	return func(t *testing.T) {
+		dsoClient, err := NewClient(ctx, cacher, t, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		type testEntity struct {
+			IntVal int
+		}
+
+		te := &testEntity{2}
+		pl, err := datastore.SaveStruct(te)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		keys := []*datastore.Key{datastore.IDKey("Test", 1, nil)}
+
+		pls := datastore.PropertyList(pl)
+		if _, err := dsoClient.PutMulti(ctx, keys,
+			[]datastore.PropertyLoadSaver{&pls}); err != nil {
+			t.Fatal(err)
+		}
+
+		getPl := datastore.PropertyList{}
+		if err := dsoClient.GetMulti(ctx,
+			keys, []datastore.PropertyLoadSaver{&getPl}); err != nil {
+			t.Fatal(err)
+		}
+		getTe := &testEntity{}
+		if err := datastore.LoadStruct(getTe, getPl); err != nil {
+			t.Fatal(err)
+		}
+		if te.IntVal != getTe.IntVal {
+			t.Fatal("expected same IntVal", getTe.IntVal)
+		}
+	}
+}
+
+func PutNilArgsTest(ctx context.Context, cacher ds.Cache) func(t *testing.T) {
+	return func(t *testing.T) {
+		dsoClient, err := NewClient(ctx, cacher, t, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := dsoClient.Put(ctx, nil, nil); err == nil {
+			t.Fatal("expected error")
+		}
+	}
+}
+
+func PutMultiLockFailureTest(ctx context.Context, cacher ds.Cache) func(t *testing.T) {
+	return func(t *testing.T) {
+		testCache := &mockCache{
+			cacher: cacher,
+			setMultiHook: func(_ context.Context, _ []*ds.Item) error {
+				return errors.New("expected error")
+			},
+		}
+
+		dsoClient, err := NewClient(ctx, testCache, t, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		type testEntity struct {
+			IntVal int
+		}
+
+		keys := []*datastore.Key{datastore.IDKey("Test", 1, nil)}
+		vals := []testEntity{{42}}
+
+		if _, err := dsoClient.PutMulti(ctx, keys, vals); err == nil {
+			t.Fatal("expected ds.PutMulti error")
+		}
+	}
+}
+
+// Make sure PutMulti still works if we have a cache unlock failure.
+func PutMultiUnlockCacheSuccessTest(ctx context.Context, cacher ds.Cache) func(t *testing.T) {
+	return func(t *testing.T) {
+		testCache := &mockCache{
+			cacher: cacher,
+			deleteMultiHook: func(_ context.Context, _ []string) error {
+				return errors.New("expected error")
+			},
+		}
+
+		dsoClient, err := NewClient(ctx, testCache, t, func(err error) bool {
+			return strings.Contains(err.Error(), "expected error")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		type testEntity struct {
+			IntVal int
+		}
+
+		keys := []*datastore.Key{datastore.IDKey("Test", 1, nil)}
+		vals := []testEntity{{42}}
+
+		if _, err := dsoClient.PutMulti(ctx, keys, vals); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func PutDatastoreMultiErrorTest(ctx context.Context, cacher ds.Cache) func(t *testing.T) {
+	return func(t *testing.T) {
+		expectedErr := errors.New("expected error")
+
+		testCache := &mockCache{
+			cacher: cacher,
+		}
+
+		ds.SetDatastorePutMultiHook(func() error {
+			return datastore.MultiError{expectedErr}
+		})
+		defer ds.SetDatastorePutMultiHook(nil)
+
+		dsoClient, err := NewClient(ctx, testCache, t, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		type testEntity struct {
+			IntVal int
+		}
+
+		key := datastore.IDKey("Test", 1, nil)
+		val := &testEntity{42}
+
+		if _, err := dsoClient.Put(ctx, key, val); err == nil {
+			t.Fatal("expected error")
+		} else if err != expectedErr {
+			t.Fatal("should be expectedErr")
+		}
+	}
+}
+
+func PutMultiZeroKeysTest(ctx context.Context, cacher ds.Cache) func(t *testing.T) {
+	return func(t *testing.T) {
+		dsoClient, err := NewClient(ctx, cacher, t, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := dsoClient.PutMulti(ctx, []*datastore.Key{},
+			[]interface{}{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

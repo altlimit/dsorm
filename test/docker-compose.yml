@@ -1,0 +1,45 @@
+services:
+  datastore:
+    image: "ghcr.io/altlimit/goappengine:latest"
+    ports:
+      - "8081:8081"
+    command:
+      [
+        "gcloud",
+        "--quiet",
+        "beta",
+        "emulators",
+        "datastore",
+        "start",
+        "--consistency=1",
+        "--host-port=0.0.0.0:8081"
+      ]
+    environment:
+      CLOUDSDK_CORE_PROJECT: app-test
+  backend:
+    image: "ghcr.io/altlimit/goappengine:latest"
+    command:
+      [
+        "/root/google-cloud-sdk/bin/dev_appserver.py",
+        "--enable_host_checking=false",
+        "--enable_watching_go_path=true",
+        "--log_level=debug",
+        "--admin_host=0.0.0.0",
+        "--host=0.0.0.0",
+        "--port=8080",
+        "--application=app-test",
+        "/app/test/app.yaml"
+      ]
+    environment:
+      GOOGLE_CLOUD_PROJECT: 'app-test'
+      DATASTORE_EMULATOR_HOST: "datastore:8081"
+    volumes:
+      - ../:/app
+    depends_on:
+      - datastore
+    ports:
+      - "8080:8080"
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"

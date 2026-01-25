@@ -1,0 +1,10 @@
+/bin/
+pkg/
+*.test
+*.out
+go.work.sum
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.Identifier
