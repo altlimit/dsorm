@@ -706,10 +706,12 @@ func (db *Client) Query(ctx context.Context, q *datastore.Query, cursor string, 
 	if err != nil {
 		return nil, "", err
 	}
-	if vals != nil && len(keys) > 0 {
+	if vals != nil {
 		v.Elem().Set(reflect.MakeSlice(v.Elem().Type(), len(keys), len(keys)))
-		if err := db.GetMulti(ctx, keys, v.Elem().Interface()); err != nil {
-			return nil, "", err
+		if len(keys) > 0 {
+			if err := db.GetMulti(ctx, keys, v.Elem().Interface()); err != nil {
+				return nil, "", err
+			}
 		}
 	}
 	return keys, next.String(), nil
