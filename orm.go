@@ -2,12 +2,12 @@ package dsorm
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/datastore"
@@ -26,10 +26,11 @@ type (
 	// Model defines the basic methods required for a struct to be managed by dsorm.
 	Model interface {
 		IsNew() bool
+		Key() *datastore.Key
 	}
 
 	modeler interface {
-		initModel(context.Context, any)
+		initModel(context.Context, any) error
 		setInitProps([]datastore.Property)
 		getInitProps() []datastore.Property
 	}
@@ -57,7 +58,7 @@ type (
 	// Base provides default implementation for Model interface and common fields.
 	// Embed this in your struct to use dsorm.
 	Base struct {
-		Key *datastore.Key `datastore:"-" json:"-"`
+		key *datastore.Key `datastore:"-" json:"-"`
 
 		initProps []datastore.Property `datastore:"-"`
 		entity    any                  `datastore:"-"`
@@ -65,23 +66,31 @@ type (
 	}
 )
 
-func (b *Base) initModel(ctx context.Context, e any) {
+func (b *Base) initModel(ctx context.Context, e any) error {
 	b.ctx = ctx
 	if b.entity == nil {
 		b.entity = e
 	}
-	if b.Key != nil {
+	if b.key != nil {
 		if kl, ok := e.(datastore.KeyLoader); ok {
-			kl.LoadKey(b.Key)
+			if err := kl.LoadKey(b.key); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
+}
+
+func (b *Base) Key() *datastore.Key {
+	return b.key
 }
 
 // initHelpers
-func initModel(ctx context.Context, v any) {
+func initModel(ctx context.Context, v any) error {
 	if m, ok := v.(modeler); ok {
-		m.initModel(ctx, v)
+		return m.initModel(ctx, v)
 	}
+	return nil
 }
 
 func reconstructOldModel(ctx context.Context, val any, k *datastore.Key) (Model, error) {
@@ -91,11 +100,13 @@ func reconstructOldModel(ctx context.Context, val any, k *datastore.Key) (Model,
 			if len(initProps) > 0 {
 				oldVal := reflect.New(reflect.ValueOf(val).Elem().Type()).Interface()
 				if oldM, ok := oldVal.(Model); ok {
-					if err := loadModel(oldVal, initProps); err != nil {
+					if err := loadModel(ctx, oldVal, initProps); err != nil {
 						return nil, err
 					}
 					if om, ok := oldVal.(modeler); ok {
-						om.initModel(ctx, oldVal)
+						if err := om.initModel(ctx, oldVal); err != nil {
+							return nil, err
+						}
 					}
 					// LoadKey as well to ensure full state
 					if kl, ok := oldVal.(datastore.KeyLoader); ok {
@@ -113,7 +124,7 @@ func reconstructOldModel(ctx context.Context, val any, k *datastore.Key) (Model,
 
 // Load implements datastore.PropertyLoadSaver.
 func (b *Base) Load(ps []datastore.Property) error {
-	err := loadModel(b.entity, ps)
+	err := loadModel(b.ctx, b.entity, ps)
 	if err != nil {
 		return err
 	}
@@ -128,25 +139,29 @@ func (b *Base) Save() ([]datastore.Property, error) {
 	if bs, ok := b.entity.(BeforeSave); ok {
 		val := reflect.New(reflect.ValueOf(b.entity).Elem().Type()).Interface()
 		ctx := b.ctx
-		initModel(ctx, val)
+		if err := initModel(ctx, val); err != nil {
+			return nil, err
+		}
 		if len(b.initProps) > 0 {
-			if err := loadModel(val, b.initProps); err != nil {
+			if err := loadModel(ctx, val, b.initProps); err != nil {
 				return nil, err
 			}
 			if v, ok := val.(datastore.KeyLoader); ok {
-				v.LoadKey(b.Key)
+				if err := v.LoadKey(b.key); err != nil {
+					return nil, err
+				}
 			}
 		}
 		if err := bs.BeforeSave(ctx, val.(Model)); err != nil {
 			return nil, err
 		}
 	}
-	return saveModel(b.entity)
+	return saveModel(b.ctx, b.entity)
 }
 
 // LoadKey implements datastore.KeyLoader.
 func (b *Base) LoadKey(k *datastore.Key) error {
-	b.Key = k
+	b.key = k
 	t := reflect.TypeOf(b.entity)
 	v := reflect.ValueOf(b.entity)
 	if t.Kind() == reflect.Ptr {
@@ -219,13 +234,16 @@ func (b *Base) IsNew() bool {
 	return len(b.initProps) == 0
 }
 
-func loadModel(e any, ps []datastore.Property) error {
+func loadModel(ctx context.Context, e any, ps []datastore.Property) error {
 	if m, ok := e.(modeler); ok {
 		m.setInitProps(ps)
 	}
 	fields := make(map[string]*structtag.StructField)
 	for _, field := range structtag.GetFieldsByTag(e, "marshal") {
-		fields[field.Tag] = field
+		// handle legacy or multi-options? "name,encrypt"
+		// We map by property name. Property name is first part of the tag.
+		parts := strings.Split(field.Tag, ",")
+		fields[parts[0]] = field
 	}
 	var props []datastore.Property
 	t := reflect.TypeOf(e)
@@ -242,25 +260,38 @@ func loadModel(e any, ps []datastore.Property) error {
 			}
 			i := reflect.New(vt).Interface()
 			val := p.Value
-			if sKey, ok := field.Value("encrypt"); ok {
+			// Check options in tag
+			parts := strings.Split(field.Tag, ",")
+			shouldDecrypt := false
+			for _, opt := range parts[1:] {
+				if opt == "encrypt" {
+					shouldDecrypt = true
+					break
+				}
+			}
+
+			if shouldDecrypt {
 				// decrypt value first
 				if enc, ok := val.(string); ok {
 					var (
 						err    error
 						secret []byte
 					)
-					if sKey == "" {
-						secretEnv := os.Getenv("DATASTORE_ENCRYPTION_KEY")
-						if secretEnv == "" {
-							return fmt.Errorf("datastore.loadModel: encryption key missing")
-						}
-						secret = []byte(secretEnv)
+
+					// Prioritize Context
+					if ctxKey, ok := ctx.Value(encryptionKeyKey).([]byte); ok {
+						secret = ctxKey
 					} else {
-						secret, err = base64.StdEncoding.DecodeString(sKey)
-						if err != nil {
-							return fmt.Errorf("datastore.loadModel: base64 decode error %v", err)
+						secretEnv := os.Getenv("DATASTORE_ENCRYPTION_KEY")
+						if secretEnv != "" {
+							secret = []byte(secretEnv)
 						}
 					}
+
+					if len(secret) == 0 {
+						return fmt.Errorf("datastore.loadModel: encryption key missing")
+					}
+
 					val, err = encryption.Decrypt(secret, enc)
 					if err != nil {
 						return err
@@ -283,7 +314,7 @@ func loadModel(e any, ps []datastore.Property) error {
 	return datastore.LoadStruct(e, props)
 }
 
-func saveModel(e any) ([]datastore.Property, error) {
+func saveModel(ctx context.Context, e any) ([]datastore.Property, error) {
 	t := reflect.TypeOf(e)
 	v := reflect.ValueOf(e)
 	if t.Kind() == reflect.Ptr {
@@ -310,47 +341,73 @@ func saveModel(e any) ([]datastore.Property, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Handle Marshal tags
 	for _, field := range structtag.GetFieldsByTag(e, "marshal") {
-		tag := field.Tag
+		// tag might be "name,encrypt"
+		parts := strings.Split(field.Tag, ",")
+		tag := parts[0]
+
 		vv := v.Field(field.Index)
 		if vv.IsZero() {
 			continue
 		}
-		b, err := json.Marshal(vv.Interface())
+		props, err = appendMarshaledProp(ctx, props, tag, field, vv, parts[1:])
 		if err != nil {
 			return nil, err
 		}
-		prop := datastore.Property{
-			Name:    tag,
-			NoIndex: true,
-		}
-		val := string(b)
-		if sKey, ok := field.Value("encrypt"); ok {
-			var (
-				err    error
-				secret []byte
-			)
-			if sKey == "" {
-				secretEnv := os.Getenv("DATASTORE_ENCRYPTION_KEY")
-				if secretEnv == "" {
-					return nil, fmt.Errorf("datastore.saveModel: encryption key missing")
-				}
-				secret = []byte(secretEnv)
-			} else {
-				secret, err = base64.StdEncoding.DecodeString(sKey)
-				if err != nil {
-					return nil, fmt.Errorf("datastore.saveModel: base64 decode error %v", err)
-				}
-			}
-			enc, err := encryption.Encrypt(secret, val)
-			if err != nil {
-				return nil, err
-			}
-			val = enc
-		}
-		prop.Value = val
-		props = append(props, prop)
 	}
+	return props, nil
+}
+
+func appendMarshaledProp(ctx context.Context, props []datastore.Property, tag string, field *structtag.StructField, vv reflect.Value, options []string) ([]datastore.Property, error) {
+	b, err := json.Marshal(vv.Interface())
+	if err != nil {
+		return nil, err
+	}
+	prop := datastore.Property{
+		Name:    tag,
+		NoIndex: true,
+	}
+	val := string(b)
+
+	// Check encryption
+	shouldEncrypt := false
+
+	for _, opt := range options {
+		if opt == "encrypt" {
+			shouldEncrypt = true
+			break
+		}
+	}
+
+	if shouldEncrypt {
+		var (
+			err    error
+			secret []byte
+		)
+
+		// Prioritize Context
+		if ctxKey, ok := ctx.Value(encryptionKeyKey).([]byte); ok {
+			secret = ctxKey
+		} else {
+			secretEnv := os.Getenv("DATASTORE_ENCRYPTION_KEY")
+			if secretEnv != "" {
+				secret = []byte(secretEnv)
+			}
+		}
+
+		if len(secret) == 0 {
+			return nil, fmt.Errorf("datastore.saveModel: encryption key missing")
+		}
+
+		enc, err := encryption.Encrypt(secret, val)
+		if err != nil {
+			return nil, err
+		}
+		val = enc
+	}
+	prop.Value = val
+	props = append(props, prop)
 	return props, nil
 }
 
@@ -358,12 +415,14 @@ func saveModel(e any) ([]datastore.Property, error) {
 type Client struct {
 	client    *ds.Client
 	rawClient *datastore.Client
+	encKey    []byte
 }
 
 type options struct {
 	projectID       string
 	cache           ds.Cache
 	datastoreClient *datastore.Client
+	encryptionKey   []byte
 }
 
 type Option func(*options)
@@ -385,6 +444,16 @@ func WithDatastoreClient(c *datastore.Client) Option {
 		o.datastoreClient = c
 	}
 }
+
+func WithEncryptionKey(key []byte) Option {
+	return func(o *options) {
+		o.encryptionKey = key
+	}
+}
+
+type contextKey string
+
+var encryptionKeyKey contextKey = "dsorm_encryption_key"
 
 // New creates a new Client with options value.
 // It auto-detects caching backend: App Engine (Memcache), Redis (env REDIS_ADDR), or Memory.
@@ -430,6 +499,10 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 		}
 	}
 
+	if o.encryptionKey != nil {
+		ctx = context.WithValue(ctx, encryptionKeyKey, o.encryptionKey)
+	}
+
 	dsoClient, err := ds.NewClient(ctx, o.cache, ds.WithDatastoreClient(dsClient), ds.WithCachePrefix(o.projectID+":"))
 	if err != nil {
 		return nil, err
@@ -438,7 +511,15 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 	return &Client{
 		rawClient: dsClient,
 		client:    dsoClient,
+		encKey:    o.encryptionKey,
 	}, nil
+}
+
+func (db *Client) context(ctx context.Context) context.Context {
+	if db.encKey != nil && ctx.Value(encryptionKeyKey) == nil {
+		return context.WithValue(ctx, encryptionKeyKey, db.encKey)
+	}
+	return ctx
 }
 
 // Keys returns a slice of keys for the given slice of entities.
@@ -505,19 +586,25 @@ func (db *Client) Key(val interface{}) *datastore.Key {
 
 // Get loads the entity for the given key/struct into the struct.
 func (db *Client) Get(ctx context.Context, val interface{}) error {
-	initModel(ctx, val)
+	ctx = db.context(ctx)
+	if err := initModel(ctx, val); err != nil {
+		return err
+	}
 	key := db.Key(val)
 	if err := db.client.Get(ctx, key, val); err != nil {
 		return err
 	}
 	if v, ok := val.(datastore.KeyLoader); ok {
-		v.LoadKey(key)
+		if err := v.LoadKey(key); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 // GetMulti loads multiple entities.
 func (db *Client) GetMulti(ctx context.Context, vals interface{}) error {
+	ctx = db.context(ctx)
 	v := reflect.ValueOf(vals)
 	if v.Kind() != reflect.Slice {
 		return fmt.Errorf("datastore.DB.GetMulti: must be slice type not '%v'", v.Kind())
@@ -528,7 +615,9 @@ func (db *Client) GetMulti(ctx context.Context, vals interface{}) error {
 			vv := v.Index(i)
 			vv.Set(reflect.New(v.Index(i).Type().Elem()))
 			e := vv.Interface()
-			initModel(ctx, e)
+			if err := initModel(ctx, e); err != nil {
+				return err
+			}
 		}
 	}
 	err := db.client.GetMulti(ctx, keys, vals)
@@ -545,20 +634,27 @@ func (db *Client) GetMulti(ctx context.Context, vals interface{}) error {
 			return err
 		}
 	}
-	loadKeys(v, keys)
+	if err := loadKeys(v, keys); err != nil {
+		return err
+	}
 	return nil
 }
 
 // Put saves an entity.
 func (db *Client) Put(ctx context.Context, val interface{}) error {
-	initModel(ctx, val)
+	ctx = db.context(ctx)
+	if err := initModel(ctx, val); err != nil {
+		return err
+	}
 	k := db.Key(val)
 	k, err := db.client.Put(ctx, k, val)
 	if err != nil {
 		return err
 	}
 	if v, ok := val.(datastore.KeyLoader); ok {
-		v.LoadKey(k)
+		if err := v.LoadKey(k); err != nil {
+			return err
+		}
 	}
 	if as, ok := val.(AfterSave); ok {
 		// Reconstruct old model using helper
@@ -573,6 +669,7 @@ func (db *Client) Put(ctx context.Context, val interface{}) error {
 
 // PutMulti saves multiple entities.
 func (db *Client) PutMulti(ctx context.Context, vals interface{}) error {
+	ctx = db.context(ctx)
 	v := reflect.ValueOf(vals)
 	if v.Kind() != reflect.Slice {
 		return fmt.Errorf("datastore.DB.PutMulti: must be slice type not '%v'", v.Kind())
@@ -580,7 +677,9 @@ func (db *Client) PutMulti(ctx context.Context, vals interface{}) error {
 	var as []func() error
 	for i := 0; i < v.Len(); i++ {
 		e := v.Index(i).Interface()
-		initModel(ctx, e)
+		if err := initModel(ctx, e); err != nil {
+			return err
+		}
 
 		if a, ok := e.(AfterSave); ok {
 			// capture closure for AfterSave execution later
@@ -601,7 +700,9 @@ func (db *Client) PutMulti(ctx context.Context, vals interface{}) error {
 	if err != nil {
 		return err
 	}
-	loadKeys(v, keys)
+	if err := loadKeys(v, keys); err != nil {
+		return err
+	}
 
 	if len(as) > 0 {
 		return util.Task(20, as, func(f func() error) error {
@@ -613,6 +714,7 @@ func (db *Client) PutMulti(ctx context.Context, vals interface{}) error {
 }
 
 func (db *Client) Delete(ctx context.Context, val interface{}) error {
+	ctx = db.context(ctx)
 	if bd, ok := val.(BeforeDelete); ok {
 		if err := bd.BeforeDelete(ctx); err != nil {
 			return err
@@ -629,6 +731,7 @@ func (db *Client) Delete(ctx context.Context, val interface{}) error {
 }
 
 func (db *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
+	ctx = db.context(ctx)
 	v := reflect.ValueOf(vals)
 	if v.Kind() != reflect.Slice {
 		return fmt.Errorf("datastore.db.DeleteMulti: must be slice type not '%v'", v.Kind())
@@ -673,6 +776,7 @@ func (db *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
 }
 
 func (db *Client) Query(ctx context.Context, q *datastore.Query, cursor string, vals interface{}) ([]*datastore.Key, string, error) {
+	ctx = db.context(ctx)
 	var keys []*datastore.Key
 	var v reflect.Value
 	if vals != nil {
@@ -714,11 +818,16 @@ func (db *Client) Query(ctx context.Context, q *datastore.Query, cursor string, 
 			for i := 0; i < vSlice.Len(); i++ {
 				if vSlice.Index(i).Kind() == reflect.Ptr && vSlice.Index(i).IsNil() {
 					newElem := reflect.New(vSlice.Index(i).Type().Elem())
+
 					vSlice.Index(i).Set(newElem)
-					initModel(ctx, newElem.Interface())
+					if err := initModel(ctx, newElem.Interface()); err != nil {
+						return nil, "", err
+					}
 				}
 			}
-			loadKeys(vSlice, keys)
+			if err := loadKeys(vSlice, keys); err != nil {
+				return nil, "", err
+			}
 			if err := db.GetMulti(ctx, vSlice.Interface()); err != nil {
 				return nil, "", err
 			}
@@ -736,13 +845,17 @@ type Transaction struct {
 
 // Get loads entity to val within the transaction.
 func (t *Transaction) Get(val interface{}) error {
-	initModel(t.ctx, val)
+	if err := initModel(t.ctx, val); err != nil {
+		return err
+	}
 	key := t.client.Key(val)
 	if err := t.tx.Get(key, val); err != nil {
 		return err
 	}
 	if v, ok := val.(datastore.KeyLoader); ok {
-		v.LoadKey(key)
+		if err := v.LoadKey(key); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -759,7 +872,9 @@ func (t *Transaction) GetMulti(vals interface{}) error {
 			vv := v.Index(i)
 			vv.Set(reflect.New(v.Index(i).Type().Elem()))
 			e := vv.Interface()
-			initModel(t.ctx, e)
+			if err := initModel(t.ctx, e); err != nil {
+				return err
+			}
 		}
 	}
 	err := t.tx.GetMulti(keys, vals)
@@ -776,13 +891,17 @@ func (t *Transaction) GetMulti(vals interface{}) error {
 			return err
 		}
 	}
-	loadKeys(v, keys)
+	if err := loadKeys(v, keys); err != nil {
+		return err
+	}
 	return nil
 }
 
 // Put saves an entity within the transaction.
 func (t *Transaction) Put(val interface{}) error {
-	initModel(t.ctx, val)
+	if err := initModel(t.ctx, val); err != nil {
+		return err
+	}
 	k := t.client.Key(val)
 	if _, err := t.tx.Put(k, val); err != nil {
 		return err
@@ -793,7 +912,9 @@ func (t *Transaction) Put(val interface{}) error {
 	// We don't really have a way to propagate the pending key to the struct until commit?
 	// Actually typical DS behavior with incomplete keys in TX is you get them after commit.
 	if v, ok := val.(datastore.KeyLoader); ok {
-		v.LoadKey(k)
+		if err := v.LoadKey(k); err != nil {
+			return err
+		}
 	}
 	if as, ok := val.(AfterSave); ok {
 		old, err := reconstructOldModel(t.ctx, val, k)
@@ -814,7 +935,9 @@ func (t *Transaction) PutMulti(vals interface{}) error {
 	var as []func() error
 	for i := 0; i < v.Len(); i++ {
 		e := v.Index(i).Interface()
-		initModel(t.ctx, e)
+		if err := initModel(t.ctx, e); err != nil {
+			return err
+		}
 
 		if a, ok := e.(AfterSave); ok {
 			k := t.client.Key(e)
@@ -832,7 +955,9 @@ func (t *Transaction) PutMulti(vals interface{}) error {
 	if _, err := t.tx.PutMulti(keys, vals); err != nil {
 		return err
 	}
-	loadKeys(v, keys)
+	if err := loadKeys(v, keys); err != nil {
+		return err
+	}
 
 	if len(as) > 0 {
 		return util.Task(20, as, func(f func() error) error {
@@ -907,7 +1032,7 @@ func (db *Client) RawClient() *datastore.Client {
 	return db.rawClient
 }
 
-func loadKeys(v reflect.Value, keys []*datastore.Key) {
+func loadKeys(v reflect.Value, keys []*datastore.Key) error {
 	for i, k := range keys {
 		if k != nil {
 			vv := v.Index(i)
@@ -915,10 +1040,13 @@ func loadKeys(v reflect.Value, keys []*datastore.Key) {
 				continue
 			}
 			if v, ok := vv.Interface().(datastore.KeyLoader); ok {
-				v.LoadKey(k)
+				if err := v.LoadKey(k); err != nil {
+					return err
+				}
 			}
 		}
 	}
+	return nil
 }
 
 // Query executes a query and returns a slice of models.
@@ -975,10 +1103,15 @@ func GetMulti[T Model](ctx context.Context, db *Client, ids any) ([]T, error) {
 		if dstVal.Index(i).Kind() == reflect.Ptr && dstVal.Index(i).IsNil() {
 			newElem := reflect.New(dstVal.Index(i).Type().Elem())
 			dstVal.Index(i).Set(newElem)
-			initModel(ctx, newElem.Interface())
+			dstVal.Index(i).Set(newElem)
+			if err := initModel(ctx, newElem.Interface()); err != nil {
+				return nil, err
+			}
 		}
 	}
-	loadKeys(dstVal, keys)
+	if err := loadKeys(dstVal, keys); err != nil {
+		return nil, err
+	}
 	if err := db.GetMulti(ctx, dst); err != nil {
 		return nil, err
 	}

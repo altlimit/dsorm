@@ -93,8 +93,8 @@ type KeyMappingModel struct {
 type EncryptionModel struct {
 	dsorm.Base
 	ID        int64  `model:"id"`
-	Secret    string `marshal:"secret" encrypt:"" datastore:"-"`
-	AltSecret string `marshal:"alt_secret" encrypt:"MTIzNDU2Nzg5MDEyMzQ1Ng==" datastore:"-"` // 1234567890123456 base64 encoded
+	Secret    string `marshal:"secret,encrypt" datastore:"-"`
+	AltSecret string `marshal:"alt_secret,encrypt" datastore:"-"` // encrypted with default key
 }
 
 type JSONModel struct {
@@ -110,6 +110,12 @@ type DatastoreTagModel struct {
 	Renamed    string `datastore:"custom_name"`
 	NotIndexed string `datastore:",noindex"`
 	Indexed    string // Indexed by default
+}
+
+type DirectEncryptModel struct {
+	dsorm.Base
+	ID   int64  `model:"id"`
+	Data string `marshal:"data,encrypt" datastore:"-"`
 }
 
 // ------------------------------------------------------------------
@@ -252,15 +258,23 @@ func TestPropertyMarshaling(t *testing.T) {
 
 	// Test JSON
 	data := map[string]string{"foo": "bar"}
-	jm := &JSONModel{Data: data}
-	jm.Key = datastore.NameKey("JSONModel", "json-1", nil)
+	jm := &JSONModel{
+		ID:   int64(10),
+		Data: data,
+	}
+	// jm.Key = datastore.NameKey("JSONModel", "json-1", nil) // Use ID
+	// Mapping: ID int64 `model:"id"`. If we want string NameKey, we should change model or use LoadKey?
+	// The model has ID int64. So it will generate IDKey.
+	// But test used NameKey "json-1".
+	// Let's assume we can change the test logic to use ID=10 (already set).
+	// Or we change ID field type? No let's stick to int64 for this model struct for test.
 
 	if err := testDB.Put(ctx, jm); err != nil {
 		t.Fatalf("Put JSONModel failed: %v", err)
 	}
 
 	fetchedJM := &JSONModel{}
-	fetchedJM.Key = jm.Key
+	fetchedJM.ID = jm.ID
 	if err := testDB.Get(ctx, fetchedJM); err != nil {
 		t.Fatalf("Get JSONModel failed: %v", err)
 	}
@@ -270,20 +284,30 @@ func TestPropertyMarshaling(t *testing.T) {
 	}
 
 	// Test Encryption
+	encCtx := context.Background()
+	secret := []byte("different-secret-32-bytes-long!!") // 32 bytes, different from TestMain
+	encDB, err := dsorm.New(encCtx, dsorm.WithEncryptionKey(secret))
+	if err != nil {
+		t.Fatalf("New DB with enc key failed: %v", err)
+	}
+
 	em := &EncryptionModel{
+		ID:        int64(100),
 		Secret:    "super-secret-value",
 		AltSecret: "another-secret",
 	}
-	em.Key = datastore.NameKey("EncryptionModel", "enc-1", nil)
+	// em.Key = datastore.NameKey ... we use ID=100.
 
-	if err := testDB.Put(ctx, em); err != nil {
+	if err := encDB.Put(encCtx, em); err != nil {
 		t.Fatalf("Put EncryptionModel failed: %v", err)
 	}
 
 	// Verify encryption in Datastore (raw check)
-	rawClient := testDB.RawClient()
+	rawClient := encDB.RawClient()
+	// Need key
+	key := encDB.Key(em)
 	var rawProps datastore.PropertyList
-	if err := rawClient.Get(ctx, em.Key, &rawProps); err != nil {
+	if err := rawClient.Get(encCtx, key, &rawProps); err != nil {
 		t.Fatalf("Raw Get failed: %v", err)
 	}
 
@@ -308,8 +332,8 @@ func TestPropertyMarshaling(t *testing.T) {
 
 	// Verify Decrypt on Load
 	fetchedEM := &EncryptionModel{}
-	fetchedEM.Key = em.Key
-	if err := testDB.Get(ctx, fetchedEM); err != nil {
+	fetchedEM.ID = em.ID
+	if err := encDB.Get(encCtx, fetchedEM); err != nil {
 		t.Fatalf("Get EncryptionModel failed: %v", err)
 	}
 
@@ -318,6 +342,64 @@ func TestPropertyMarshaling(t *testing.T) {
 	}
 	if fetchedEM.AltSecret != "another-secret" {
 		t.Errorf("AltSecret decryption failed. Got '%s'", fetchedEM.AltSecret)
+	}
+
+	// Test Priority: Context Key vs Env Key
+	// Context key was set to "different-secret-32-bytes-long!!"
+	// Env key is "12345678901234567890123456789012"
+	// If we accept Env key (testDB), decryption should fail (or return garbage/error).
+	fetchedWithEnv := &EncryptionModel{}
+	fetchedWithEnv.ID = em.ID
+	if err := testDB.Get(ctx, fetchedWithEnv); err == nil {
+		// It might not error if garbage looks like string, but it shouldn't match original.
+		// Usually AES decryption without correct key/iv will produce random bytes, likely failing JSON unmarshal or just being wrong.
+		// Or error on pad check.
+		// encryption.Decrypt might error.
+		if fetchedWithEnv.Secret == "super-secret-value" {
+			t.Error("Decrypted successfully with Env key but should have used Context key for encryption!")
+		}
+	} else {
+		// Error is expected/possible
+		t.Logf("Expected error decrypting with wrong key: %v", err)
+	}
+
+	// Test DirectEncryptModel (new tag behavior)
+	dem := &DirectEncryptModel{
+		ID:   500,
+		Data: "sensitive-data",
+	}
+	if err := encDB.Put(encCtx, dem); err != nil {
+		t.Fatalf("Put DirectEncryptModel failed: %v", err)
+	}
+
+	fetchedDEM := &DirectEncryptModel{ID: 500}
+	if err := encDB.Get(encCtx, fetchedDEM); err != nil {
+		t.Fatalf("Get DirectEncryptModel failed: %v", err)
+	}
+	if fetchedDEM.Data != "sensitive-data" {
+		t.Errorf("DirectEncryptModel data mismatch. Got '%s'", fetchedDEM.Data)
+	}
+
+	// Verify it is indeed encrypted in raw
+	keyDEM := encDB.Key(dem)
+	var rawPropsDEM datastore.PropertyList
+	if err := rawClient.Get(encCtx, keyDEM, &rawPropsDEM); err != nil {
+		t.Fatalf("Raw Get DEM failed: %v", err)
+	}
+	foundData := false
+	for _, p := range rawPropsDEM {
+		if p.Name == "data" {
+			foundData = true
+			if p.Value.(string) == "\"sensitive-data\"" {
+				t.Error("DirectEncryptModel data stored in plain text")
+			}
+			if !p.NoIndex {
+				t.Error("DirectEncryptModel data should be NoIndex")
+			}
+		}
+	}
+	if !foundData {
+		t.Error("DirectEncryptModel data property not found")
 	}
 }
 
@@ -330,7 +412,8 @@ func TestDatastoreTags(t *testing.T) {
 		Indexed:    "visible",
 	}
 	// Use a new random key to avoid collision with previous runs
-	m.Key = datastore.NameKey("DatastoreTagModel", fmt.Sprintf("dtag-%d", time.Now().UnixNano()), nil)
+	// m.Key = ... use ID
+	m.ID = time.Now().UnixNano()
 
 	if err := testDB.Put(ctx, m); err != nil {
 		t.Fatalf("Put failed: %v", err)
@@ -338,8 +421,10 @@ func TestDatastoreTags(t *testing.T) {
 
 	// Verify via Raw Client
 	rawClient := testDB.RawClient()
+	// Need key - use db.Key to generate it as we rely on ID
+	key := testDB.Key(m)
 	var rawProps datastore.PropertyList
-	if err := rawClient.Get(ctx, m.Key, &rawProps); err != nil {
+	if err := rawClient.Get(ctx, key, &rawProps); err != nil {
 		t.Fatalf("Raw Get failed: %v", err)
 	}
 
@@ -411,8 +496,11 @@ func TestDBOperations(t *testing.T) {
 	// PutMulti
 	var models []*LifecycleModel
 	for i := 0; i < 5; i++ {
-		m := &LifecycleModel{Value: fmt.Sprintf("val-%d", i)}
-		m.Key = datastore.NameKey("LifecycleModel", fmt.Sprintf("multi-%d", i), nil)
+		m := &LifecycleModel{
+			ID:    int64(i + 1000), // Explicit ID
+			Value: fmt.Sprintf("val-%d", i),
+		}
+		// m.Key = ...
 		models = append(models, m)
 	}
 
@@ -424,7 +512,15 @@ func TestDBOperations(t *testing.T) {
 	var fetchedModels []*LifecycleModel
 	for _, m := range models {
 		newM := &LifecycleModel{}
-		newM.ID = m.Key.ID
+		// newM.ID = m.Key.ID // m.Key is method now, returning *Key.
+		// Wait, m (LifecycleModel) has Base embedded. m.Key() returns *Key.
+		// BUT we haven't Loaded m yet, so m.Key() might be nil if it wasn't set by Put?
+		// Put calls LoadKey on the struct if it implements KeyLoader. Base does.
+		// So m.Key() should be populated after Put.
+		if m.Key() == nil {
+			t.Fatalf("Model key is nil after Put")
+		}
+		newM.ID = m.Key().ID
 		fetchedModels = append(fetchedModels, newM)
 	}
 
@@ -682,7 +778,7 @@ func TestGetMultiGeneric(t *testing.T) {
 	// 3. Test with []*datastore.Key
 	var keys []*datastore.Key
 	for _, m := range intModels {
-		keys = append(keys, m.Key)
+		keys = append(keys, m.Key())
 	}
 	resKeys, err := dsorm.GetMulti[*LifecycleModel](ctx, testDB, keys)
 	if err != nil {

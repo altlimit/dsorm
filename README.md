@@ -9,7 +9,7 @@
 - **Auto-Caching**: Transparently caches keys/entities in Memory, Redis, or Memcache.
 - **Model Hooks**: `BeforeSave`, `AfterSave`, `OnLoad` lifecycle methods.
 - **Key Mapping**: Use struct tags (e.g., `model:"id"`) to map keys to struct fields.
-- **Field Encryption**: Built-in encryption for sensitive string fields via `encrypt` tag.
+- **Field Encryption**: Built-in encryption for sensitive string fields via `marshal:"name,encrypt"` tag.
 - **JSON Marshaling**: Store complex structs/maps as compact JSON strings via `marshal` tag.
 - **API Parity**: Wraps standard `datastore` methods (`Put`, `Get`, `RunInTransaction`) for easy migration.
 
@@ -42,7 +42,8 @@ if err != nil {
 // With Options
 client, err = dsorm.New(ctx, 
     dsorm.WithProjectID("my-project"),
-    dsorm.WithCachePrefix("myapp:"), 
+    dsorm.WithCachePrefix("myapp:"),
+    dsorm.WithEncryptionKey([]byte("my-32-byte-secret-key...")),
 )
 ```
 
@@ -58,34 +59,13 @@ type User struct {
     Parent    *datastore.Key `model:"parent"`   // Auto-used for Key Parent (can also use *ParentModel)
     Username  string
     Email     string    `datastore:"email"`
-    Secret    string    `encrypt:""`
+    Secret    string    `marshal:"secret,encrypt"`     // Encrypted + NoIndex + stored as "secret"
     Profile   map[string]string `marshal:"profile"` 
     CreatedAt time.Time `model:"created"`  // Auto-set on creation
     UpdatedAt time.Time `model:"modified"` // Auto-set on save
 }
-
-// Optional: Lifecycle Hooks
-func (u *User) BeforeSave(ctx context.Context, m dsorm.Model) error {
-    u.Namespace = "my-app" // Set defaults
-    return nil
-}
-
-func (u *User) AfterSave(ctx context.Context, old dsorm.Model) error {
-    // old is nil if creating new entity
-    if old != nil {
-        oldUser := old.(*User)
-        fmt.Printf("Changed from %s to %s\n", oldUser.Username, u.Username)
-    }
-    return nil
-}
-
-func (u *User) BeforeDelete(ctx context.Context) error {
-    return nil
-}
-
-func (u *User) AfterDelete(ctx context.Context) error {
-    return nil
-}
+// Access key via u.Key()
+// ...
 ```
 
 ### 3. CRUD Operations
@@ -147,12 +127,12 @@ users, err := dsorm.GetMulti[*User](ctx, client, ids)
 
 ## Configuration
 
-Set environment variables to configure defaults:
+Set environment variables to configure defaults (fallback):
 
 | Variable | Description |
 |----------|-------------|
 | `DATASTORE_PROJECT_ID` | Google Cloud Project ID. |
-| `DATASTORE_ENCRYPTION_KEY` | 32-byte key for field encryption. |
+| `DATASTORE_ENCRYPTION_KEY` | 32-byte key for field encryption (Fallback if not provided in Context). |
 | `REDIS_ADDR` | Address for Redis cache (e.g., `localhost:6379`). |
 
 ## License
