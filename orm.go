@@ -517,11 +517,12 @@ func (db *Client) Get(ctx context.Context, val interface{}) error {
 }
 
 // GetMulti loads multiple entities.
-func (db *Client) GetMulti(ctx context.Context, keys []*datastore.Key, vals interface{}) error {
+func (db *Client) GetMulti(ctx context.Context, vals interface{}) error {
 	v := reflect.ValueOf(vals)
 	if v.Kind() != reflect.Slice {
 		return fmt.Errorf("datastore.DB.GetMulti: must be slice type not '%v'", v.Kind())
 	}
+	keys := db.Keys(vals)
 	for i, k := range keys {
 		if k != nil {
 			vv := v.Index(i)
@@ -709,7 +710,16 @@ func (db *Client) Query(ctx context.Context, q *datastore.Query, cursor string, 
 	if vals != nil {
 		v.Elem().Set(reflect.MakeSlice(v.Elem().Type(), len(keys), len(keys)))
 		if len(keys) > 0 {
-			if err := db.GetMulti(ctx, keys, v.Elem().Interface()); err != nil {
+			vSlice := v.Elem()
+			for i := 0; i < vSlice.Len(); i++ {
+				if vSlice.Index(i).Kind() == reflect.Ptr && vSlice.Index(i).IsNil() {
+					newElem := reflect.New(vSlice.Index(i).Type().Elem())
+					vSlice.Index(i).Set(newElem)
+					initModel(ctx, newElem.Interface())
+				}
+			}
+			loadKeys(vSlice, keys)
+			if err := db.GetMulti(ctx, vSlice.Interface()); err != nil {
 				return nil, "", err
 			}
 		}
@@ -738,11 +748,12 @@ func (t *Transaction) Get(val interface{}) error {
 }
 
 // GetMulti loads multiple entities within the transaction.
-func (t *Transaction) GetMulti(keys []*datastore.Key, vals interface{}) error {
+func (t *Transaction) GetMulti(vals interface{}) error {
 	v := reflect.ValueOf(vals)
 	if v.Kind() != reflect.Slice {
 		return fmt.Errorf("dsorm.Transaction.GetMulti: must be slice type not '%v'", v.Kind())
 	}
+	keys := t.client.Keys(vals)
 	for i, k := range keys {
 		if k != nil {
 			vv := v.Index(i)
@@ -959,7 +970,16 @@ func GetMulti[T Model](ctx context.Context, db *Client, ids any) ([]T, error) {
 	}
 
 	dst := make([]T, len(keys))
-	if err := db.GetMulti(ctx, keys, dst); err != nil {
+	dstVal := reflect.ValueOf(dst)
+	for i := 0; i < dstVal.Len(); i++ {
+		if dstVal.Index(i).Kind() == reflect.Ptr && dstVal.Index(i).IsNil() {
+			newElem := reflect.New(dstVal.Index(i).Type().Elem())
+			dstVal.Index(i).Set(newElem)
+			initModel(ctx, newElem.Interface())
+		}
+	}
+	loadKeys(dstVal, keys)
+	if err := db.GetMulti(ctx, dst); err != nil {
 		return nil, err
 	}
 	return dst, nil

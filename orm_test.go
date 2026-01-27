@@ -21,7 +21,9 @@ func TestMain(m *testing.M) {
 	flag.Parse()
 
 	// Setup Emulator
-	os.Setenv("DATASTORE_EMULATOR_HOST", "localhost:8081")
+	if os.Getenv("DATASTORE_EMULATOR_HOST") == "" {
+		os.Setenv("DATASTORE_EMULATOR_HOST", "localhost:8081")
+	}
 	os.Setenv("DATASTORE_PROJECT_ID", "app-test")
 	// Setup Encryption Key
 	os.Setenv("DATASTORE_ENCRYPTION_KEY", "12345678901234567890123456789012") // 32 bytes
@@ -420,13 +422,13 @@ func TestDBOperations(t *testing.T) {
 
 	// GetMulti
 	var fetchedModels []*LifecycleModel
-	var keys []*datastore.Key
 	for _, m := range models {
-		fetchedModels = append(fetchedModels, &LifecycleModel{})
-		keys = append(keys, m.Key)
+		newM := &LifecycleModel{}
+		newM.ID = m.Key.ID
+		fetchedModels = append(fetchedModels, newM)
 	}
 
-	if err := testDB.GetMulti(ctx, keys, fetchedModels); err != nil {
+	if err := testDB.GetMulti(ctx, fetchedModels); err != nil {
 		t.Fatalf("GetMulti failed: %v", err)
 	}
 
