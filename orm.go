@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/datastore"
@@ -165,45 +166,55 @@ func (b *Base) LoadKey(k *datastore.Key) error {
 	t := reflect.TypeOf(b.entity)
 	v := reflect.ValueOf(b.entity)
 	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
 		v = v.Elem()
 	}
-	for _, field := range structtag.GetFieldsByTag(b.entity, "model") {
-		tag := field.Tag
-		switch tag {
-		case "id":
-			vv := v.Field(field.Index)
-			var val reflect.Value
-			switch vv.Kind() {
-			case reflect.String:
-				val = reflect.ValueOf(k.Name)
-			case reflect.Int64:
-				val = reflect.ValueOf(k.ID)
+
+	info := getTypeInfo(t)
+
+	// ID
+	if info.idField != nil {
+		vv := v.Field(info.idField.Index)
+		var val reflect.Value
+		switch vv.Kind() {
+		case reflect.String:
+			val = reflect.ValueOf(k.Name)
+		case reflect.Int64:
+			val = reflect.ValueOf(k.ID)
+		}
+		vv.Set(val)
+	}
+
+	// Parent
+	if info.parentField != nil {
+		vv := v.Field(info.parentField.Index)
+		if p, ok := vv.Interface().(*datastore.Key); ok {
+			if p != nil && p.Namespace != "" {
+				k.Namespace = p.Namespace
 			}
-			vv.Set(val)
-		case "parent":
-			vv := v.Field(field.Index)
-			if p, ok := vv.Interface().(*datastore.Key); ok {
-				if p != nil && p.Namespace != "" {
-					k.Namespace = p.Namespace
-				}
-				vv.Set(reflect.ValueOf(k.Parent))
-			} else if k.Parent != nil && vv.Kind() == reflect.Ptr && vv.Type().Elem().Kind() == reflect.Struct {
-				if vv.IsNil() {
-					vv.Set(reflect.New(vv.Type().Elem()))
-				}
-				if vv.IsNil() {
-					vv.Set(reflect.New(vv.Type().Elem()))
-				}
-				initModel(b.ctx, vv.Interface())
-				if kl, ok := vv.Interface().(datastore.KeyLoader); ok {
-					kl.LoadKey(k.Parent)
+			vv.Set(reflect.ValueOf(k.Parent))
+		} else if k.Parent != nil && vv.Kind() == reflect.Ptr && vv.Type().Elem().Kind() == reflect.Struct {
+			if vv.IsNil() {
+				vv.Set(reflect.New(vv.Type().Elem()))
+			}
+			if vv.IsNil() {
+				vv.Set(reflect.New(vv.Type().Elem()))
+			}
+			if err := initModel(b.ctx, vv.Interface()); err != nil {
+				return err
+			}
+			if kl, ok := vv.Interface().(datastore.KeyLoader); ok {
+				if err := kl.LoadKey(k.Parent); err != nil {
+					return err
 				}
 			}
-		case "ns":
-			if k.Namespace == "" {
-				continue
-			}
-			vv := v.Field(field.Index)
+		}
+	}
+
+	// NS
+	if info.nsField != nil {
+		if k.Namespace != "" {
+			vv := v.Field(info.nsField.Index)
 			var val reflect.Value
 			switch vv.Kind() {
 			case reflect.String:
@@ -238,19 +249,17 @@ func loadModel(ctx context.Context, e any, ps []datastore.Property) error {
 	if m, ok := e.(modeler); ok {
 		m.setInitProps(ps)
 	}
-	fields := make(map[string]*structtag.StructField)
-	for _, field := range structtag.GetFieldsByTag(e, "marshal") {
-		// handle legacy or multi-options? "name,encrypt"
-		// We map by property name. Property name is first part of the tag.
-		parts := strings.Split(field.Tag, ",")
-		fields[parts[0]] = field
-	}
-	var props []datastore.Property
 	t := reflect.TypeOf(e)
 	v := reflect.ValueOf(e)
 	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
 		v = v.Elem()
 	}
+
+	info := getTypeInfo(t)
+	fields := info.marshalFields
+	var props []datastore.Property
+
 	for _, p := range ps {
 		if field, ok := fields[p.Name]; ok {
 			vv := v.Field(field.Index)
@@ -260,17 +269,8 @@ func loadModel(ctx context.Context, e any, ps []datastore.Property) error {
 			}
 			i := reflect.New(vt).Interface()
 			val := p.Value
-			// Check options in tag
-			parts := strings.Split(field.Tag, ",")
-			shouldDecrypt := false
-			for _, opt := range parts[1:] {
-				if opt == "encrypt" {
-					shouldDecrypt = true
-					break
-				}
-			}
-
-			if shouldDecrypt {
+			// Decrypt if needed
+			if field.Encrypt {
 				// decrypt value first
 				if enc, ok := val.(string); ok {
 					var (
@@ -318,40 +318,40 @@ func saveModel(ctx context.Context, e any) ([]datastore.Property, error) {
 	t := reflect.TypeOf(e)
 	v := reflect.ValueOf(e)
 	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
 		v = v.Elem()
 	}
 	now := time.Now().UTC()
 	m, ok := e.(Model)
-	for _, field := range structtag.GetFieldsByTag(e, "model") {
-		tag := field.Tag
-		switch tag {
-		case "created":
-			if ok && m.IsNew() {
-				vv := v.Field(field.Index)
-				vv.Set(reflect.ValueOf(now))
-			}
-		case "modified":
-			if ok {
-				vv := v.Field(field.Index)
-				vv.Set(reflect.ValueOf(now))
-			}
+
+	info := getTypeInfo(t)
+
+	// Created/Modified
+	if info.createdField != nil {
+		if ok && m.IsNew() {
+			vv := v.Field(info.createdField.Index)
+			vv.Set(reflect.ValueOf(now))
 		}
 	}
+	if info.modifiedField != nil {
+		if ok {
+			vv := v.Field(info.modifiedField.Index)
+			vv.Set(reflect.ValueOf(now))
+		}
+	}
+
 	props, err := datastore.SaveStruct(e)
 	if err != nil {
 		return nil, err
 	}
-	// Handle Marshal tags
-	for _, field := range structtag.GetFieldsByTag(e, "marshal") {
-		// tag might be "name,encrypt"
-		parts := strings.Split(field.Tag, ",")
-		tag := parts[0]
+	// Handle Marshal tags using cache list
+	for _, fi := range info.marshalFieldsList {
 
-		vv := v.Field(field.Index)
+		vv := v.Field(fi.Index)
 		if vv.IsZero() {
 			continue
 		}
-		props, err = appendMarshaledProp(ctx, props, tag, field, vv, parts[1:])
+		props, err = appendMarshaledProp(ctx, props, fi.Name, vv, fi.Encrypt)
 		if err != nil {
 			return nil, err
 		}
@@ -359,7 +359,7 @@ func saveModel(ctx context.Context, e any) ([]datastore.Property, error) {
 	return props, nil
 }
 
-func appendMarshaledProp(ctx context.Context, props []datastore.Property, tag string, field *structtag.StructField, vv reflect.Value, options []string) ([]datastore.Property, error) {
+func appendMarshaledProp(ctx context.Context, props []datastore.Property, tag string, vv reflect.Value, shouldEncrypt bool) ([]datastore.Property, error) {
 	b, err := json.Marshal(vv.Interface())
 	if err != nil {
 		return nil, err
@@ -369,16 +369,6 @@ func appendMarshaledProp(ctx context.Context, props []datastore.Property, tag st
 		NoIndex: true,
 	}
 	val := string(b)
-
-	// Check encryption
-	shouldEncrypt := false
-
-	for _, opt := range options {
-		if opt == "encrypt" {
-			shouldEncrypt = true
-			break
-		}
-	}
 
 	if shouldEncrypt {
 		var (
@@ -1116,4 +1106,85 @@ func GetMulti[T Model](ctx context.Context, db *Client, ids any) ([]T, error) {
 		return nil, err
 	}
 	return dst, nil
+}
+
+// ------------------------------------------------------------------
+// Caching for Performance
+// ------------------------------------------------------------------
+
+var typeCache sync.Map
+
+type typeInfo struct {
+	idField       *structtag.StructField
+	parentField   *structtag.StructField
+	nsField       *structtag.StructField
+	createdField  *structtag.StructField
+	modifiedField *structtag.StructField
+
+	marshalFields     map[string]*fieldInfo // for Load (lookup by prop name)
+	marshalFieldsList []*fieldInfo          // for Save (ordered iteration)
+}
+
+type fieldInfo struct {
+	Index   int
+	Name    string
+	Encrypt bool
+}
+
+func getTypeInfo(t reflect.Type) *typeInfo {
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if v, ok := typeCache.Load(t); ok {
+		return v.(*typeInfo)
+	}
+
+	info := &typeInfo{
+		marshalFields: make(map[string]*fieldInfo),
+	}
+
+	// Model tags
+	// We need an instance to call GetFieldsByTag which expects 'any' but uses reflect.TypeOf.
+	// Actually structtag.GetFieldsByTag takes 'entity any' and does reflect.TypeOf(entity).
+	// So passing reflect.New(t).Interface() works.
+	dummy := reflect.New(t).Interface()
+
+	for _, field := range structtag.GetFieldsByTag(dummy, "model") {
+		switch field.Tag {
+		case "id":
+			info.idField = field
+		case "parent":
+			info.parentField = field
+		case "ns":
+			info.nsField = field
+		case "created":
+			info.createdField = field
+		case "modified":
+			info.modifiedField = field
+		}
+	}
+
+	// Marshal tags
+	for _, field := range structtag.GetFieldsByTag(dummy, "marshal") {
+		parts := strings.Split(field.Tag, ",")
+		name := parts[0]
+		encrypt := false
+		for _, opt := range parts[1:] {
+			if opt == "encrypt" {
+				encrypt = true
+				break
+			}
+		}
+
+		fi := &fieldInfo{
+			Index:   field.Index,
+			Name:    name,
+			Encrypt: encrypt,
+		}
+		info.marshalFields[name] = fi
+		info.marshalFieldsList = append(info.marshalFieldsList, fi)
+	}
+
+	typeCache.Store(t, info)
+	return info
 }
