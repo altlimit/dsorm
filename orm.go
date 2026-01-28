@@ -828,9 +828,15 @@ func (db *Client) Query(ctx context.Context, q *datastore.Query, cursor string, 
 
 // Transaction wraps ds.Transaction to provide dsorm functionality (ID mapping, lifecycle hooks).
 type Transaction struct {
-	tx     *ds.Transaction
-	client *Client
-	ctx    context.Context
+	tx      *ds.Transaction
+	client  *Client
+	ctx     context.Context
+	pending []pendingItem
+}
+
+type pendingItem struct {
+	pk   *datastore.PendingKey
+	item interface{}
 }
 
 // Get loads entity to val within the transaction.
@@ -893,14 +899,13 @@ func (t *Transaction) Put(val interface{}) error {
 		return err
 	}
 	k := t.client.Key(val)
-	if _, err := t.tx.Put(k, val); err != nil {
+	pk, err := t.tx.Put(k, val)
+	if err != nil {
 		return err
 	}
-	// Note: tx.Put returns a PendingKey, but dsorm usually relies on the struct being updated or key known.
-	// Since we are inside a tx, ID allocation for incomplete keys happens at commit.
-	// However, datastore.Transaction.Put returns (*PendingKey, error).
-	// We don't really have a way to propagate the pending key to the struct until commit?
-	// Actually typical DS behavior with incomplete keys in TX is you get them after commit.
+	if pk != nil {
+		t.pending = append(t.pending, pendingItem{pk, val})
+	}
 	if v, ok := val.(datastore.KeyLoader); ok {
 		if err := v.LoadKey(k); err != nil {
 			return err
@@ -942,8 +947,16 @@ func (t *Transaction) PutMulti(vals interface{}) error {
 		}
 	}
 	keys := t.client.Keys(vals)
-	if _, err := t.tx.PutMulti(keys, vals); err != nil {
+	pks, err := t.tx.PutMulti(keys, vals)
+	if err != nil {
 		return err
+	}
+	if len(pks) == v.Len() {
+		for i, pk := range pks {
+			if pk != nil {
+				t.pending = append(t.pending, pendingItem{pk, v.Index(i).Interface()})
+			}
+		}
 	}
 	if err := loadKeys(v, keys); err != nil {
 		return err
@@ -1004,14 +1017,41 @@ func (t *Transaction) DeleteMulti(vals interface{}) error {
 
 // Transact runs a function in a transaction.
 func (db *Client) Transact(ctx context.Context, f func(tx *Transaction) error) (*datastore.Commit, error) {
-	return db.client.RunInTransaction(ctx, func(tx *ds.Transaction) error {
+	var pending []pendingItem
+
+	cmt, err := db.client.RunInTransaction(ctx, func(tx *ds.Transaction) error {
 		dsormTx := &Transaction{
 			tx:     tx,
 			client: db,
 			ctx:    ctx,
 		}
-		return f(dsormTx)
+		if err := f(dsormTx); err != nil {
+			return err
+		}
+		pending = dsormTx.pending
+		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	if len(pending) > 0 && cmt != nil {
+		// Resolve pending keys
+		for _, p := range pending {
+			k := cmt.Key(p.pk)
+			if k != nil {
+				if v, ok := p.item.(datastore.KeyLoader); ok {
+					if err := v.LoadKey(k); err != nil {
+						// Should we error here? The TX is already committed.
+						// Logging or returning error is tricky.
+						return cmt, err
+					}
+				}
+			}
+		}
+	}
+	return cmt, nil
+
 }
 
 func (db *Client) Client() *ds.Client {

@@ -797,3 +797,23 @@ func TestGetMultiGeneric(t *testing.T) {
 		t.Errorf("Expected 3 results from structs, got %d", len(resStructs))
 	}
 }
+
+func TestTransactionPendingKey(t *testing.T) {
+	ctx := context.Background()
+	m := &LifecycleModel{Value: "pending-key"}
+	// ID is 0, so incomplete key.
+
+	// Run transaction
+	_, err := testDB.Transact(ctx, func(tx *dsorm.Transaction) error {
+		return tx.Put(m)
+	})
+	if err != nil {
+		t.Fatalf("Transact failed: %v", err)
+	}
+
+	// After fix, this should be populated.
+	// Currently, we expect this to likely be 0.
+	if m.ID == 0 {
+		t.Error("ID is 0, expected it to be populated from PendingKey")
+	}
+}
