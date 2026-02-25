@@ -8,11 +8,11 @@ import (
 	"go.opencensus.io/trace"
 )
 
-// Transaction wraps datastore.Transaction with caching.
+// Transaction wraps ds.TransactionStore with caching.
 type Transaction struct {
 	c   *Client
 	ctx context.Context
-	tx  *datastore.Transaction
+	tx  TransactionStore
 	sync.Mutex
 	lockCacheItems []*Item
 }
@@ -32,11 +32,11 @@ func (t *Transaction) lockKeys(keys []*datastore.Key) {
 }
 
 // NewTransaction starts a transaction with cache-aware context.
-func (c *Client) NewTransaction(ctx context.Context, opts ...datastore.TransactionOption) (t *Transaction, err error) {
+func (c *Client) NewTransaction(ctx context.Context, opts ...datastore.TransactionOption) (*Transaction, error) {
 	var span *trace.Span
 	ctx, span = trace.StartSpan(ctx, "github.com/altlimit/dsorm.NewTransaction")
 	defer span.End()
-	tx, err := c.Client.NewTransaction(ctx, opts...)
+	tx, err := c.Transactioner.NewTransaction(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -115,11 +115,6 @@ func (t *Transaction) Rollback() (err error) {
 	return t.tx.Rollback()
 }
 
-// Query helper for underlying TX.
-func (t *Transaction) Query(q *datastore.Query) *datastore.Query {
-	return q.Transaction(t.tx)
-}
-
 // Mutate locks keys from mutations.
 func (t *Transaction) Mutate(muts ...*Mutation) ([]*datastore.PendingKey, error) {
 	var span *trace.Span
@@ -141,7 +136,7 @@ func (c *Client) RunInTransaction(ctx context.Context, f func(tx *Transaction) e
 	ctx, span = trace.StartSpan(ctx, "github.com/altlimit/dsorm.RunInTransaction")
 	defer span.End()
 
-	return c.Client.RunInTransaction(ctx, func(tx *datastore.Transaction) error {
+	return c.Transactioner.RunInTransaction(ctx, func(tx TransactionStore) error {
 		txn := &Transaction{c: c, ctx: ctx, tx: tx}
 		if err := f(txn); err != nil {
 			return err

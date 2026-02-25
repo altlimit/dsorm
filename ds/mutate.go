@@ -111,5 +111,5 @@ func (c *Client) Mutate(ctx context.Context, muts ...*Mutation) ([]*datastore.Ke
 		}
 	}
 
-	return c.Client.Mutate(ctx, mutations...)
+	return c.Store.Mutate(ctx, mutations...)
 }

@@ -10,11 +10,21 @@ import (
 
 	"cloud.google.com/go/datastore"
 	"github.com/altlimit/dsorm"
+	"github.com/altlimit/dsorm/ds"
+	"github.com/ostafen/clover/v2"
 )
 
 // Global test DB instance for convenience, or strictly local?
 // Let's use a global one initialized in TestMain for simplicity, mimicking previous behavior
-var testDB *dsorm.Client
+var testClients map[string]*dsorm.Client
+
+func runAllStores(t *testing.T, f func(*testing.T, *dsorm.Client)) {
+	for name, db := range testClients {
+		t.Run(name, func(t *testing.T) {
+			f(t, db)
+		})
+	}
+}
 
 // TestMain setups the environment for tests
 func TestMain(m *testing.M) {
@@ -30,10 +40,24 @@ func TestMain(m *testing.M) {
 
 	// Initialize DB
 	ctx := context.Background()
-	var err error
-	testDB, err = dsorm.New(ctx)
+	testDB, err := dsorm.New(ctx)
 	if err != nil {
 		panic(err)
+	}
+
+	cloverDB, err := clover.Open("")
+	if err != nil {
+		panic(err)
+	}
+	localStore := ds.NewLocalStore(cloverDB)
+	localClient, err := dsorm.New(ctx, dsorm.WithStore(localStore, localStore.(ds.Queryer), localStore.(ds.Transactioner)))
+	if err != nil {
+		panic(err)
+	}
+
+	testClients = map[string]*dsorm.Client{
+		"CloudStore": testDB,
+		"LocalStore": localClient,
 	}
 
 	code := m.Run()
@@ -123,6 +147,10 @@ type DirectEncryptModel struct {
 // ------------------------------------------------------------------
 
 func TestModelLifecycle(t *testing.T) {
+	runAllStores(t, testModelLifecycle)
+}
+
+func testModelLifecycle(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 
 	m := &LifecycleModel{Value: "lifecycle"}
@@ -215,6 +243,10 @@ func TestModelLifecycle(t *testing.T) {
 }
 
 func TestKeyMapping(t *testing.T) {
+	runAllStores(t, testKeyMapping)
+}
+
+func testKeyMapping(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 	parentKey := datastore.NameKey("Parent", "parent-id", nil)
 	parentKey.Namespace = "ns-custom"
@@ -254,6 +286,10 @@ func TestKeyMapping(t *testing.T) {
 }
 
 func TestPropertyMarshaling(t *testing.T) {
+	runAllStores(t, testPropertyMarshaling)
+}
+
+func testPropertyMarshaling(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 
 	// Test JSON
@@ -303,11 +339,11 @@ func TestPropertyMarshaling(t *testing.T) {
 	}
 
 	// Verify encryption in Datastore (raw check)
-	rawClient := encDB.RawClient()
+	store := encDB.InternalClient().Store
 	// Need key
 	key := encDB.Key(em)
 	var rawProps datastore.PropertyList
-	if err := rawClient.Get(encCtx, key, &rawProps); err != nil {
+	if err := store.Get(encCtx, key, &rawProps); err != nil {
 		t.Fatalf("Raw Get failed: %v", err)
 	}
 
@@ -383,7 +419,7 @@ func TestPropertyMarshaling(t *testing.T) {
 	// Verify it is indeed encrypted in raw
 	keyDEM := encDB.Key(dem)
 	var rawPropsDEM datastore.PropertyList
-	if err := rawClient.Get(encCtx, keyDEM, &rawPropsDEM); err != nil {
+	if err := store.Get(encCtx, keyDEM, &rawPropsDEM); err != nil {
 		t.Fatalf("Raw Get DEM failed: %v", err)
 	}
 	foundData := false
@@ -404,6 +440,10 @@ func TestPropertyMarshaling(t *testing.T) {
 }
 
 func TestDatastoreTags(t *testing.T) {
+	runAllStores(t, testDatastoreTags)
+}
+
+func testDatastoreTags(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 	m := &DatastoreTagModel{
 		Ignored:    "should-not-save",
@@ -420,11 +460,11 @@ func TestDatastoreTags(t *testing.T) {
 	}
 
 	// Verify via Raw Client
-	rawClient := testDB.RawClient()
+	store := testDB.InternalClient().Store
 	// Need key - use db.Key to generate it as we rely on ID
 	key := testDB.Key(m)
 	var rawProps datastore.PropertyList
-	if err := rawClient.Get(ctx, key, &rawProps); err != nil {
+	if err := store.Get(ctx, key, &rawProps); err != nil {
 		t.Fatalf("Raw Get failed: %v", err)
 	}
 
@@ -468,7 +508,7 @@ func TestDatastoreTags(t *testing.T) {
 
 	// Verify Query behavior
 	// Querying on unindexed field should return nothing
-	q := datastore.NewQuery("DatastoreTagModel").FilterField("NotIndexed", "=", "hidden")
+	q := dsorm.NewQuery("DatastoreTagModel").FilterField("NotIndexed", "=", "hidden")
 	results, _, err := dsorm.Query[*DatastoreTagModel](ctx, testDB, q, "")
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
@@ -478,7 +518,7 @@ func TestDatastoreTags(t *testing.T) {
 	}
 
 	// Querying on indexed field should find it
-	q2 := datastore.NewQuery("DatastoreTagModel").FilterField("Indexed", "=", "visible")
+	q2 := dsorm.NewQuery("DatastoreTagModel").FilterField("Indexed", "=", "visible")
 	results2, _, err := dsorm.Query[*DatastoreTagModel](ctx, testDB, q2, "")
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
@@ -491,6 +531,10 @@ func TestDatastoreTags(t *testing.T) {
 }
 
 func TestDBOperations(t *testing.T) {
+	runAllStores(t, testDBOperations)
+}
+
+func testDBOperations(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 
 	// PutMulti
@@ -535,7 +579,7 @@ func TestDBOperations(t *testing.T) {
 	}
 
 	// Query
-	q := datastore.NewQuery("LifecycleModel").Order("Value")
+	q := dsorm.NewQuery("LifecycleModel").Order("Value")
 	results, _, err := dsorm.Query[*LifecycleModel](ctx, testDB, q, "")
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
@@ -566,6 +610,10 @@ func TestDBOperations(t *testing.T) {
 }
 
 func TestTransactions(t *testing.T) {
+	runAllStores(t, testTransactions)
+}
+
+func testTransactions(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 	m := &LifecycleModel{ID: 555, Value: "initial"}
 	// ID=555 -> Key(LifecycleModel, 555)
@@ -633,6 +681,10 @@ type ChildModel struct {
 }
 
 func TestStructParent(t *testing.T) {
+	runAllStores(t, testStructParent)
+}
+
+func testStructParent(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 
 	parent := &ParentModel{ID: "parent-1"}
@@ -696,6 +748,10 @@ func TestStructParent(t *testing.T) {
 }
 
 func TestGetMultiGeneric(t *testing.T) {
+	runAllStores(t, testGetMultiGeneric)
+}
+
+func testGetMultiGeneric(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 
 	// 1. Test with []string using KeyMappingModel (String ID)
@@ -799,6 +855,10 @@ func TestGetMultiGeneric(t *testing.T) {
 }
 
 func TestTransactionPendingKey(t *testing.T) {
+	runAllStores(t, testTransactionPendingKey)
+}
+
+func testTransactionPendingKey(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 	m := &LifecycleModel{Value: "pending-key"}
 	// ID is 0, so incomplete key.

@@ -14,8 +14,9 @@ type Client struct {
 	onErrorFn   OnErrorFunc
 	cachePrefix string
 
-	// TODO: Client is exported since we embedded datastore.Client - fix this
-	*datastore.Client
+	Store
+	Queryer
+	Transactioner
 }
 
 // ClientOption option for dsorm Client.
@@ -23,7 +24,18 @@ type ClientOption func(*Client)
 
 func WithDatastoreClient(ds *datastore.Client) ClientOption {
 	return func(c *Client) {
-		c.Client = ds
+		b := NewCloudStore(ds)
+		c.Store = b
+		c.Queryer = b
+		c.Transactioner = b
+	}
+}
+
+func WithStore(s Store, q Queryer, t Transactioner) ClientOption {
+	return func(c *Client) {
+		c.Store = s
+		c.Queryer = q
+		c.Transactioner = t
 	}
 }
 
@@ -55,12 +67,15 @@ func NewClient(ctx context.Context, cacher Cache, opts ...ClientOption) (*Client
 		opt(client)
 	}
 
-	if client.Client == nil {
+	if client.Store == nil {
 		// Default datastore.Client
 		if ds, err := datastore.NewClient(ctx, ""); err != nil {
 			return nil, err
 		} else {
-			client.Client = ds
+			b := NewCloudStore(ds)
+			client.Store = b
+			client.Queryer = b
+			client.Transactioner = b
 		}
 	}
 
