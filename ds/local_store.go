@@ -3,6 +3,7 @@ package ds
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -11,9 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"cloud.google.com/go/datastore"
-	uuid "github.com/satori/go.uuid"
 	"google.golang.org/api/iterator"
 	_ "modernc.org/sqlite"
 )
@@ -25,8 +26,6 @@ type localStore struct {
 
 	// cache for kind existence: namespace -> kind -> true
 	kindCache map[string]map[string]bool
-	// cache for index fields: namespace -> kind -> field -> true
-	idxCache map[string]map[string]map[string]bool
 }
 
 func NewLocalStore(basePath string) Store {
@@ -34,7 +33,6 @@ func NewLocalStore(basePath string) Store {
 		basePath:  basePath,
 		dbs:       make(map[string]*sql.DB),
 		kindCache: make(map[string]map[string]bool),
-		idxCache:  make(map[string]map[string]map[string]bool),
 	}
 }
 
@@ -67,7 +65,6 @@ func (c *localStore) getDB(namespace string) (*sql.DB, error) {
 
 	c.dbs[namespace] = db
 	c.kindCache[namespace] = make(map[string]bool)
-	c.idxCache[namespace] = make(map[string]map[string]bool)
 
 	return db, nil
 }
@@ -86,43 +83,28 @@ func (c *localStore) ensureKind(namespace, kind string, db *sql.DB) error {
 		return nil
 	}
 
-	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %q (
-		_key TEXT PRIMARY KEY,
-		_id INTEGER,
-		_idstr TEXT,
-		data JSON,
-		_props BLOB
-	)`, kind)
+	idxTable := kind + "_idx"
+	idxName := fmt.Sprintf("idx_%s_name_value", kind)
+
+	query := fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %q (
+			key TEXT PRIMARY KEY,
+			parent_key TEXT,
+			props BLOB
+		);
+		CREATE TABLE IF NOT EXISTS %q (
+			key TEXT,
+			name TEXT,
+			value JSON
+		);
+		CREATE INDEX IF NOT EXISTS %q ON %q(name, value);
+	`, kind, idxTable, idxName, idxTable)
+
 	if _, err := db.Exec(query); err != nil {
 		return err
 	}
 
 	c.kindCache[namespace][kind] = true
-	c.idxCache[namespace][kind] = make(map[string]bool)
-	return nil
-}
-
-func (c *localStore) ensureIndex(namespace, kind, field string, db *sql.DB) error {
-	c.mu.RLock()
-	exists := c.idxCache[namespace][kind][field]
-	c.mu.RUnlock()
-	if exists {
-		return nil
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.idxCache[namespace][kind][field] {
-		return nil
-	}
-
-	idxName := fmt.Sprintf("idx_%s_%s", kind, field)
-	query := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %q ON %q(json_extract(data, '$.%s'))`, idxName, kind, field)
-	if _, err := db.Exec(query); err != nil {
-		return err
-	}
-
-	c.idxCache[namespace][kind][field] = true
 	return nil
 }
 
@@ -132,11 +114,23 @@ func keyToColAndID(k *datastore.Key) (string, string) {
 	if id == "" {
 		id = strconv.FormatInt(k.ID, 10)
 	}
-	if k.Parent != nil {
-		pCol, pID := keyToColAndID(k.Parent)
-		id = pCol + "_" + pID + "_" + id
-	}
 	return col, id
+}
+
+func getParentKeyStr(k *datastore.Key) string {
+	if k.Parent == nil {
+		return ""
+	}
+	pCol, pID := keyToColAndID(k.Parent)
+	return pCol + ":" + pID
+}
+
+func keyFromStrAndKind(kind string, keyStr string) *datastore.Key {
+	id, err := strconv.ParseInt(keyStr, 10, 64)
+	if err == nil {
+		return datastore.IDKey(kind, id, nil)
+	}
+	return datastore.NameKey(kind, keyStr, nil)
 }
 
 func (c *localStore) Get(ctx context.Context, key *datastore.Key, dst interface{}) error {
@@ -149,7 +143,7 @@ func (c *localStore) Get(ctx context.Context, key *datastore.Key, dst interface{
 		return err
 	}
 
-	query := fmt.Sprintf(`SELECT _props FROM %q WHERE _key = ?`, col)
+	query := fmt.Sprintf(`SELECT props FROM %q WHERE key = ?`, col)
 	var propsBlob []byte
 	err = db.QueryRow(query, id).Scan(&propsBlob)
 	if err != nil {
@@ -205,93 +199,159 @@ func (c *localStore) PutMulti(ctx context.Context, keys []*datastore.Key, src in
 	me := make(datastore.MultiError, len(keys))
 	hasErr := false
 
+	// Group keys by collection and namespace to batch inserts
+	type batchKey struct{ ns, col string }
+	batches := make(map[batchKey][]*datastore.Key)
+	batchIdxs := make(map[batchKey][]int)
+
 	for i, k := range keys {
-		col, id := keyToColAndID(k)
-		db, err := c.getDB(k.Namespace)
+		if k.Name == "" && k.ID == 0 {
+			k.ID = rand.Int63n(1<<62) + 1 // High ID generation
+		}
+
+		col, _ := keyToColAndID(k)
+		bk := batchKey{k.Namespace, col}
+		batches[bk] = append(batches[bk], k)
+		batchIdxs[bk] = append(batchIdxs[bk], i)
+	}
+
+	for bk, bKeys := range batches {
+		ns, col := bk.ns, bk.col
+		db, err := c.getDB(ns)
 		if err != nil {
-			me[i] = err
-			hasErr = true
-			continue
-		}
-		if err := c.ensureKind(k.Namespace, col, db); err != nil {
-			me[i] = err
-			hasErr = true
-			continue
-		}
-
-		elem := v.Index(i)
-
-		var pl datastore.PropertyList
-		if pls, ok := elem.Interface().(datastore.PropertyLoadSaver); ok {
-			props, err := pls.Save()
-			if err != nil {
-				me[i] = err
+			for _, idx := range batchIdxs[bk] {
+				me[idx] = err
 				hasErr = true
-				continue
 			}
-			pl = props
-		} else if plv, ok := elem.Interface().(datastore.PropertyList); ok {
-			pl = plv
-		} else if plvPtr, ok := elem.Interface().(*datastore.PropertyList); ok {
-			pl = *plvPtr
-		} else {
-			props, err := datastore.SaveStruct(elem.Interface())
-			if err != nil {
-				me[i] = err
+			continue
+		}
+		if err := c.ensureKind(ns, col, db); err != nil {
+			for _, idx := range batchIdxs[bk] {
+				me[idx] = err
 				hasErr = true
-				continue
 			}
-			pl = props
-		}
-
-		for j, p := range pl {
-			if p.Value != nil {
-				val := reflect.ValueOf(p.Value)
-				if val.Kind() == reflect.Ptr && val.IsNil() {
-					pl[j].Value = nil
-				}
-			}
-		}
-
-		propsBlob, err := marshalPropertyList(pl)
-		if err != nil {
-			me[i] = err
-			hasErr = true
 			continue
 		}
 
-		docMap := make(map[string]interface{})
-		for _, p := range pl {
-			if !p.NoIndex {
-				docMap[p.Name] = p.Value
-				if err := c.ensureIndex(k.Namespace, col, p.Name, db); err != nil {
-					// Ignore index creation errors for now
+		var args []interface{}
+		var placeholders []string
+
+		var idxArgs []interface{}
+		var idxPlaceholders []string
+
+		var delArgs []interface{}
+		var delPlaceholders []string
+
+		for bi, k := range bKeys {
+			i := batchIdxs[bk][bi]
+			_, id := keyToColAndID(k)
+			parentKey := getParentKeyStr(k)
+
+			delPlaceholders = append(delPlaceholders, "?")
+			delArgs = append(delArgs, id)
+
+			elem := v.Index(i)
+
+			var pl datastore.PropertyList
+			if pls, ok := elem.Interface().(datastore.PropertyLoadSaver); ok {
+				props, err := pls.Save()
+				if err != nil {
+					me[i] = err
+					hasErr = true
+					continue
 				}
-			}
-		}
-
-		dataJSON, err := json.Marshal(docMap)
-		if err != nil {
-			me[i] = err
-			hasErr = true
-			continue
-		}
-
-		if id == "0" || id == "" {
-			if k.Name == "" {
-				k.ID = rand.Int63n(1<<62) + 1
-				id = strconv.FormatInt(k.ID, 10)
+				pl = props
+			} else if plv, ok := elem.Interface().(datastore.PropertyList); ok {
+				pl = plv
+			} else if plvPtr, ok := elem.Interface().(*datastore.PropertyList); ok {
+				pl = *plvPtr
 			} else {
-				k.Name = uuid.NewV4().String()
-				id = k.Name
+				props, err := datastore.SaveStruct(elem.Interface())
+				if err != nil {
+					me[i] = err
+					hasErr = true
+					continue
+				}
+				pl = props
 			}
-			col, id = keyToColAndID(k)
+
+			// Clean nil pointer values
+			for j, p := range pl {
+				if p.Value != nil {
+					val := reflect.ValueOf(p.Value)
+					if val.Kind() == reflect.Ptr && val.IsNil() {
+						pl[j].Value = nil
+					}
+				}
+			}
+
+			// Generate exact gob props blob for Get recovery
+			propsBlob, err := marshalPropertyList(pl)
+			if err != nil {
+				me[i] = err
+				hasErr = true
+				continue
+			}
+
+			// Build index map
+			for _, p := range pl {
+				if p.NoIndex {
+					continue
+				}
+
+				var dataVal interface{} = p.Value
+				if p.Value != nil {
+					switch val := p.Value.(type) {
+					case *datastore.Key:
+						dataVal = val.Encode()
+					case time.Time:
+						dataVal = val.Format(time.RFC3339Nano)
+					case []byte:
+						dataVal = base64.StdEncoding.EncodeToString(val)
+					case *datastore.Entity:
+						continue
+					}
+				}
+
+				dataJSON, err := json.Marshal(dataVal)
+				if err == nil {
+					idxPlaceholders = append(idxPlaceholders, "(?, ?, ?)")
+					idxArgs = append(idxArgs, id, p.Name, string(dataJSON))
+				}
+			}
+
+			placeholders = append(placeholders, "(?, ?, ?)")
+			args = append(args, id, parentKey, propsBlob)
 		}
 
-		query := fmt.Sprintf(`INSERT OR REPLACE INTO %q (_key, _id, _idstr, data, _props) VALUES (?, ?, ?, ?, ?)`, col)
-		if _, err := db.Exec(query, id, k.ID, k.Name, dataJSON, propsBlob); err != nil {
-			me[i] = err
-			hasErr = true
+		if len(delPlaceholders) > 0 {
+			delQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, col+"_idx", strings.Join(delPlaceholders, ","))
+			if _, err := db.Exec(delQuery, delArgs...); err != nil {
+				for _, idx := range batchIdxs[bk] {
+					me[idx] = err
+					hasErr = true
+				}
+			}
+		}
+
+		if len(placeholders) > 0 {
+			query := fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, parent_key, props) VALUES %s`, col, strings.Join(placeholders, ", "))
+			if _, err := db.Exec(query, args...); err != nil {
+				for _, idx := range batchIdxs[bk] {
+					me[idx] = err
+					hasErr = true
+				}
+			}
+		}
+
+		if len(idxPlaceholders) > 0 {
+			idxQuery := fmt.Sprintf(`INSERT INTO %q (key, name, value) VALUES %s`, col+"_idx", strings.Join(idxPlaceholders, ", "))
+			if _, err := db.Exec(idxQuery, idxArgs...); err != nil {
+				for _, idx := range batchIdxs[bk] {
+					me[idx] = err
+					hasErr = true
+				}
+			}
 		}
 	}
 
@@ -310,7 +370,10 @@ func (c *localStore) Delete(ctx context.Context, key *datastore.Key) error {
 	if err := c.ensureKind(key.Namespace, col, db); err != nil {
 		return err
 	}
-	query := fmt.Sprintf(`DELETE FROM %q WHERE _key = ?`, col)
+	delIdxQuery := fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col+"_idx")
+	db.Exec(delIdxQuery, id)
+
+	query := fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col)
 	_, err = db.Exec(query, id)
 	return err
 }
@@ -404,23 +467,57 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 
 	var conditions []string
 	var args []interface{}
+	var joins []string
+
+	idxAlias := 0
 
 	for _, f := range q.Filters() {
 		op := f.Op
 		if op == "" {
 			op = "="
 		}
-		conditions = append(conditions, fmt.Sprintf("json_extract(data, '$.%s') %s ?", f.Field, op))
-		args = append(args, f.Value)
+
+		alias := fmt.Sprintf("i%d", idxAlias)
+		idxAlias++
+
+		joins = append(joins, fmt.Sprintf("JOIN %q %s ON main.key = %s.key", col+"_idx", alias, alias))
+
+		conditions = append(conditions, fmt.Sprintf("%s.name = ?", alias))
+		args = append(args, f.Field)
+
+		var dataVal interface{} = f.Value
+		if f.Value != nil {
+			switch v := f.Value.(type) {
+			case *datastore.Key:
+				dataVal = v.Encode()
+			case time.Time:
+				dataVal = v.Format(time.RFC3339Nano)
+			case []byte:
+				dataVal = base64.StdEncoding.EncodeToString(v)
+			}
+		}
+
+		dataJSON, _ := json.Marshal(dataVal)
+
+		if op == "=" {
+			conditions = append(conditions, fmt.Sprintf("%s.value = ?", alias))
+			args = append(args, string(dataJSON))
+		} else {
+			conditions = append(conditions, fmt.Sprintf("%s.value %s ?", alias, op))
+			args = append(args, string(dataJSON))
+		}
 	}
 
 	if anc := q.GetAncestor(); anc != nil {
 		_, pID := keyToColAndID(anc)
-		conditions = append(conditions, "_key LIKE ?")
-		args = append(args, pID+"_%")
+		conditions = append(conditions, "main.parent_key = ?")
+		args = append(args, pID)
 	}
 
-	queryStr := fmt.Sprintf("SELECT _id, _idstr, _props FROM %q", col)
+	queryStr := fmt.Sprintf("SELECT DISTINCT main.key, main.props FROM %q main", col)
+	if len(joins) > 0 {
+		queryStr += " " + strings.Join(joins, " ")
+	}
 	if len(conditions) > 0 {
 		queryStr += " WHERE " + strings.Join(conditions, " AND ")
 	}
@@ -432,7 +529,14 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 			if o.Direction == "desc" || strings.HasPrefix(strings.ToLower(o.Direction), "-") {
 				dir = "DESC"
 			}
-			orderStrs = append(orderStrs, fmt.Sprintf("json_extract(data, '$.%s') %s", o.Field, dir))
+
+			alias := fmt.Sprintf("i%d", idxAlias)
+			idxAlias++
+
+			queryStr += fmt.Sprintf(" LEFT JOIN %q %s ON main.key = %s.key AND %s.name = ?", col+"_idx", alias, alias, alias)
+			args = append(args, o.Field)
+
+			orderStrs = append(orderStrs, fmt.Sprintf("%s.value %s", alias, dir))
 		}
 		queryStr += " ORDER BY " + strings.Join(orderStrs, ", ")
 	}
@@ -454,19 +558,18 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 	var blobs [][]byte
 
 	for rows.Next() {
-		var idInt sql.NullInt64
-		var idStr sql.NullString
+		var keyStr string
 		var propsBlob []byte
-		if err := rows.Scan(&idInt, &idStr, &propsBlob); err != nil {
+		if err := rows.Scan(&keyStr, &propsBlob); err != nil {
 			return &localIterator{doneErr: err}
 		}
 
-		k := datastore.NameKey(col, idStr.String, nil)
-		if idInt.Int64 != 0 {
-			k = datastore.IDKey(col, idInt.Int64, nil)
-		}
+		b := make([]byte, len(propsBlob))
+		copy(b, propsBlob)
+
+		k := keyFromStrAndKind(col, keyStr)
 		keys = append(keys, k)
-		blobs = append(blobs, propsBlob)
+		blobs = append(blobs, b)
 	}
 
 	idx := 0

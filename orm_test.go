@@ -45,7 +45,12 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 
-	localStore := ds.NewLocalStore("./")
+	tempDir, err := os.MkdirTemp("", "dsorm_test_*")
+	if err != nil {
+		panic(err)
+	}
+
+	localStore := ds.NewLocalStore(tempDir)
 	localClient, err := dsorm.New(ctx, dsorm.WithStore(localStore, localStore.(ds.Queryer), localStore.(ds.Transactioner)))
 	if err != nil {
 		panic(err)
@@ -57,6 +62,7 @@ func TestMain(m *testing.M) {
 	}
 
 	code := m.Run()
+	os.RemoveAll(tempDir)
 	os.Exit(code)
 }
 
