@@ -21,6 +21,9 @@ type Store interface {
 	PutMulti(ctx context.Context, keys []*datastore.Key, src interface{}) ([]*datastore.Key, error)
 	Delete(ctx context.Context, key *datastore.Key) error
 	DeleteMulti(ctx context.Context, keys []*datastore.Key) error
+	Run(ctx context.Context, q Query) Iterator
+	NewTransaction(ctx context.Context, opts ...datastore.TransactionOption) (TransactionStore, error)
+	RunInTransaction(ctx context.Context, f func(tx TransactionStore) error, opts ...datastore.TransactionOption) (*datastore.Commit, error)
 }
 
 // Mutator is an optional interface for stores that support datastore mutations.
@@ -52,18 +55,6 @@ type Query interface {
 	GetAncestor() *datastore.Key
 	GetCursor() string
 	GetNamespace() string
-}
-
-// Queryer is implemented by Stores that support querying.
-// It accepts a ds.Query interface to avoid import cycles with dsorm.
-type Queryer interface {
-	Run(ctx context.Context, q Query) Iterator
-}
-
-// Transactioner abstracts transactions
-type Transactioner interface {
-	NewTransaction(ctx context.Context, opts ...datastore.TransactionOption) (TransactionStore, error)
-	RunInTransaction(ctx context.Context, f func(tx TransactionStore) error, opts ...datastore.TransactionOption) (*datastore.Commit, error)
 }
 
 // TransactionStore abstracts datastore.Transaction

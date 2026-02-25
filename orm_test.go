@@ -51,7 +51,7 @@ func TestMain(m *testing.M) {
 	}
 
 	localStore := ds.NewLocalStore(tempDir)
-	localClient, err := dsorm.New(ctx, dsorm.WithStore(localStore, localStore.(ds.Queryer), localStore.(ds.Transactioner)))
+	localClient, err := dsorm.New(ctx, dsorm.WithStore(localStore))
 	if err != nil {
 		panic(err)
 	}
@@ -325,7 +325,7 @@ func testPropertyMarshaling(t *testing.T, testDB *dsorm.Client) {
 	encCtx := context.Background()
 	secret := []byte("different-secret-32-bytes-long!!") // 32 bytes, different from TestMain
 
-	storeOpts := dsorm.WithStore(testDB.InternalClient().Store, testDB.InternalClient().Queryer, testDB.InternalClient().Transactioner)
+	storeOpts := dsorm.WithStore(testDB.InternalClient().Store)
 	encDB, err := dsorm.New(encCtx, dsorm.WithEncryptionKey(secret), storeOpts)
 	if err != nil {
 		t.Fatalf("New DB with enc key failed: %v", err)

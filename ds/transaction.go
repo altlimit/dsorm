@@ -37,7 +37,7 @@ func (c *Client) NewTransaction(ctx context.Context, opts ...datastore.Transacti
 	var span *trace.Span
 	ctx, span = trace.StartSpan(ctx, "github.com/altlimit/dsorm.NewTransaction")
 	defer span.End()
-	tx, err := c.Transactioner.NewTransaction(ctx, opts...)
+	tx, err := c.Store.NewTransaction(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +141,7 @@ func (c *Client) RunInTransaction(ctx context.Context, f func(tx *Transaction) e
 	ctx, span = trace.StartSpan(ctx, "github.com/altlimit/dsorm.RunInTransaction")
 	defer span.End()
 
-	return c.Transactioner.RunInTransaction(ctx, func(tx TransactionStore) error {
+	return c.Store.RunInTransaction(ctx, func(tx TransactionStore) error {
 		txn := &Transaction{c: c, ctx: ctx, tx: tx}
 		if err := f(txn); err != nil {
 			return err

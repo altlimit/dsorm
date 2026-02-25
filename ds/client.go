@@ -15,8 +15,6 @@ type Client struct {
 	cachePrefix string
 
 	Store
-	Queryer
-	Transactioner
 }
 
 // ClientOption option for dsorm Client.
@@ -24,18 +22,13 @@ type ClientOption func(*Client)
 
 func WithDatastoreClient(ds *datastore.Client) ClientOption {
 	return func(c *Client) {
-		b := NewCloudStore(ds)
-		c.Store = b
-		c.Queryer = b
-		c.Transactioner = b
+		c.Store = NewCloudStore(ds)
 	}
 }
 
-func WithStore(s Store, q Queryer, t Transactioner) ClientOption {
+func WithStore(s Store) ClientOption {
 	return func(c *Client) {
 		c.Store = s
-		c.Queryer = q
-		c.Transactioner = t
 	}
 }
 
@@ -72,10 +65,7 @@ func NewClient(ctx context.Context, cacher Cache, opts ...ClientOption) (*Client
 		if ds, err := datastore.NewClient(ctx, ""); err != nil {
 			return nil, err
 		} else {
-			b := NewCloudStore(ds)
-			client.Store = b
-			client.Queryer = b
-			client.Transactioner = b
+			client.Store = NewCloudStore(ds)
 		}
 	}
 

@@ -413,8 +413,6 @@ type options struct {
 	cache           ds.Cache
 	datastoreClient *datastore.Client
 	store           ds.Store
-	queryer         ds.Queryer
-	transactioner   ds.Transactioner
 	encryptionKey   []byte
 }
 
@@ -438,11 +436,9 @@ func WithDatastoreClient(c *datastore.Client) Option {
 	}
 }
 
-func WithStore(s ds.Store, q ds.Queryer, t ds.Transactioner) Option {
+func WithStore(s ds.Store) Option {
 	return func(o *options) {
 		o.store = s
-		o.queryer = q
-		o.transactioner = t
 	}
 }
 
@@ -505,8 +501,8 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 	}
 
 	var dsOpts []ds.ClientOption
-	if o.store != nil && o.queryer != nil && o.transactioner != nil {
-		dsOpts = append(dsOpts, ds.WithStore(o.store, o.queryer, o.transactioner))
+	if o.store != nil {
+		dsOpts = append(dsOpts, ds.WithStore(o.store))
 	} else {
 		dsOpts = append(dsOpts, ds.WithDatastoreClient(dsClient))
 	}

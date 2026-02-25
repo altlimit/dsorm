@@ -8,8 +8,6 @@ import (
 
 // ensure cloudStore implements the interfaces
 var _ Store = (*cloudStore)(nil)
-var _ Queryer = (*cloudStore)(nil)
-var _ Transactioner = (*cloudStore)(nil)
 var _ Mutator = (*cloudStore)(nil)
 var _ TransactionMutator = (*cloudTransaction)(nil)
 

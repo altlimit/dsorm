@@ -23,8 +23,6 @@ import (
 
 // Compile-time interface assertions
 var _ Store = (*localStore)(nil)
-var _ Queryer = (*localStore)(nil)
-var _ Transactioner = (*localStore)(nil)
 
 type localStore struct {
 	basePath string
