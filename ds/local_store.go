@@ -60,8 +60,12 @@ func (c *localStore) getDB(namespace string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.Exec("PRAGMA journal_mode=WAL;")
-	db.Exec("PRAGMA synchronous=NORMAL;")
+	if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec("PRAGMA synchronous=NORMAL;"); err != nil {
+		return nil, err
+	}
 
 	c.dbs[namespace] = db
 	c.kindCache[namespace] = make(map[string]bool)
@@ -367,11 +371,10 @@ func (c *localStore) Delete(ctx context.Context, key *datastore.Key) error {
 	if err != nil {
 		return err
 	}
-	if err := c.ensureKind(key.Namespace, col, db); err != nil {
+	delIdxQuery := fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col+"_idx")
+	if _, err := db.Exec(delIdxQuery, id); err != nil {
 		return err
 	}
-	delIdxQuery := fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col+"_idx")
-	db.Exec(delIdxQuery, id)
 
 	query := fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col)
 	_, err = db.Exec(query, id)
@@ -497,13 +500,54 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 			}
 		}
 
-		dataJSON, _ := json.Marshal(dataVal)
+		opUpper := strings.ToUpper(strings.TrimSpace(op))
 
-		if op == "=" {
-			conditions = append(conditions, fmt.Sprintf("%s.value = ?", alias))
-			args = append(args, string(dataJSON))
+		if opUpper == "IN" || opUpper == "NOT-IN" || opUpper == "NOT IN" {
+			realOp := "IN"
+			if opUpper == "NOT-IN" || opUpper == "NOT IN" {
+				realOp = "NOT IN"
+			}
+
+			vVal := reflect.ValueOf(f.Value)
+			if vVal.Kind() == reflect.Slice || vVal.Kind() == reflect.Array {
+				var placeholders []string
+				for i := 0; i < vVal.Len(); i++ {
+					elem := vVal.Index(i).Interface()
+					elemVal := elem
+					switch ev := elem.(type) {
+					case *datastore.Key:
+						elemVal = ev.Encode()
+					case time.Time:
+						elemVal = ev.Format(time.RFC3339Nano)
+					case []byte:
+						elemVal = base64.StdEncoding.EncodeToString(ev)
+					}
+					elemJSON, _ := json.Marshal(elemVal)
+					placeholders = append(placeholders, "?")
+					args = append(args, string(elemJSON))
+				}
+				if len(placeholders) > 0 {
+					conditions = append(conditions, fmt.Sprintf("%s.value %s (%s)", alias, realOp, strings.Join(placeholders, ",")))
+				} else {
+					if realOp == "IN" {
+						conditions = append(conditions, "1=0") // IN empty matches nothing
+					} else {
+						conditions = append(conditions, "1=1") // NOT IN empty matches everything
+					}
+				}
+			} else {
+				// Single value IN fallback
+				dataJSON, _ := json.Marshal(dataVal)
+				conditions = append(conditions, fmt.Sprintf("%s.value %s (?)", alias, realOp))
+				args = append(args, string(dataJSON))
+			}
 		} else {
-			conditions = append(conditions, fmt.Sprintf("%s.value %s ?", alias, op))
+			dataJSON, _ := json.Marshal(dataVal)
+			if op == "=" {
+				conditions = append(conditions, fmt.Sprintf("%s.value = ?", alias))
+			} else {
+				conditions = append(conditions, fmt.Sprintf("%s.value %s ?", alias, op))
+			}
 			args = append(args, string(dataJSON))
 		}
 	}
