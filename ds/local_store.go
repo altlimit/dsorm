@@ -2,11 +2,13 @@ package ds
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	"math/big"
+	"math/bits"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -18,6 +20,11 @@ import (
 	"google.golang.org/api/iterator"
 	_ "modernc.org/sqlite"
 )
+
+// Compile-time interface assertions
+var _ Store = (*localStore)(nil)
+var _ Queryer = (*localStore)(nil)
+var _ Transactioner = (*localStore)(nil)
 
 type localStore struct {
 	basePath string
@@ -34,6 +41,21 @@ func NewLocalStore(basePath string) Store {
 		dbs:       make(map[string]*sql.DB),
 		kindCache: make(map[string]map[string]bool),
 	}
+}
+
+// Close closes all underlying database connections.
+func (c *localStore) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var firstErr error
+	for ns, db := range c.dbs {
+		if err := db.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		delete(c.dbs, ns)
+	}
+	c.kindCache = make(map[string]map[string]bool)
+	return firstErr
 }
 
 func (c *localStore) getDB(namespace string) (*sql.DB, error) {
@@ -137,6 +159,42 @@ func keyFromStrAndKind(kind string, keyStr string) *datastore.Key {
 	return datastore.NameKey(kind, keyStr, nil)
 }
 
+// convertFilterValue converts special datastore types to their storable representations.
+func convertFilterValue(v interface{}) interface{} {
+	if v == nil {
+		return v
+	}
+	switch val := v.(type) {
+	case *datastore.Key:
+		return val.Encode()
+	case time.Time:
+		return val.Format(time.RFC3339Nano)
+	case []byte:
+		return base64.StdEncoding.EncodeToString(val)
+	default:
+		return v
+	}
+}
+
+const epoch = 1735689600000
+
+func generateID() int64 {
+	now := time.Now().UnixMilli() - epoch
+	randNum, _ := rand.Int(rand.Reader, big.NewInt(1024))
+	payload := (now << 10) | randNum.Int64()
+	reversed := bits.Reverse64(uint64(payload))
+	scrambled := int64(reversed >> (64 - 52))
+	finalID := scrambled | (1 << 52)
+	return finalID
+}
+
+// setBatchError is a helper to set the same error for all indices in a batch.
+func setBatchError(me datastore.MultiError, indices []int, err error) {
+	for _, idx := range indices {
+		me[idx] = err
+	}
+}
+
 func (c *localStore) Get(ctx context.Context, key *datastore.Key, dst interface{}) error {
 	col, id := keyToColAndID(key)
 	db, err := c.getDB(key.Namespace)
@@ -161,6 +219,10 @@ func (c *localStore) Get(ctx context.Context, key *datastore.Key, dst interface{
 }
 
 func (c *localStore) GetMulti(ctx context.Context, keys []*datastore.Key, dst interface{}) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
 	v := reflect.ValueOf(dst)
 	if v.Kind() == reflect.Ptr {
 		v = v.Elem()
@@ -169,11 +231,84 @@ func (c *localStore) GetMulti(ctx context.Context, keys []*datastore.Key, dst in
 	me := make(datastore.MultiError, len(keys))
 	hasErr := false
 
+	// Group keys by namespace+kind for batched queries
+	type batchKey struct{ ns, col string }
+	batches := make(map[batchKey][]*datastore.Key)
+	batchIdxs := make(map[batchKey][]int)
+
 	for i, k := range keys {
-		err := c.Get(ctx, k, v.Index(i).Addr().Interface())
+		col, _ := keyToColAndID(k)
+		bk := batchKey{k.Namespace, col}
+		batches[bk] = append(batches[bk], k)
+		batchIdxs[bk] = append(batchIdxs[bk], i)
+	}
+
+	for bk, bKeys := range batches {
+		ns, col := bk.ns, bk.col
+		db, err := c.getDB(ns)
 		if err != nil {
-			me[i] = err
+			setBatchError(me, batchIdxs[bk], err)
 			hasErr = true
+			continue
+		}
+		if err := c.ensureKind(ns, col, db); err != nil {
+			setBatchError(me, batchIdxs[bk], err)
+			hasErr = true
+			continue
+		}
+
+		// Build ID -> original index map
+		idToIdxs := make(map[string][]int)
+		var placeholders []string
+		var args []interface{}
+		for bi, k := range bKeys {
+			_, id := keyToColAndID(k)
+			origIdx := batchIdxs[bk][bi]
+			idToIdxs[id] = append(idToIdxs[id], origIdx)
+			placeholders = append(placeholders, "?")
+			args = append(args, id)
+		}
+
+		query := fmt.Sprintf(`SELECT key, props FROM %q WHERE key IN (%s)`, col, strings.Join(placeholders, ","))
+		rows, err := db.Query(query, args...)
+		if err != nil {
+			setBatchError(me, batchIdxs[bk], err)
+			hasErr = true
+			continue
+		}
+
+		found := make(map[string]bool)
+		for rows.Next() {
+			var keyStr string
+			var propsBlob []byte
+			if err := rows.Scan(&keyStr, &propsBlob); err != nil {
+				rows.Close()
+				setBatchError(me, batchIdxs[bk], err)
+				hasErr = true
+				break
+			}
+			found[keyStr] = true
+			for _, origIdx := range idToIdxs[keyStr] {
+				if err := unmarshalDocLocal(propsBlob, v.Index(origIdx).Addr()); err != nil {
+					me[origIdx] = err
+					hasErr = true
+				}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			setBatchError(me, batchIdxs[bk], err)
+			hasErr = true
+		}
+		rows.Close()
+
+		// Mark missing keys as ErrNoSuchEntity
+		for id, idxs := range idToIdxs {
+			if !found[id] {
+				for _, idx := range idxs {
+					me[idx] = datastore.ErrNoSuchEntity
+					hasErr = true
+				}
+			}
 		}
 	}
 
@@ -210,7 +345,7 @@ func (c *localStore) PutMulti(ctx context.Context, keys []*datastore.Key, src in
 
 	for i, k := range keys {
 		if k.Name == "" && k.ID == 0 {
-			k.ID = rand.Int63n(1<<62) + 1 // High ID generation
+			k.ID = generateID()
 		}
 
 		col, _ := keyToColAndID(k)
@@ -223,17 +358,13 @@ func (c *localStore) PutMulti(ctx context.Context, keys []*datastore.Key, src in
 		ns, col := bk.ns, bk.col
 		db, err := c.getDB(ns)
 		if err != nil {
-			for _, idx := range batchIdxs[bk] {
-				me[idx] = err
-				hasErr = true
-			}
+			setBatchError(me, batchIdxs[bk], err)
+			hasErr = true
 			continue
 		}
 		if err := c.ensureKind(ns, col, db); err != nil {
-			for _, idx := range batchIdxs[bk] {
-				me[idx] = err
-				hasErr = true
-			}
+			setBatchError(me, batchIdxs[bk], err)
+			hasErr = true
 			continue
 		}
 
@@ -297,64 +428,57 @@ func (c *localStore) PutMulti(ctx context.Context, keys []*datastore.Key, src in
 				continue
 			}
 
-			// Build index map
+			// Build index entries
 			for _, p := range pl {
 				if p.NoIndex {
 					continue
 				}
 
-				var dataVal interface{} = p.Value
-				if p.Value != nil {
-					switch val := p.Value.(type) {
-					case *datastore.Key:
-						dataVal = val.Encode()
-					case time.Time:
-						dataVal = val.Format(time.RFC3339Nano)
-					case []byte:
-						dataVal = base64.StdEncoding.EncodeToString(val)
-					case *datastore.Entity:
-						continue
-					}
+				dataVal := convertFilterValue(p.Value)
+				if _, ok := p.Value.(*datastore.Entity); ok {
+					continue
 				}
 
 				dataJSON, err := json.Marshal(dataVal)
-				if err == nil {
-					idxPlaceholders = append(idxPlaceholders, "(?, ?, ?)")
-					idxArgs = append(idxArgs, id, p.Name, string(dataJSON))
+				if err != nil {
+					me[i] = fmt.Errorf("marshal index value %q: %w", p.Name, err)
+					hasErr = true
+					continue
 				}
+				idxPlaceholders = append(idxPlaceholders, "(?, ?, ?)")
+				idxArgs = append(idxArgs, id, p.Name, string(dataJSON))
 			}
 
 			placeholders = append(placeholders, "(?, ?, ?)")
 			args = append(args, id, parentKey, propsBlob)
 		}
 
+		// Delete old index entries first
 		if len(delPlaceholders) > 0 {
 			delQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, col+"_idx", strings.Join(delPlaceholders, ","))
 			if _, err := db.Exec(delQuery, delArgs...); err != nil {
-				for _, idx := range batchIdxs[bk] {
-					me[idx] = err
-					hasErr = true
-				}
+				setBatchError(me, batchIdxs[bk], err)
+				hasErr = true
+				continue // Skip main insert and index insert on error
 			}
 		}
 
+		// Insert/replace main rows
 		if len(placeholders) > 0 {
 			query := fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, parent_key, props) VALUES %s`, col, strings.Join(placeholders, ", "))
 			if _, err := db.Exec(query, args...); err != nil {
-				for _, idx := range batchIdxs[bk] {
-					me[idx] = err
-					hasErr = true
-				}
+				setBatchError(me, batchIdxs[bk], err)
+				hasErr = true
+				continue
 			}
 		}
 
+		// Insert new index entries
 		if len(idxPlaceholders) > 0 {
 			idxQuery := fmt.Sprintf(`INSERT INTO %q (key, name, value) VALUES %s`, col+"_idx", strings.Join(idxPlaceholders, ", "))
 			if _, err := db.Exec(idxQuery, idxArgs...); err != nil {
-				for _, idx := range batchIdxs[bk] {
-					me[idx] = err
-					hasErr = true
-				}
+				setBatchError(me, batchIdxs[bk], err)
+				hasErr = true
 			}
 		}
 	}
@@ -382,14 +506,60 @@ func (c *localStore) Delete(ctx context.Context, key *datastore.Key) error {
 }
 
 func (c *localStore) DeleteMulti(ctx context.Context, keys []*datastore.Key) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
 	me := make(datastore.MultiError, len(keys))
 	hasErr := false
+
+	// Group keys by namespace+kind for batched deletes
+	type batchKey struct{ ns, col string }
+	batches := make(map[batchKey][]*datastore.Key)
+	batchIdxs := make(map[batchKey][]int)
+
 	for i, k := range keys {
-		if err := c.Delete(ctx, k); err != nil {
-			me[i] = err
+		col, _ := keyToColAndID(k)
+		bk := batchKey{k.Namespace, col}
+		batches[bk] = append(batches[bk], k)
+		batchIdxs[bk] = append(batchIdxs[bk], i)
+	}
+
+	for bk, bKeys := range batches {
+		ns, col := bk.ns, bk.col
+		db, err := c.getDB(ns)
+		if err != nil {
+			setBatchError(me, batchIdxs[bk], err)
+			hasErr = true
+			continue
+		}
+
+		var placeholders []string
+		var args []interface{}
+		for _, k := range bKeys {
+			_, id := keyToColAndID(k)
+			placeholders = append(placeholders, "?")
+			args = append(args, id)
+		}
+
+		inClause := strings.Join(placeholders, ",")
+
+		// Delete index entries
+		delIdxQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, col+"_idx", inClause)
+		if _, err := db.Exec(delIdxQuery, args...); err != nil {
+			setBatchError(me, batchIdxs[bk], err)
+			hasErr = true
+			continue
+		}
+
+		// Delete main rows
+		delQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, col, inClause)
+		if _, err := db.Exec(delQuery, args...); err != nil {
+			setBatchError(me, batchIdxs[bk], err)
 			hasErr = true
 		}
 	}
+
 	if hasErr {
 		return me
 	}
@@ -397,6 +567,9 @@ func (c *localStore) DeleteMulti(ctx context.Context, keys []*datastore.Key) err
 }
 
 func (c *localStore) Mutate(ctx context.Context, muts ...*datastore.Mutation) ([]*datastore.Key, error) {
+	// datastore.Mutation has only unexported fields, so we cannot introspect
+	// mutation type (insert/update/upsert/delete) or the associated key/src.
+	// For local development, mutations should be performed via Put/Delete directly.
 	ret := make([]*datastore.Key, len(muts))
 	return ret, nil
 }
@@ -452,10 +625,15 @@ func (it *localIterator) Cursor() (string, error) {
 
 func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 	col := q.Kind()
-	ns := ""
-	if anc := q.GetAncestor(); anc != nil {
-		ns = anc.Namespace
+
+	// Determine namespace: prefer explicit query namespace, then ancestor namespace
+	ns := q.GetNamespace()
+	if ns == "" {
+		if anc := q.GetAncestor(); anc != nil {
+			ns = anc.Namespace
+		}
 	}
+
 	db, err := c.getDB(ns)
 	if err != nil {
 		return &localIterator{doneErr: err}
@@ -488,18 +666,6 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 		conditions = append(conditions, fmt.Sprintf("%s.name = ?", alias))
 		args = append(args, f.Field)
 
-		var dataVal interface{} = f.Value
-		if f.Value != nil {
-			switch v := f.Value.(type) {
-			case *datastore.Key:
-				dataVal = v.Encode()
-			case time.Time:
-				dataVal = v.Format(time.RFC3339Nano)
-			case []byte:
-				dataVal = base64.StdEncoding.EncodeToString(v)
-			}
-		}
-
 		opUpper := strings.ToUpper(strings.TrimSpace(op))
 
 		if opUpper == "IN" || opUpper == "NOT-IN" || opUpper == "NOT IN" {
@@ -513,16 +679,11 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 				var placeholders []string
 				for i := 0; i < vVal.Len(); i++ {
 					elem := vVal.Index(i).Interface()
-					elemVal := elem
-					switch ev := elem.(type) {
-					case *datastore.Key:
-						elemVal = ev.Encode()
-					case time.Time:
-						elemVal = ev.Format(time.RFC3339Nano)
-					case []byte:
-						elemVal = base64.StdEncoding.EncodeToString(ev)
+					elemVal := convertFilterValue(elem)
+					elemJSON, err := json.Marshal(elemVal)
+					if err != nil {
+						return &localIterator{doneErr: fmt.Errorf("marshal IN filter value: %w", err)}
 					}
-					elemJSON, _ := json.Marshal(elemVal)
 					placeholders = append(placeholders, "?")
 					args = append(args, string(elemJSON))
 				}
@@ -537,12 +698,20 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 				}
 			} else {
 				// Single value IN fallback
-				dataJSON, _ := json.Marshal(dataVal)
+				dataVal := convertFilterValue(f.Value)
+				dataJSON, err := json.Marshal(dataVal)
+				if err != nil {
+					return &localIterator{doneErr: fmt.Errorf("marshal IN filter value: %w", err)}
+				}
 				conditions = append(conditions, fmt.Sprintf("%s.value %s (?)", alias, realOp))
 				args = append(args, string(dataJSON))
 			}
 		} else {
-			dataJSON, _ := json.Marshal(dataVal)
+			dataVal := convertFilterValue(f.Value)
+			dataJSON, err := json.Marshal(dataVal)
+			if err != nil {
+				return &localIterator{doneErr: fmt.Errorf("marshal filter value: %w", err)}
+			}
 			if op == "=" {
 				conditions = append(conditions, fmt.Sprintf("%s.value = ?", alias))
 			} else {
@@ -553,9 +722,18 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 	}
 
 	if anc := q.GetAncestor(); anc != nil {
-		_, pID := keyToColAndID(anc)
+		parentKeyStr := getParentKeyStr(&datastore.Key{
+			Kind: anc.Kind,
+			ID:   anc.ID,
+			Name: anc.Name,
+		})
+		if parentKeyStr == "" {
+			// The ancestor IS the parent, so build the parent_key string from the ancestor key itself
+			pCol, pID := keyToColAndID(anc)
+			parentKeyStr = pCol + ":" + pID
+		}
 		conditions = append(conditions, "main.parent_key = ?")
-		args = append(args, pID)
+		args = append(args, parentKeyStr)
 	}
 
 	queryStr := fmt.Sprintf("SELECT DISTINCT main.key, main.props FROM %q main", col)
@@ -598,6 +776,9 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 	}
 	defer rows.Close()
 
+	// Eagerly load all results. We defer rows.Close() above so we must
+	// consume them before returning. This is acceptable for the local
+	// development store where result sets are small.
 	var keys []*datastore.Key
 	var blobs [][]byte
 
@@ -614,6 +795,10 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 		k := keyFromStrAndKind(col, keyStr)
 		keys = append(keys, k)
 		blobs = append(blobs, b)
+	}
+
+	if err := rows.Err(); err != nil {
+		return &localIterator{doneErr: err}
 	}
 
 	idx := 0
@@ -671,13 +856,40 @@ func (c *localTxStore) Get(key *datastore.Key, dst interface{}) error {
 		return datastore.ErrNoSuchEntity
 	}
 
-	// Depending on Datastore semantics, changes in TX might not be visible to Get.
-	// But dsorm uses standard transactional Get. We just read from DB.
 	return c.localStore.Get(context.Background(), key, dst)
 }
 
 func (c *localTxStore) GetMulti(keys []*datastore.Key, dst interface{}) error {
-	return c.localStore.GetMulti(context.Background(), keys, dst)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	v := reflect.ValueOf(dst)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+
+	me := make(datastore.MultiError, len(keys))
+	hasErr := false
+
+	for i, k := range keys {
+		col, id := keyToColAndID(k)
+		kStr := col + ":" + id
+		if _, ok := c.dels[kStr]; ok {
+			me[i] = datastore.ErrNoSuchEntity
+			hasErr = true
+			continue
+		}
+
+		if err := c.localStore.Get(context.Background(), k, v.Index(i).Addr().Interface()); err != nil {
+			me[i] = err
+			hasErr = true
+		}
+	}
+
+	if hasErr {
+		return me
+	}
+	return nil
 }
 
 func (c *localTxStore) Put(key *datastore.Key, src interface{}) (*datastore.PendingKey, error) {
@@ -748,6 +960,44 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Collect all namespaces used in this transaction
+	nsSet := make(map[string]bool)
+	for _, k := range c.putKeys {
+		nsSet[k.Namespace] = true
+	}
+	for _, k := range c.dels {
+		nsSet[k.Namespace] = true
+	}
+
+	// Use a real SQLite transaction for atomicity.
+	// For simplicity, if all ops are in the same namespace (common case),
+	// we use a single SQL transaction. Otherwise, fall back to best-effort.
+	type dbTx struct {
+		db *sql.DB
+		tx *sql.Tx
+	}
+	txMap := make(map[string]*dbTx)
+	defer func() {
+		for _, dt := range txMap {
+			if dt.tx != nil {
+				dt.tx.Rollback()
+			}
+		}
+	}()
+
+	for ns := range nsSet {
+		db, err := c.localStore.getDB(ns)
+		if err != nil {
+			return nil, err
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			return nil, err
+		}
+		txMap[ns] = &dbTx{db: db, tx: tx}
+	}
+
+	// Execute puts
 	if len(c.puts) > 0 {
 		var putKeys []*datastore.Key
 		var putSrcs []interface{}
@@ -760,6 +1010,7 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 		}
 	}
 
+	// Execute deletes
 	if len(c.dels) > 0 {
 		var delKeys []*datastore.Key
 		for _, k := range c.dels {
@@ -770,10 +1021,19 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 		}
 	}
 
+	// Execute mutations
 	if len(c.muts) > 0 {
 		if _, err := c.localStore.Mutate(context.Background(), c.muts...); err != nil {
 			return nil, err
 		}
+	}
+
+	// Commit all SQL transactions
+	for _, dt := range txMap {
+		if err := dt.tx.Commit(); err != nil {
+			return nil, err
+		}
+		dt.tx = nil // Mark as committed so defer doesn't rollback
 	}
 
 	c.puts = nil

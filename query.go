@@ -15,19 +15,12 @@ type QueryBuilder struct {
 	keysOnly  bool
 	ancestor  *datastore.Key
 	cursorStr string
+	namespace string
 }
 
 // NewQuery creates a new query for a specific kind.
 func NewQuery(kind string) *QueryBuilder {
 	return &QueryBuilder{kind: kind}
-}
-
-// Filter adds a filter to the query. e.g. Filter("Weight >", 50)
-// This is typical Datastore v1.X syntax.
-func (q *QueryBuilder) Filter(filterStr string, value interface{}) *QueryBuilder {
-	// Parse filterStr for Op, or default to "="
-	// Actually we should support FilterField to match Google's latest `datastore.Query` API.
-	return q
 }
 
 // FilterField adds a field-specific filter to the query.
@@ -37,6 +30,12 @@ func (q *QueryBuilder) FilterField(fieldName, operator string, value interface{}
 		Op:    operator,
 		Value: value,
 	})
+	return q
+}
+
+// Namespace sets the namespace for the query.
+func (q *QueryBuilder) Namespace(ns string) *QueryBuilder {
+	q.namespace = ns
 	return q
 }
 
@@ -93,3 +92,4 @@ func (q *QueryBuilder) GetOffset() int              { return q.offset }
 func (q *QueryBuilder) IsKeysOnly() bool            { return q.keysOnly }
 func (q *QueryBuilder) GetAncestor() *datastore.Key { return q.ancestor }
 func (q *QueryBuilder) GetCursor() string           { return q.cursorStr }
+func (q *QueryBuilder) GetNamespace() string        { return q.namespace }

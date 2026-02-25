@@ -47,6 +47,7 @@ type Query interface {
 	IsKeysOnly() bool
 	GetAncestor() *datastore.Key
 	GetCursor() string
+	GetNamespace() string
 }
 
 // Queryer is implemented by Stores that support querying.
