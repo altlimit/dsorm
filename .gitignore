@@ -8,3 +8,6 @@ go.work.sum
 .DS_Store
 Thumbs.db
 *.Identifier
+*.DS_Store
+*.db
+*.db-*

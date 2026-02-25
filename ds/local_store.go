@@ -2,25 +2,128 @@ package ds
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math/rand"
+	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
+	"sync"
 
 	"cloud.google.com/go/datastore"
-	v2 "github.com/ostafen/clover/v2"
-	"github.com/ostafen/clover/v2/document"
-	"github.com/ostafen/clover/v2/query"
 	uuid "github.com/satori/go.uuid"
 	"google.golang.org/api/iterator"
+	_ "modernc.org/sqlite"
 )
 
 type localStore struct {
-	db *v2.DB
+	basePath string
+	dbs      map[string]*sql.DB
+	mu       sync.RWMutex
+
+	// cache for kind existence: namespace -> kind -> true
+	kindCache map[string]map[string]bool
+	// cache for index fields: namespace -> kind -> field -> true
+	idxCache map[string]map[string]map[string]bool
 }
 
-func NewLocalStore(db *v2.DB) Store {
-	return &localStore{db: db}
+func NewLocalStore(basePath string) Store {
+	return &localStore{
+		basePath:  basePath,
+		dbs:       make(map[string]*sql.DB),
+		kindCache: make(map[string]map[string]bool),
+		idxCache:  make(map[string]map[string]map[string]bool),
+	}
+}
+
+func (c *localStore) getDB(namespace string) (*sql.DB, error) {
+	c.mu.RLock()
+	db, ok := c.dbs[namespace]
+	c.mu.RUnlock()
+	if ok {
+		return db, nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if db, ok := c.dbs[namespace]; ok {
+		return db, nil
+	}
+
+	dbName := "default.db"
+	if namespace != "" {
+		dbName = fmt.Sprintf("default-%s.db", namespace)
+	}
+	dbPath := filepath.Join(c.basePath, dbName)
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, err
+	}
+	db.Exec("PRAGMA journal_mode=WAL;")
+	db.Exec("PRAGMA synchronous=NORMAL;")
+
+	c.dbs[namespace] = db
+	c.kindCache[namespace] = make(map[string]bool)
+	c.idxCache[namespace] = make(map[string]map[string]bool)
+
+	return db, nil
+}
+
+func (c *localStore) ensureKind(namespace, kind string, db *sql.DB) error {
+	c.mu.RLock()
+	exists := c.kindCache[namespace][kind]
+	c.mu.RUnlock()
+	if exists {
+		return nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.kindCache[namespace][kind] {
+		return nil
+	}
+
+	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %q (
+		_key TEXT PRIMARY KEY,
+		_id INTEGER,
+		_idstr TEXT,
+		data JSON,
+		_props BLOB
+	)`, kind)
+	if _, err := db.Exec(query); err != nil {
+		return err
+	}
+
+	c.kindCache[namespace][kind] = true
+	c.idxCache[namespace][kind] = make(map[string]bool)
+	return nil
+}
+
+func (c *localStore) ensureIndex(namespace, kind, field string, db *sql.DB) error {
+	c.mu.RLock()
+	exists := c.idxCache[namespace][kind][field]
+	c.mu.RUnlock()
+	if exists {
+		return nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.idxCache[namespace][kind][field] {
+		return nil
+	}
+
+	idxName := fmt.Sprintf("idx_%s_%s", kind, field)
+	query := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %q ON %q(json_extract(data, '$.%s'))`, idxName, kind, field)
+	if _, err := db.Exec(query); err != nil {
+		return err
+	}
+
+	c.idxCache[namespace][kind][field] = true
+	return nil
 }
 
 func keyToColAndID(k *datastore.Key) (string, string) {
@@ -29,8 +132,6 @@ func keyToColAndID(k *datastore.Key) (string, string) {
 	if id == "" {
 		id = strconv.FormatInt(k.ID, 10)
 	}
-	// For ancestors, ideally we want to encode the entire path into the ID or add a field.
-	// For local testing, we'll just use a simple prefixed ID if it has a parent.
 	if k.Parent != nil {
 		pCol, pID := keyToColAndID(k.Parent)
 		id = pCol + "_" + pID + "_" + id
@@ -38,53 +139,27 @@ func keyToColAndID(k *datastore.Key) (string, string) {
 	return col, id
 }
 
-func findDocByKey(db *v2.DB, col, id string) (*document.Document, error) {
-	docs, err := db.FindAll(query.NewQuery(col).Where(query.Field("__key__").Eq(id)).Limit(1))
-	if err != nil {
-		return nil, err
-	}
-	if len(docs) == 0 {
-		return nil, nil
-	}
-	return docs[0], nil
-}
-
-func replaceDocByKey(db *v2.DB, col, id string, d *document.Document) error {
-	doc, err := findDocByKey(db, col, id)
-	if err != nil {
-		return err
-	}
-	d.Set("__key__", id)
-	if doc == nil {
-		return db.Insert(col, d)
-	}
-	d.Set(document.ObjectIdField, doc.ObjectId())
-	return db.ReplaceById(col, doc.ObjectId(), d)
-}
-
-func deleteDocByKey(db *v2.DB, col, id string) error {
-	doc, err := findDocByKey(db, col, id)
-	if err != nil {
-		return err
-	}
-	if doc == nil {
-		return nil
-	}
-	return db.DeleteById(col, doc.ObjectId())
-}
-
 func (c *localStore) Get(ctx context.Context, key *datastore.Key, dst interface{}) error {
 	col, id := keyToColAndID(key)
-
-	doc, err := findDocByKey(c.db, col, id)
+	db, err := c.getDB(key.Namespace)
 	if err != nil {
-		return datastore.ErrNoSuchEntity
+		return err
 	}
-	if doc == nil {
-		return datastore.ErrNoSuchEntity
+	if err := c.ensureKind(key.Namespace, col, db); err != nil {
+		return err
 	}
 
-	return unmarshalDoc(doc, reflect.ValueOf(dst))
+	query := fmt.Sprintf(`SELECT _props FROM %q WHERE _key = ?`, col)
+	var propsBlob []byte
+	err = db.QueryRow(query, id).Scan(&propsBlob)
+	if err != nil {
+		if err == sql.ErrNoRows || strings.Contains(err.Error(), "no such table") {
+			return datastore.ErrNoSuchEntity
+		}
+		return err
+	}
+
+	return unmarshalDocLocal(propsBlob, reflect.ValueOf(dst))
 }
 
 func (c *localStore) GetMulti(ctx context.Context, keys []*datastore.Key, dst interface{}) error {
@@ -97,22 +172,8 @@ func (c *localStore) GetMulti(ctx context.Context, keys []*datastore.Key, dst in
 	hasErr := false
 
 	for i, k := range keys {
-		col, id := keyToColAndID(k)
-		doc, err := findDocByKey(c.db, col, id)
-
-		if err != nil || doc == nil {
-			me[i] = datastore.ErrNoSuchEntity
-			hasErr = true
-			continue
-		}
-
-		elem := v.Index(i)
-		// Need a pointer to the element to unmarshal
-		if elem.Kind() != reflect.Ptr {
-			elem = elem.Addr()
-		}
-
-		if err := unmarshalDoc(doc, elem); err != nil {
+		err := c.Get(ctx, k, v.Index(i).Addr().Interface())
+		if err != nil {
 			me[i] = err
 			hasErr = true
 		}
@@ -146,16 +207,19 @@ func (c *localStore) PutMulti(ctx context.Context, keys []*datastore.Key, src in
 
 	for i, k := range keys {
 		col, id := keyToColAndID(k)
-
-		// Create collection if missing
-		exists, _ := c.db.HasCollection(col)
-		if !exists {
-			c.db.CreateCollection(col)
+		db, err := c.getDB(k.Namespace)
+		if err != nil {
+			me[i] = err
+			hasErr = true
+			continue
+		}
+		if err := c.ensureKind(k.Namespace, col, db); err != nil {
+			me[i] = err
+			hasErr = true
+			continue
 		}
 
 		elem := v.Index(i)
-
-		docMap := make(map[string]interface{})
 
 		var pl datastore.PropertyList
 		if pls, ok := elem.Interface().(datastore.PropertyLoadSaver); ok {
@@ -180,31 +244,40 @@ func (c *localStore) PutMulti(ctx context.Context, keys []*datastore.Key, src in
 			pl = props
 		}
 
-		// Fix gob panic for typed nil pointers (e.g., *datastore.Key)
 		for j, p := range pl {
 			if p.Value != nil {
-				v := reflect.ValueOf(p.Value)
-				if v.Kind() == reflect.Ptr && v.IsNil() {
+				val := reflect.ValueOf(p.Value)
+				if val.Kind() == reflect.Ptr && val.IsNil() {
 					pl[j].Value = nil
 				}
 			}
 		}
 
-		b, err := marshalPropertyList(pl)
+		propsBlob, err := marshalPropertyList(pl)
 		if err != nil {
 			me[i] = err
 			hasErr = true
 			continue
 		}
 
-		docMap["__props__"] = b
+		docMap := make(map[string]interface{})
 		for _, p := range pl {
 			if !p.NoIndex {
 				docMap[p.Name] = p.Value
+				if err := c.ensureIndex(k.Namespace, col, p.Name, db); err != nil {
+					// Ignore index creation errors for now
+				}
 			}
 		}
 
-		if id == "0" {
+		dataJSON, err := json.Marshal(docMap)
+		if err != nil {
+			me[i] = err
+			hasErr = true
+			continue
+		}
+
+		if id == "0" || id == "" {
 			if k.Name == "" {
 				k.ID = rand.Int63n(1<<62) + 1
 				id = strconv.FormatInt(k.ID, 10)
@@ -212,11 +285,11 @@ func (c *localStore) PutMulti(ctx context.Context, keys []*datastore.Key, src in
 				k.Name = uuid.NewV4().String()
 				id = k.Name
 			}
+			col, id = keyToColAndID(k)
 		}
-		docMap["__key__"] = id
 
-		d := document.NewDocumentOf(docMap)
-		if err := replaceDocByKey(c.db, col, id, d); err != nil {
+		query := fmt.Sprintf(`INSERT OR REPLACE INTO %q (_key, _id, _idstr, data, _props) VALUES (?, ?, ?, ?, ?)`, col)
+		if _, err := db.Exec(query, id, k.ID, k.Name, dataJSON, propsBlob); err != nil {
 			me[i] = err
 			hasErr = true
 		}
@@ -230,15 +303,23 @@ func (c *localStore) PutMulti(ctx context.Context, keys []*datastore.Key, src in
 
 func (c *localStore) Delete(ctx context.Context, key *datastore.Key) error {
 	col, id := keyToColAndID(key)
-	return deleteDocByKey(c.db, col, id)
+	db, err := c.getDB(key.Namespace)
+	if err != nil {
+		return err
+	}
+	if err := c.ensureKind(key.Namespace, col, db); err != nil {
+		return err
+	}
+	query := fmt.Sprintf(`DELETE FROM %q WHERE _key = ?`, col)
+	_, err = db.Exec(query, id)
+	return err
 }
 
 func (c *localStore) DeleteMulti(ctx context.Context, keys []*datastore.Key) error {
 	me := make(datastore.MultiError, len(keys))
 	hasErr := false
 	for i, k := range keys {
-		col, id := keyToColAndID(k)
-		if err := deleteDocByKey(c.db, col, id); err != nil {
+		if err := c.Delete(ctx, k); err != nil {
 			me[i] = err
 			hasErr = true
 		}
@@ -250,21 +331,13 @@ func (c *localStore) DeleteMulti(ctx context.Context, keys []*datastore.Key) err
 }
 
 func (c *localStore) Mutate(ctx context.Context, muts ...*datastore.Mutation) ([]*datastore.Key, error) {
-	// Not fully implemented for local DB natively, translating to Put/Delete
-	// Real mutations in LocalDB are immediate, so we just run them
 	ret := make([]*datastore.Key, len(muts))
-	// simplified version
 	return ret, nil
 }
 
-// unmarshalDoc handles mapping generic map[string]interface{} into structs or PropertyList
-func unmarshalDoc(doc *document.Document, dst reflect.Value) error {
-	b, ok := doc.Get("__props__").([]byte)
-	if !ok {
-		return datastore.ErrNoSuchEntity
-	}
+func unmarshalDocLocal(propsBlob []byte, dst reflect.Value) error {
 	var pl datastore.PropertyList
-	if err := unmarshalPropertyList(b, &pl); err != nil {
+	if err := unmarshalPropertyList(propsBlob, &pl); err != nil {
 		return err
 	}
 
@@ -281,29 +354,30 @@ func unmarshalDoc(doc *document.Document, dst reflect.Value) error {
 }
 
 type localIterator struct {
-	docs []*document.Document
-	idx  int
+	rows    *sql.Rows
+	idx     int
+	keys    []*datastore.Key
+	blobs   [][]byte
+	doneErr error
 }
 
 func (it *localIterator) Next(dst interface{}) (*datastore.Key, error) {
-	if it.idx >= len(it.docs) {
+	if it.doneErr != nil {
+		return nil, it.doneErr
+	}
+	if it.idx >= len(it.keys) {
 		return nil, iterator.Done
 	}
-	doc := it.docs[it.idx]
+	k := it.keys[it.idx]
+	blob := it.blobs[it.idx]
 	it.idx++
 
 	if dst != nil {
-		if err := unmarshalDoc(doc, reflect.ValueOf(dst)); err != nil {
+		if err := unmarshalDocLocal(blob, reflect.ValueOf(dst)); err != nil {
 			return nil, err
 		}
 	}
-
-	idStr, _ := doc.Get("__key__").(string)
-	id, _ := strconv.ParseInt(idStr, 10, 64)
-	if id == 0 {
-		return datastore.NameKey("Unknown", idStr, nil), nil
-	}
-	return datastore.IDKey("Unknown", id, nil), nil
+	return k, nil
 }
 
 func (it *localIterator) Cursor() (string, error) {
@@ -312,52 +386,89 @@ func (it *localIterator) Cursor() (string, error) {
 
 func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 	col := q.Kind()
-	exists, _ := c.db.HasCollection(col)
-	if !exists {
-		return &localIterator{docs: nil, idx: 0}
+	ns := ""
+	if anc := q.GetAncestor(); anc != nil {
+		ns = anc.Namespace
+	}
+	db, err := c.getDB(ns)
+	if err != nil {
+		return &localIterator{doneErr: err}
 	}
 
-	cq := query.NewQuery(col)
-	// Example filter mapping
+	c.mu.RLock()
+	exists := c.kindCache[ns][col]
+	c.mu.RUnlock()
+	if !exists {
+		return &localIterator{doneErr: iterator.Done}
+	}
+
+	var conditions []string
+	var args []interface{}
+
 	for _, f := range q.Filters() {
-		switch f.Op {
-		case "=":
-			cq = cq.Where(query.Field(f.Field).Eq(f.Value))
-		case ">":
-			cq = cq.Where(query.Field(f.Field).Gt(f.Value))
-		case ">=":
-			cq = cq.Where(query.Field(f.Field).GtEq(f.Value))
-		case "<":
-			cq = cq.Where(query.Field(f.Field).Lt(f.Value))
-		case "<=":
-			cq = cq.Where(query.Field(f.Field).LtEq(f.Value))
+		op := f.Op
+		if op == "" {
+			op = "="
 		}
+		conditions = append(conditions, fmt.Sprintf("json_extract(data, '$.%s') %s ?", f.Field, op))
+		args = append(args, f.Value)
+	}
+
+	if anc := q.GetAncestor(); anc != nil {
+		_, pID := keyToColAndID(anc)
+		conditions = append(conditions, "_key LIKE ?")
+		args = append(args, pID+"_%")
+	}
+
+	queryStr := fmt.Sprintf("SELECT _id, _idstr, _props FROM %q", col)
+	if len(conditions) > 0 {
+		queryStr += " WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	if len(q.Orders()) > 0 {
+		var orderStrs []string
+		for _, o := range q.Orders() {
+			dir := "ASC"
+			if o.Direction == "desc" || strings.HasPrefix(strings.ToLower(o.Direction), "-") {
+				dir = "DESC"
+			}
+			orderStrs = append(orderStrs, fmt.Sprintf("json_extract(data, '$.%s') %s", o.Field, dir))
+		}
+		queryStr += " ORDER BY " + strings.Join(orderStrs, ", ")
 	}
 
 	if q.GetLimit() > 0 {
-		cq = cq.Limit(q.GetLimit())
+		queryStr += " LIMIT " + strconv.Itoa(q.GetLimit())
 	}
 	if q.GetOffset() > 0 {
-		cq = cq.Skip(q.GetOffset())
-	}
-	// order mapping
-	for _, o := range q.Orders() {
-		dir := 1
-		if o.Direction == "desc" {
-			dir = -1
-		}
-		cq = cq.Sort(query.SortOption{Field: o.Field, Direction: dir})
+		queryStr += " OFFSET " + strconv.Itoa(q.GetOffset())
 	}
 
-	docs, _ := c.db.FindAll(cq)
-	if col == "DatastoreTagModel" {
-		fmt.Printf("DSORM-DEBUG Run query on %s with filters %v returned %d docs\n", col, q.Filters(), len(docs))
-		for _, doc := range docs {
-			fmt.Printf("Doc: %v\n", doc.AsMap())
+	rows, err := db.Query(queryStr, args...)
+	if err != nil {
+		return &localIterator{doneErr: err}
+	}
+	defer rows.Close()
+
+	var keys []*datastore.Key
+	var blobs [][]byte
+
+	for rows.Next() {
+		var idInt sql.NullInt64
+		var idStr sql.NullString
+		var propsBlob []byte
+		if err := rows.Scan(&idInt, &idStr, &propsBlob); err != nil {
+			return &localIterator{doneErr: err}
 		}
+
+		k := datastore.NameKey(col, idStr.String, nil)
+		if idInt.Int64 != 0 {
+			k = datastore.IDKey(col, idInt.Int64, nil)
+		}
+		keys = append(keys, k)
+		blobs = append(blobs, propsBlob)
 	}
 
-	// handle cursor
 	idx := 0
 	if cStr := q.GetCursor(); cStr != "" {
 		if cInt, err := strconv.Atoi(cStr); err == nil {
@@ -366,32 +477,55 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 	}
 
 	return &localIterator{
-		docs: docs,
-		idx:  idx,
+		keys:  keys,
+		blobs: blobs,
+		idx:   idx,
 	}
 }
 
-// localStore inherently supports atomic operations natively per document,
-// but across documents transactions lock the DB file.
 func (c *localStore) RunInTransaction(ctx context.Context, f func(tx TransactionStore) error, opts ...datastore.TransactionOption) (*datastore.Commit, error) {
-	// Mock transaction for now.
-	// We can use sync.Mutex or a localStore wrapper.
-	txStore := &localTxStore{c}
+	txStore := &localTxStore{
+		localStore: c,
+		puts:       make(map[string]interface{}),
+		putKeys:    make(map[string]*datastore.Key),
+		dels:       make(map[string]*datastore.Key),
+	}
 	if err := f(txStore); err != nil {
 		return nil, err
 	}
-	return &datastore.Commit{}, nil
+	return txStore.Commit()
 }
 
 func (c *localStore) NewTransaction(ctx context.Context, opts ...datastore.TransactionOption) (TransactionStore, error) {
-	return &localTxStore{c}, nil
+	return &localTxStore{
+		localStore: c,
+		puts:       make(map[string]interface{}),
+		putKeys:    make(map[string]*datastore.Key),
+		dels:       make(map[string]*datastore.Key),
+	}, nil
 }
 
 type localTxStore struct {
 	*localStore
+	mu      sync.Mutex
+	puts    map[string]interface{}
+	putKeys map[string]*datastore.Key
+	dels    map[string]*datastore.Key
+	muts    []*datastore.Mutation
 }
 
 func (c *localTxStore) Get(key *datastore.Key, dst interface{}) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	col, id := keyToColAndID(key)
+	kStr := col + ":" + id
+	if _, ok := c.dels[kStr]; ok {
+		return datastore.ErrNoSuchEntity
+	}
+
+	// Depending on Datastore semantics, changes in TX might not be visible to Get.
+	// But dsorm uses standard transactional Get. We just read from DB.
 	return c.localStore.Get(context.Background(), key, dst)
 }
 
@@ -400,27 +534,104 @@ func (c *localTxStore) GetMulti(keys []*datastore.Key, dst interface{}) error {
 }
 
 func (c *localTxStore) Put(key *datastore.Key, src interface{}) (*datastore.PendingKey, error) {
-	_, err := c.localStore.Put(context.Background(), key, src)
-	return nil, err
+	keys, err := c.PutMulti([]*datastore.Key{key}, []interface{}{src})
+	if err != nil {
+		return nil, err
+	}
+	return keys[0], nil
 }
 
 func (c *localTxStore) PutMulti(keys []*datastore.Key, src interface{}) ([]*datastore.PendingKey, error) {
-	_, err := c.localStore.PutMulti(context.Background(), keys, src)
-	return nil, err
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	v := reflect.ValueOf(src)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+
+	ret := make([]*datastore.PendingKey, len(keys))
+	for i, k := range keys {
+		col, id := keyToColAndID(k)
+		kStr := col + ":" + id
+
+		c.puts[kStr] = v.Index(i).Interface()
+		c.putKeys[kStr] = k
+		delete(c.dels, kStr)
+		ret[i] = &datastore.PendingKey{}
+	}
+	return ret, nil
 }
 
 func (c *localTxStore) Delete(key *datastore.Key) error {
-	return c.localStore.Delete(context.Background(), key)
+	return c.DeleteMulti([]*datastore.Key{key})
 }
 
 func (c *localTxStore) DeleteMulti(keys []*datastore.Key) error {
-	return c.localStore.DeleteMulti(context.Background(), keys)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, k := range keys {
+		col, id := keyToColAndID(k)
+		kStr := col + ":" + id
+		c.dels[kStr] = k
+		delete(c.puts, kStr)
+		delete(c.putKeys, kStr)
+	}
+	return nil
 }
 
 func (c *localTxStore) Mutate(muts ...*datastore.Mutation) ([]*datastore.PendingKey, error) {
-	_, err := c.localStore.Mutate(context.Background(), muts...)
-	return nil, err
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.muts = append(c.muts, muts...)
+	return make([]*datastore.PendingKey, len(muts)), nil
 }
 
-func (c *localTxStore) Rollback() error                    { return nil }
-func (c *localTxStore) Commit() (*datastore.Commit, error) { return &datastore.Commit{}, nil }
+func (c *localTxStore) Rollback() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.puts = nil
+	c.putKeys = nil
+	c.dels = nil
+	c.muts = nil
+	return nil
+}
+
+func (c *localTxStore) Commit() (*datastore.Commit, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(c.puts) > 0 {
+		var putKeys []*datastore.Key
+		var putSrcs []interface{}
+		for k, v := range c.puts {
+			putKeys = append(putKeys, c.putKeys[k])
+			putSrcs = append(putSrcs, v)
+		}
+		if _, err := c.localStore.PutMulti(context.Background(), putKeys, putSrcs); err != nil {
+			return nil, err
+		}
+	}
+
+	if len(c.dels) > 0 {
+		var delKeys []*datastore.Key
+		for _, k := range c.dels {
+			delKeys = append(delKeys, k)
+		}
+		if err := c.localStore.DeleteMulti(context.Background(), delKeys); err != nil {
+			return nil, err
+		}
+	}
+
+	if len(c.muts) > 0 {
+		if _, err := c.localStore.Mutate(context.Background(), c.muts...); err != nil {
+			return nil, err
+		}
+	}
+
+	c.puts = nil
+	c.putKeys = nil
+	c.dels = nil
+	c.muts = nil
+	return &datastore.Commit{}, nil
+}
