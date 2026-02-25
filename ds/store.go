@@ -21,6 +21,10 @@ type Store interface {
 	PutMulti(ctx context.Context, keys []*datastore.Key, src interface{}) ([]*datastore.Key, error)
 	Delete(ctx context.Context, key *datastore.Key) error
 	DeleteMulti(ctx context.Context, keys []*datastore.Key) error
+}
+
+// Mutator is an optional interface for stores that support datastore mutations.
+type Mutator interface {
 	Mutate(ctx context.Context, muts ...*datastore.Mutation) ([]*datastore.Key, error)
 }
 
@@ -72,5 +76,9 @@ type TransactionStore interface {
 	DeleteMulti(keys []*datastore.Key) error
 	Commit() (*datastore.Commit, error)
 	Rollback() error
+}
+
+// TransactionMutator is an optional interface for transaction stores that support mutations.
+type TransactionMutator interface {
 	Mutate(muts ...*datastore.Mutation) ([]*datastore.PendingKey, error)
 }

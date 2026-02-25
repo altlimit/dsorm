@@ -2,6 +2,7 @@ package ds
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"cloud.google.com/go/datastore"
@@ -127,7 +128,11 @@ func (t *Transaction) Mutate(muts ...*Mutation) ([]*datastore.PendingKey, error)
 		keys[i] = mut.k
 	}
 	t.lockKeys(keys)
-	return t.tx.Mutate(mutations...)
+	m, ok := t.tx.(TransactionMutator)
+	if !ok {
+		return nil, errors.New("transaction store does not support Mutate")
+	}
+	return m.Mutate(mutations...)
 }
 
 // RunInTransaction wrapper ensuring cache interaction.

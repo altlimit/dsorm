@@ -566,14 +566,6 @@ func (c *localStore) DeleteMulti(ctx context.Context, keys []*datastore.Key) err
 	return nil
 }
 
-func (c *localStore) Mutate(ctx context.Context, muts ...*datastore.Mutation) ([]*datastore.Key, error) {
-	// datastore.Mutation has only unexported fields, so we cannot introspect
-	// mutation type (insert/update/upsert/delete) or the associated key/src.
-	// For local development, mutations should be performed via Put/Delete directly.
-	ret := make([]*datastore.Key, len(muts))
-	return ret, nil
-}
-
 func unmarshalDocLocal(propsBlob []byte, dst reflect.Value) error {
 	var pl datastore.PropertyList
 	if err := unmarshalPropertyList(propsBlob, &pl); err != nil {
@@ -843,7 +835,6 @@ type localTxStore struct {
 	puts    map[string]interface{}
 	putKeys map[string]*datastore.Key
 	dels    map[string]*datastore.Key
-	muts    []*datastore.Mutation
 }
 
 func (c *localTxStore) Get(key *datastore.Key, dst interface{}) error {
@@ -939,20 +930,12 @@ func (c *localTxStore) DeleteMulti(keys []*datastore.Key) error {
 	return nil
 }
 
-func (c *localTxStore) Mutate(muts ...*datastore.Mutation) ([]*datastore.PendingKey, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.muts = append(c.muts, muts...)
-	return make([]*datastore.PendingKey, len(muts)), nil
-}
-
 func (c *localTxStore) Rollback() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.puts = nil
 	c.putKeys = nil
 	c.dels = nil
-	c.muts = nil
 	return nil
 }
 
@@ -1021,13 +1004,6 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 		}
 	}
 
-	// Execute mutations
-	if len(c.muts) > 0 {
-		if _, err := c.localStore.Mutate(context.Background(), c.muts...); err != nil {
-			return nil, err
-		}
-	}
-
 	// Commit all SQL transactions
 	for _, dt := range txMap {
 		if err := dt.tx.Commit(); err != nil {
@@ -1039,6 +1015,5 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 	c.puts = nil
 	c.putKeys = nil
 	c.dels = nil
-	c.muts = nil
 	return &datastore.Commit{}, nil
 }

@@ -10,6 +10,8 @@ import (
 var _ Store = (*cloudStore)(nil)
 var _ Queryer = (*cloudStore)(nil)
 var _ Transactioner = (*cloudStore)(nil)
+var _ Mutator = (*cloudStore)(nil)
+var _ TransactionMutator = (*cloudTransaction)(nil)
 
 type cloudStore struct {
 	client *datastore.Client
