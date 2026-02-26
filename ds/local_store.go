@@ -594,11 +594,13 @@ func unmarshalDocLocal(propsBlob []byte, dst reflect.Value) error {
 }
 
 type localIterator struct {
-	rows    *sql.Rows
-	idx     int
-	keys    []*datastore.Key
-	blobs   [][]byte
-	doneErr error
+	rows       *sql.Rows
+	idx        int
+	keys       []*datastore.Key
+	blobs      [][]byte
+	page       int
+	totalPages int
+	doneErr    error
 }
 
 func (it *localIterator) Next(dst interface{}) (*datastore.Key, error) {
@@ -621,7 +623,11 @@ func (it *localIterator) Next(dst interface{}) (*datastore.Key, error) {
 }
 
 func (it *localIterator) Cursor() (string, error) {
-	return strconv.Itoa(it.idx), nil
+	nextPage := it.page + 1
+	if it.totalPages > 0 && nextPage > it.totalPages {
+		return "", nil
+	}
+	return fmt.Sprintf("%d:%d", nextPage, it.totalPages), nil
 }
 
 func (c *localStore) Run(ctx context.Context, q Query) Iterator {
@@ -775,20 +781,42 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 	// then condition/filter args (they appear in WHERE).
 	finalArgs := append(orderJoinArgs, args...)
 
-	// Parse cursor early so we can adjust LIMIT to account for
-	// cursor-skipped rows (the cursor skip happens post-query).
-	cursorIdx := 0
+	// Parse page-based cursor (format: "page:totalPages").
+	page := 1
 	if cStr := q.GetCursor(); cStr != "" {
-		if cInt, err := strconv.Atoi(cStr); err == nil {
-			cursorIdx = cInt
+		parts := strings.SplitN(cStr, ":", 2)
+		if p, err := strconv.Atoi(parts[0]); err == nil && p > 0 {
+			page = p
 		}
 	}
 
-	if q.GetLimit() > 0 {
-		queryStr += " LIMIT " + strconv.Itoa(q.GetLimit()+cursorIdx)
-	}
-	if q.GetOffset() > 0 {
-		queryStr += " OFFSET " + strconv.Itoa(q.GetOffset())
+	// Run a COUNT query to determine total rows for pagination.
+	totalPages := 0
+	limit := q.GetLimit()
+	if limit > 0 {
+		countQuery := fmt.Sprintf("SELECT COUNT(DISTINCT main.key) FROM %q main", col)
+		if len(joins) > 0 {
+			countQuery += " " + strings.Join(joins, " ")
+		}
+		if len(conditions) > 0 {
+			countQuery += " WHERE " + strings.Join(conditions, " AND ")
+		}
+		// COUNT query only needs filter args (no order join args).
+		var totalRows int
+		if err := db.QueryRow(countQuery, args...).Scan(&totalRows); err != nil {
+			return &localIterator{doneErr: fmt.Errorf("count query: %w", err)}
+		}
+		totalPages = (totalRows + limit - 1) / limit // ceil division
+
+		offset := (page - 1) * limit
+		if q.GetOffset() > 0 {
+			offset += q.GetOffset()
+		}
+		queryStr += " LIMIT " + strconv.Itoa(limit) + " OFFSET " + strconv.Itoa(offset)
+	} else {
+		if q.GetOffset() > 0 {
+			queryStr += " OFFSET " + strconv.Itoa(q.GetOffset())
+		}
 	}
 
 	rows, err := db.Query(queryStr, finalArgs...)
@@ -823,9 +851,10 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 	}
 
 	return &localIterator{
-		keys:  keys,
-		blobs: blobs,
-		idx:   cursorIdx,
+		keys:       keys,
+		blobs:      blobs,
+		page:       page,
+		totalPages: totalPages,
 	}
 }
 
