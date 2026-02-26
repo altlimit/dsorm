@@ -5,16 +5,26 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"cloud.google.com/go/datastore"
 	"github.com/altlimit/dsorm"
+	"github.com/altlimit/dsorm/ds/local"
 )
 
 // Global test DB instance for convenience, or strictly local?
 // Let's use a global one initialized in TestMain for simplicity, mimicking previous behavior
-var testDB *dsorm.Client
+var testClients map[string]*dsorm.Client
+
+func runAllStores(t *testing.T, f func(*testing.T, *dsorm.Client)) {
+	for name, db := range testClients {
+		t.Run(name, func(t *testing.T) {
+			f(t, db)
+		})
+	}
+}
 
 // TestMain setups the environment for tests
 func TestMain(m *testing.M) {
@@ -30,13 +40,29 @@ func TestMain(m *testing.M) {
 
 	// Initialize DB
 	ctx := context.Background()
-	var err error
-	testDB, err = dsorm.New(ctx)
+	testDB, err := dsorm.New(ctx)
 	if err != nil {
 		panic(err)
 	}
 
+	tempDir, err := os.MkdirTemp("", "dsorm_test_*")
+	if err != nil {
+		panic(err)
+	}
+
+	localStore := local.NewStore(tempDir)
+	localClient, err := dsorm.New(ctx, dsorm.WithStore(localStore))
+	if err != nil {
+		panic(err)
+	}
+
+	testClients = map[string]*dsorm.Client{
+		"CloudStore": testDB,
+		"LocalStore": localClient,
+	}
+
 	code := m.Run()
+	os.RemoveAll(tempDir)
 	os.Exit(code)
 }
 
@@ -123,6 +149,10 @@ type DirectEncryptModel struct {
 // ------------------------------------------------------------------
 
 func TestModelLifecycle(t *testing.T) {
+	runAllStores(t, testModelLifecycle)
+}
+
+func testModelLifecycle(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 
 	m := &LifecycleModel{Value: "lifecycle"}
@@ -215,6 +245,10 @@ func TestModelLifecycle(t *testing.T) {
 }
 
 func TestKeyMapping(t *testing.T) {
+	runAllStores(t, testKeyMapping)
+}
+
+func testKeyMapping(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 	parentKey := datastore.NameKey("Parent", "parent-id", nil)
 	parentKey.Namespace = "ns-custom"
@@ -254,6 +288,10 @@ func TestKeyMapping(t *testing.T) {
 }
 
 func TestPropertyMarshaling(t *testing.T) {
+	runAllStores(t, testPropertyMarshaling)
+}
+
+func testPropertyMarshaling(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 
 	// Test JSON
@@ -286,7 +324,9 @@ func TestPropertyMarshaling(t *testing.T) {
 	// Test Encryption
 	encCtx := context.Background()
 	secret := []byte("different-secret-32-bytes-long!!") // 32 bytes, different from TestMain
-	encDB, err := dsorm.New(encCtx, dsorm.WithEncryptionKey(secret))
+
+	storeOpts := dsorm.WithStore(testDB.InternalClient().Store)
+	encDB, err := dsorm.New(encCtx, dsorm.WithEncryptionKey(secret), storeOpts)
 	if err != nil {
 		t.Fatalf("New DB with enc key failed: %v", err)
 	}
@@ -303,11 +343,11 @@ func TestPropertyMarshaling(t *testing.T) {
 	}
 
 	// Verify encryption in Datastore (raw check)
-	rawClient := encDB.RawClient()
+	store := encDB.InternalClient().Store
 	// Need key
 	key := encDB.Key(em)
 	var rawProps datastore.PropertyList
-	if err := rawClient.Get(encCtx, key, &rawProps); err != nil {
+	if err := store.Get(encCtx, key, &rawProps); err != nil {
 		t.Fatalf("Raw Get failed: %v", err)
 	}
 
@@ -383,7 +423,7 @@ func TestPropertyMarshaling(t *testing.T) {
 	// Verify it is indeed encrypted in raw
 	keyDEM := encDB.Key(dem)
 	var rawPropsDEM datastore.PropertyList
-	if err := rawClient.Get(encCtx, keyDEM, &rawPropsDEM); err != nil {
+	if err := store.Get(encCtx, keyDEM, &rawPropsDEM); err != nil {
 		t.Fatalf("Raw Get DEM failed: %v", err)
 	}
 	foundData := false
@@ -404,6 +444,10 @@ func TestPropertyMarshaling(t *testing.T) {
 }
 
 func TestDatastoreTags(t *testing.T) {
+	runAllStores(t, testDatastoreTags)
+}
+
+func testDatastoreTags(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 	m := &DatastoreTagModel{
 		Ignored:    "should-not-save",
@@ -420,11 +464,11 @@ func TestDatastoreTags(t *testing.T) {
 	}
 
 	// Verify via Raw Client
-	rawClient := testDB.RawClient()
+	store := testDB.InternalClient().Store
 	// Need key - use db.Key to generate it as we rely on ID
 	key := testDB.Key(m)
 	var rawProps datastore.PropertyList
-	if err := rawClient.Get(ctx, key, &rawProps); err != nil {
+	if err := store.Get(ctx, key, &rawProps); err != nil {
 		t.Fatalf("Raw Get failed: %v", err)
 	}
 
@@ -468,7 +512,7 @@ func TestDatastoreTags(t *testing.T) {
 
 	// Verify Query behavior
 	// Querying on unindexed field should return nothing
-	q := datastore.NewQuery("DatastoreTagModel").FilterField("NotIndexed", "=", "hidden")
+	q := dsorm.NewQuery("DatastoreTagModel").FilterField("NotIndexed", "=", "hidden")
 	results, _, err := dsorm.Query[*DatastoreTagModel](ctx, testDB, q, "")
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
@@ -478,7 +522,7 @@ func TestDatastoreTags(t *testing.T) {
 	}
 
 	// Querying on indexed field should find it
-	q2 := datastore.NewQuery("DatastoreTagModel").FilterField("Indexed", "=", "visible")
+	q2 := dsorm.NewQuery("DatastoreTagModel").FilterField("Indexed", "=", "visible")
 	results2, _, err := dsorm.Query[*DatastoreTagModel](ctx, testDB, q2, "")
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
@@ -491,6 +535,10 @@ func TestDatastoreTags(t *testing.T) {
 }
 
 func TestDBOperations(t *testing.T) {
+	runAllStores(t, testDBOperations)
+}
+
+func testDBOperations(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 
 	// PutMulti
@@ -535,7 +583,7 @@ func TestDBOperations(t *testing.T) {
 	}
 
 	// Query
-	q := datastore.NewQuery("LifecycleModel").Order("Value")
+	q := dsorm.NewQuery("LifecycleModel").Order("Value")
 	results, _, err := dsorm.Query[*LifecycleModel](ctx, testDB, q, "")
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
@@ -566,6 +614,10 @@ func TestDBOperations(t *testing.T) {
 }
 
 func TestTransactions(t *testing.T) {
+	runAllStores(t, testTransactions)
+}
+
+func testTransactions(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 	m := &LifecycleModel{ID: 555, Value: "initial"}
 	// ID=555 -> Key(LifecycleModel, 555)
@@ -621,6 +673,99 @@ func TestTransactions(t *testing.T) {
 	}
 }
 
+func TestTransactionCRUD(t *testing.T) {
+	runAllStores(t, testTransactionCRUD)
+}
+
+func testTransactionCRUD(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+	baseID := time.Now().UnixNano()
+
+	// --- Transaction PutMulti + GetMulti ---
+	t.Run("PutMulti_GetMulti", func(t *testing.T) {
+		m1 := &LifecycleModel{ID: baseID + 1, Value: "tx-put-1"}
+		m2 := &LifecycleModel{ID: baseID + 2, Value: "tx-put-2"}
+
+		_, err := testDB.Transact(ctx, func(tx *dsorm.Transaction) error {
+			return tx.PutMulti([]*LifecycleModel{m1, m2})
+		})
+		if err != nil {
+			t.Fatalf("Transact PutMulti failed: %v", err)
+		}
+
+		// Verify via GetMulti in a new transaction
+		_, err = testDB.Transact(ctx, func(tx *dsorm.Transaction) error {
+			fetched := []*LifecycleModel{
+				{ID: baseID + 1},
+				{ID: baseID + 2},
+			}
+			if err := tx.GetMulti(fetched); err != nil {
+				return err
+			}
+			if fetched[0].Value != "tx-put-1" {
+				t.Errorf("Expected tx-put-1, got %s", fetched[0].Value)
+			}
+			if fetched[1].Value != "tx-put-2" {
+				t.Errorf("Expected tx-put-2, got %s", fetched[1].Value)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Transact GetMulti failed: %v", err)
+		}
+	})
+
+	// --- Transaction Delete ---
+	t.Run("Delete", func(t *testing.T) {
+		m := &LifecycleModel{ID: baseID + 10, Value: "to-delete"}
+		if err := testDB.Put(ctx, m); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+
+		_, err := testDB.Transact(ctx, func(tx *dsorm.Transaction) error {
+			return tx.Delete(&LifecycleModel{ID: baseID + 10})
+		})
+		if err != nil {
+			t.Fatalf("Transact Delete failed: %v", err)
+		}
+
+		// Verify deleted
+		check := &LifecycleModel{ID: baseID + 10}
+		if err := testDB.Get(ctx, check); err != datastore.ErrNoSuchEntity {
+			t.Errorf("Expected ErrNoSuchEntity, got %v", err)
+		}
+	})
+
+	// --- Transaction DeleteMulti ---
+	t.Run("DeleteMulti", func(t *testing.T) {
+		m1 := &LifecycleModel{ID: baseID + 20, Value: "del-1"}
+		m2 := &LifecycleModel{ID: baseID + 21, Value: "del-2"}
+		if err := testDB.PutMulti(ctx, []*LifecycleModel{m1, m2}); err != nil {
+			t.Fatalf("PutMulti failed: %v", err)
+		}
+
+		_, err := testDB.Transact(ctx, func(tx *dsorm.Transaction) error {
+			return tx.DeleteMulti([]*LifecycleModel{
+				{ID: baseID + 20},
+				{ID: baseID + 21},
+			})
+		})
+		if err != nil {
+			t.Fatalf("Transact DeleteMulti failed: %v", err)
+		}
+
+		// Verify all deleted
+		check1 := &LifecycleModel{ID: baseID + 20}
+		check2 := &LifecycleModel{ID: baseID + 21}
+		if err := testDB.Get(ctx, check1); err != datastore.ErrNoSuchEntity {
+			t.Errorf("Expected ErrNoSuchEntity for ID %d, got %v", baseID+20, err)
+		}
+		if err := testDB.Get(ctx, check2); err != datastore.ErrNoSuchEntity {
+			t.Errorf("Expected ErrNoSuchEntity for ID %d, got %v", baseID+21, err)
+		}
+	})
+}
+
 type ParentModel struct {
 	dsorm.Base
 	ID string `model:"id"`
@@ -633,6 +778,10 @@ type ChildModel struct {
 }
 
 func TestStructParent(t *testing.T) {
+	runAllStores(t, testStructParent)
+}
+
+func testStructParent(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 
 	parent := &ParentModel{ID: "parent-1"}
@@ -696,6 +845,10 @@ func TestStructParent(t *testing.T) {
 }
 
 func TestGetMultiGeneric(t *testing.T) {
+	runAllStores(t, testGetMultiGeneric)
+}
+
+func testGetMultiGeneric(t *testing.T, testDB *dsorm.Client) {
 	ctx := context.Background()
 
 	// 1. Test with []string using KeyMappingModel (String ID)
@@ -799,6 +952,14 @@ func TestGetMultiGeneric(t *testing.T) {
 }
 
 func TestTransactionPendingKey(t *testing.T) {
+	runAllStores(t, testTransactionPendingKey)
+}
+
+func testTransactionPendingKey(t *testing.T, testDB *dsorm.Client) {
+	if strings.Contains(t.Name(), "LocalStore") {
+		t.Skip("LocalStore cannot populate datastore.Commit private keys for PendingKey resolution")
+	}
+
 	ctx := context.Background()
 	m := &LifecycleModel{Value: "pending-key"}
 	// ID is 0, so incomplete key.
@@ -815,5 +976,414 @@ func TestTransactionPendingKey(t *testing.T) {
 	// Currently, we expect this to likely be 0.
 	if m.ID == 0 {
 		t.Error("ID is 0, expected it to be populated from PendingKey")
+	}
+}
+
+func TestSlicePropertyQuery(t *testing.T) {
+	runAllStores(t, testSlicePropertyQuery)
+}
+
+func testSlicePropertyQuery(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	type User struct {
+		dsorm.Base
+		ID      int64     `datastore:"-" model:"id"`
+		Name    string    `datastore:"name"`
+		Created time.Time `datastore:"created" model:"created"`
+		Tags    []string  `datastore:"tag"`
+	}
+
+	user := &User{
+		Name: "Alice",
+		Tags: []string{"tag1", "tag2"},
+	}
+
+	if err := testDB.Put(ctx, user); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// Query for tag1 — should find the user
+	q := dsorm.NewQuery("User").FilterField("tag", "=", "tag1")
+	users, _, err := dsorm.Query[*User](ctx, testDB, q, "")
+	if err != nil {
+		t.Fatalf("Query tag1 failed: %v", err)
+	}
+	if len(users) < 1 {
+		t.Errorf("Expected at least 1 result for tag1, got %d", len(users))
+	}
+
+	// Query for tag2 — should also find the user
+	q2 := dsorm.NewQuery("User").FilterField("tag", "=", "tag2")
+	users2, _, err := dsorm.Query[*User](ctx, testDB, q2, "")
+	if err != nil {
+		t.Fatalf("Query tag2 failed: %v", err)
+	}
+	if len(users2) < 1 {
+		t.Errorf("Expected at least 1 result for tag2, got %d", len(users2))
+	}
+
+	// Verify the returned user has both tags
+	if len(users) > 0 {
+		if users[0].Name != "Alice" {
+			t.Errorf("Expected name 'Alice', got '%s'", users[0].Name)
+		}
+		if len(users[0].Tags) != 2 {
+			t.Errorf("Expected 2 tags, got %d: %v", len(users[0].Tags), users[0].Tags)
+		}
+	}
+}
+
+// ------------------------------------------------------------------
+// Comprehensive Query Tests
+// ------------------------------------------------------------------
+
+type QueryModel struct {
+	dsorm.Base
+	ID    int64  `model:"id"`
+	Group string `datastore:"group"` // scoping field to isolate test runs
+	Label string `datastore:"label"`
+	Score int    `datastore:"score"`
+}
+
+func TestQueryFeatures(t *testing.T) {
+	runAllStores(t, testQueryFeatures)
+}
+
+func testQueryFeatures(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	// Unique group per test run to isolate from leftover data
+	group := fmt.Sprintf("grp-%d", time.Now().UnixNano())
+
+	// Seed 5 models with distinct scores and labels
+	baseID := time.Now().UnixNano()
+	seeds := []struct {
+		label string
+		score int
+	}{
+		{"alpha", 10},
+		{"bravo", 20},
+		{"charlie", 30},
+		{"delta", 40},
+		{"echo", 50},
+	}
+	for i, s := range seeds {
+		m := &QueryModel{ID: baseID + int64(i), Group: group, Label: s.label, Score: s.score}
+		if err := testDB.Put(ctx, m); err != nil {
+			t.Fatalf("Seed Put %d failed: %v", i, err)
+		}
+	}
+
+	// Helper: new query scoped to our group
+	newQ := func() *dsorm.QueryBuilder {
+		return dsorm.NewQuery("QueryModel").FilterField("group", "=", group)
+	}
+
+	// --- Limit ---
+	t.Run("Limit", func(t *testing.T) {
+		q := newQ().Limit(2)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) != 2 {
+			t.Errorf("Expected 2 results, got %d", len(results))
+		}
+	})
+
+	// --- Offset ---
+	t.Run("Offset", func(t *testing.T) {
+		q := newQ().Order("score").Limit(2).Offset(2)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) != 2 {
+			t.Errorf("Expected 2 results, got %d", len(results))
+		}
+		if len(results) >= 1 && results[0].Score != 30 {
+			t.Errorf("Expected first result to have score 30, got %d", results[0].Score)
+		}
+	})
+
+	// --- Order Ascending ---
+	t.Run("OrderAsc", func(t *testing.T) {
+		q := newQ().Order("score")
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) != 5 {
+			t.Fatalf("Expected 5 results, got %d", len(results))
+		}
+		for i := 1; i < len(results); i++ {
+			if results[i].Score < results[i-1].Score {
+				t.Errorf("Results not sorted ascending: score[%d]=%d < score[%d]=%d",
+					i, results[i].Score, i-1, results[i-1].Score)
+			}
+		}
+	})
+
+	// --- Order Descending ---
+	t.Run("OrderDesc", func(t *testing.T) {
+		q := newQ().Order("-score")
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) != 5 {
+			t.Fatalf("Expected 5 results, got %d", len(results))
+		}
+		for i := 1; i < len(results); i++ {
+			if results[i].Score > results[i-1].Score {
+				t.Errorf("Results not sorted descending: score[%d]=%d > score[%d]=%d",
+					i, results[i].Score, i-1, results[i-1].Score)
+			}
+		}
+	})
+
+	// --- Cursor / Pagination ---
+	t.Run("Cursor", func(t *testing.T) {
+		q := newQ().Order("score").Limit(3)
+		page1, cursor, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Page 1 failed: %v", err)
+		}
+		if len(page1) != 3 {
+			t.Fatalf("Page 1: expected 3 results, got %d", len(page1))
+		}
+		if cursor == "" {
+			t.Fatal("Expected non-empty cursor after page 1")
+		}
+
+		// Page 2
+		page2, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, cursor)
+		if err != nil {
+			t.Fatalf("Page 2 failed: %v", err)
+		}
+		if len(page2) != 2 {
+			t.Errorf("Page 2: expected 2 results, got %d", len(page2))
+		}
+
+		// Ensure no overlap between pages
+		page1IDs := make(map[int64]bool)
+		for _, r := range page1 {
+			page1IDs[r.ID] = true
+		}
+		for _, r := range page2 {
+			if page1IDs[r.ID] {
+				t.Errorf("Page 2 result ID %d was already in page 1", r.ID)
+			}
+		}
+	})
+
+	// --- Inequality: Greater Than ---
+	t.Run("InequalityGT", func(t *testing.T) {
+		q := newQ().FilterField("score", ">", 30)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) < 2 {
+			t.Errorf("Expected at least 2 results (score 40, 50), got %d", len(results))
+		}
+		for _, r := range results {
+			if r.Score <= 30 {
+				t.Errorf("Unexpected result with score %d (should be > 30)", r.Score)
+			}
+		}
+	})
+
+	// --- Inequality: Greater Than or Equal ---
+	t.Run("InequalityGTE", func(t *testing.T) {
+		q := newQ().FilterField("score", ">=", 30)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) < 3 {
+			t.Errorf("Expected at least 3 results (score 30, 40, 50), got %d", len(results))
+		}
+		for _, r := range results {
+			if r.Score < 30 {
+				t.Errorf("Unexpected result with score %d (should be >= 30)", r.Score)
+			}
+		}
+	})
+
+	// --- Inequality: Less Than ---
+	t.Run("InequalityLT", func(t *testing.T) {
+		q := newQ().FilterField("score", "<", 30)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) < 2 {
+			t.Errorf("Expected at least 2 results (score 10, 20), got %d", len(results))
+		}
+		for _, r := range results {
+			if r.Score >= 30 {
+				t.Errorf("Unexpected result with score %d (should be < 30)", r.Score)
+			}
+		}
+	})
+
+	// --- Inequality: Less Than or Equal ---
+	t.Run("InequalityLTE", func(t *testing.T) {
+		q := newQ().FilterField("score", "<=", 30)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) < 3 {
+			t.Errorf("Expected at least 3 results (score 10, 20, 30), got %d", len(results))
+		}
+		for _, r := range results {
+			if r.Score > 30 {
+				t.Errorf("Unexpected result with score %d (should be <= 30)", r.Score)
+			}
+		}
+	})
+
+	// --- Multiple Filters ---
+	t.Run("MultipleFilters", func(t *testing.T) {
+		q := newQ().
+			FilterField("label", "=", "charlie")
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) != 1 {
+			t.Errorf("Expected 1 result, got %d", len(results))
+		}
+		for _, r := range results {
+			if r.Label != "charlie" || r.Score != 30 {
+				t.Errorf("Unexpected result: label=%q score=%d", r.Label, r.Score)
+			}
+		}
+	})
+
+	// --- Order + Filter combined ---
+	t.Run("OrderWithFilter", func(t *testing.T) {
+		q := newQ().
+			FilterField("score", ">=", 20).
+			Order("score").
+			Limit(3)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) != 3 {
+			t.Errorf("Expected 3, got %d", len(results))
+		}
+		if len(results) >= 3 {
+			if results[0].Score != 20 || results[1].Score != 30 || results[2].Score != 40 {
+				t.Errorf("Expected scores [20,30,40], got [%d,%d,%d]",
+					results[0].Score, results[1].Score, results[2].Score)
+			}
+		}
+	})
+}
+
+// --- Ancestor Query Test ---
+func TestAncestorQuery(t *testing.T) {
+	runAllStores(t, testAncestorQuery)
+}
+
+func testAncestorQuery(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	parent := &ParentModel{ID: fmt.Sprintf("qparent-%d", time.Now().UnixNano())}
+	child1 := &ChildModel{ID: "qchild-1", Parent: parent}
+	child2 := &ChildModel{ID: "qchild-2", Parent: parent}
+
+	if err := testDB.Put(ctx, child1); err != nil {
+		t.Fatalf("Put child1 failed: %v", err)
+	}
+	if err := testDB.Put(ctx, child2); err != nil {
+		t.Fatalf("Put child2 failed: %v", err)
+	}
+
+	// Also save a child under a different parent
+	other := &ParentModel{ID: "qother-parent"}
+	otherChild := &ChildModel{ID: "qchild-other", Parent: other}
+	if err := testDB.Put(ctx, otherChild); err != nil {
+		t.Fatalf("Put otherChild failed: %v", err)
+	}
+
+	parentKey := testDB.Key(parent)
+	q := dsorm.NewQuery("ChildModel").Ancestor(parentKey)
+	results, _, err := dsorm.Query[*ChildModel](ctx, testDB, q, "")
+	if err != nil {
+		t.Fatalf("Ancestor query failed: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Errorf("Expected 2 children under parent, got %d", len(results))
+	}
+	for _, r := range results {
+		if r.ID != "qchild-1" && r.ID != "qchild-2" {
+			t.Errorf("Unexpected child ID: %s", r.ID)
+		}
+	}
+}
+
+// --- Namespace Query Test ---
+func TestNamespaceQuery(t *testing.T) {
+	runAllStores(t, testNamespaceQuery)
+}
+
+type NSQueryModel struct {
+	dsorm.Base
+	ID    string `model:"id"`
+	NS    string `model:"ns"`
+	Value string `datastore:"value"`
+}
+
+func testNamespaceQuery(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	ns := fmt.Sprintf("ns-query-%d", time.Now().UnixNano())
+
+	// Use unique IDs per run to avoid collision
+	m1 := &NSQueryModel{ID: fmt.Sprintf("ns-1-%d", time.Now().UnixNano()), NS: ns, Value: "hello"}
+	m2 := &NSQueryModel{ID: fmt.Sprintf("ns-2-%d", time.Now().UnixNano()), NS: ns, Value: "world"}
+
+	if err := testDB.Put(ctx, m1); err != nil {
+		t.Fatalf("Put m1 failed: %v", err)
+	}
+	if err := testDB.Put(ctx, m2); err != nil {
+		t.Fatalf("Put m2 failed: %v", err)
+	}
+
+	// Query with filter in the custom namespace
+	q := dsorm.NewQuery("NSQueryModel").
+		Namespace(ns).
+		FilterField("value", "=", "hello")
+	results, _, err := dsorm.Query[*NSQueryModel](ctx, testDB, q, "")
+	if err != nil {
+		t.Fatalf("Namespace query failed: %v", err)
+	}
+	if len(results) < 1 {
+		t.Errorf("Expected at least 1 result in namespace %q, got %d", ns, len(results))
+	}
+	for _, r := range results {
+		if r == nil {
+			continue
+		}
+		if r.Value != "hello" {
+			t.Errorf("Unexpected value %q in namespace query", r.Value)
+		}
+	}
+
+	// Query all in namespace
+	q2 := dsorm.NewQuery("NSQueryModel").Namespace(ns)
+	allResults, _, err := dsorm.Query[*NSQueryModel](ctx, testDB, q2, "")
+	if err != nil {
+		t.Fatalf("Namespace all query failed: %v", err)
+	}
+	if len(allResults) != 2 {
+		t.Errorf("Expected 2 results in namespace %q, got %d", ns, len(allResults))
 	}
 }

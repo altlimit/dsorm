@@ -111,5 +111,9 @@ func (c *Client) Mutate(ctx context.Context, muts ...*Mutation) ([]*datastore.Ke
 		}
 	}
 
-	return c.Client.Mutate(ctx, mutations...)
+	m, ok := c.Store.(Mutator)
+	if !ok {
+		return nil, errors.New("store does not support Mutate")
+	}
+	return m.Mutate(ctx, mutations...)
 }

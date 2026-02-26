@@ -8,9 +8,6 @@ import (
 )
 
 var (
-	MarshalPropertyList   = marshalPropertyList
-	UnmarshalPropertyList = unmarshalPropertyList
-
 	NoneItem   = noneItem
 	EntityItem = entityItem
 
