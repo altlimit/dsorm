@@ -119,14 +119,14 @@ type KeyMappingModel struct {
 type EncryptionModel struct {
 	dsorm.Base
 	ID        int64  `model:"id"`
-	Secret    string `marshal:"secret,encrypt" datastore:"-"`
-	AltSecret string `marshal:"alt_secret,encrypt" datastore:"-"` // encrypted with default key
+	Secret    string `model:"secret,encrypt"`
+	AltSecret string `model:"alt_secret,encrypt"` // encrypted with default key
 }
 
 type JSONModel struct {
 	dsorm.Base
 	ID   int64             `model:"id"`
-	Data map[string]string `marshal:"data" datastore:"-"`
+	Data map[string]string `model:"data,marshal" datastore:"-"`
 }
 
 type DatastoreTagModel struct {
@@ -141,7 +141,7 @@ type DatastoreTagModel struct {
 type DirectEncryptModel struct {
 	dsorm.Base
 	ID   int64  `model:"id"`
-	Data string `marshal:"data,encrypt" datastore:"-"`
+	Data string `model:"data,encrypt"`
 }
 
 // ------------------------------------------------------------------

@@ -344,9 +344,23 @@ func saveModel(ctx context.Context, e any) ([]datastore.Property, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Handle Marshal tags using cache list
-	for _, fi := range info.marshalFieldsList {
 
+	// Filter out excluded properties (id, ns, parent, marshal, encrypt fields).
+	// Unsupported types (maps, custom structs) must have datastore:"-" so
+	// SaveStruct skips them. Simple types (string, int64) still produce
+	// zero-value properties that we filter here.
+	if len(info.excludeProps) > 0 {
+		filtered := props[:0]
+		for _, p := range props {
+			if !info.excludeProps[p.Name] {
+				filtered = append(filtered, p)
+			}
+		}
+		props = filtered
+	}
+
+	// Append marshaled/encrypted properties
+	for _, fi := range info.marshalFieldsList {
 		vv := v.Field(fi.Index)
 		if vv.IsZero() {
 			continue
@@ -1067,6 +1081,11 @@ func (db *Client) Transact(ctx context.Context, f func(tx *Transaction) error) (
 
 }
 
+// Close closes the underlying store connection.
+func (db *Client) Close() error {
+	return db.client.Close()
+}
+
 func (db *Client) Client() *ds.Client {
 	return db.client
 }
@@ -1181,12 +1200,28 @@ type typeInfo struct {
 
 	marshalFields     map[string]*fieldInfo // for Load (lookup by prop name)
 	marshalFieldsList []*fieldInfo          // for Save (ordered iteration)
+
+	// excludeProps lists property names that should be auto-excluded from
+	// datastore.SaveStruct output (model built-in fields + marshal/encrypt fields).
+	excludeProps map[string]bool
 }
 
 type fieldInfo struct {
 	Index   int
 	Name    string
 	Encrypt bool
+}
+
+// propNameForField returns the datastore property name for a struct field.
+// It checks the "datastore" tag first; if absent, uses the Go field name.
+func propNameForField(field *structtag.StructField) string {
+	if dsTag, ok := field.Value("datastore"); ok {
+		parts := strings.Split(dsTag, ",")
+		if parts[0] != "" && parts[0] != "-" {
+			return parts[0]
+		}
+	}
+	return field.FieldName
 }
 
 func getTypeInfo(t reflect.Type) *typeInfo {
@@ -1199,48 +1234,65 @@ func getTypeInfo(t reflect.Type) *typeInfo {
 
 	info := &typeInfo{
 		marshalFields: make(map[string]*fieldInfo),
+		excludeProps:  make(map[string]bool),
 	}
 
-	// Model tags
-	// We need an instance to call GetFieldsByTag which expects 'any' but uses reflect.TypeOf.
-	// Actually structtag.GetFieldsByTag takes 'entity any' and does reflect.TypeOf(entity).
-	// So passing reflect.New(t).Interface() works.
+	// Model tags — parse all options from model:"value,opt1,opt2"
 	dummy := reflect.New(t).Interface()
 
 	for _, field := range structtag.GetFieldsByTag(dummy, "model") {
-		switch field.Tag {
+		parts := strings.Split(field.Tag, ",")
+		primary := parts[0]
+
+		// Parse options
+		hasStore := false
+		hasMarshal := false
+		hasEncrypt := false
+		for _, opt := range parts[1:] {
+			switch opt {
+			case "store":
+				hasStore = true
+			case "marshal":
+				hasMarshal = true
+			case "encrypt":
+				hasEncrypt = true
+			}
+		}
+
+		switch primary {
 		case "id":
 			info.idField = field
+			if !hasStore {
+				info.excludeProps[propNameForField(field)] = true
+			}
 		case "parent":
 			info.parentField = field
+			if !hasStore {
+				info.excludeProps[propNameForField(field)] = true
+			}
 		case "ns":
 			info.nsField = field
+			if !hasStore {
+				info.excludeProps[propNameForField(field)] = true
+			}
 		case "created":
 			info.createdField = field
 		case "modified":
 			info.modifiedField = field
-		}
-	}
-
-	// Marshal tags
-	for _, field := range structtag.GetFieldsByTag(dummy, "marshal") {
-		parts := strings.Split(field.Tag, ",")
-		name := parts[0]
-		encrypt := false
-		for _, opt := range parts[1:] {
-			if opt == "encrypt" {
-				encrypt = true
-				break
+		default:
+			// model:"name,marshal" or model:"name,encrypt"
+			if hasMarshal || hasEncrypt {
+				fi := &fieldInfo{
+					Index:   field.Index,
+					Name:    primary,
+					Encrypt: hasEncrypt,
+				}
+				info.marshalFields[primary] = fi
+				info.marshalFieldsList = append(info.marshalFieldsList, fi)
+				// Auto-exclude from datastore.SaveStruct output
+				info.excludeProps[propNameForField(field)] = true
 			}
 		}
-
-		fi := &fieldInfo{
-			Index:   field.Index,
-			Name:    name,
-			Encrypt: encrypt,
-		}
-		info.marshalFields[name] = fi
-		info.marshalFieldsList = append(info.marshalFieldsList, fi)
 	}
 
 	typeCache.Store(t, info)

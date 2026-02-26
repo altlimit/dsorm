@@ -20,6 +20,10 @@ func NewCloudStore(client *datastore.Client) *cloudStore {
 	return &cloudStore{client: client}
 }
 
+func (b *cloudStore) Close() error {
+	return b.client.Close()
+}
+
 func (b *cloudStore) Get(ctx context.Context, key *datastore.Key, dst interface{}) error {
 	return b.client.Get(ctx, key, dst)
 }

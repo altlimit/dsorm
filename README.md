@@ -9,9 +9,9 @@
 - **Auto-Caching**: Transparently caches keys/entities in Memory, Redis, or Memcache.
 - **Model Hooks**: `BeforeSave`, `AfterSave`, `OnLoad`, `BeforeDelete`, `AfterDelete` lifecycle methods.
 - **Key Mapping**: Use struct tags (e.g., `model:"id"`) to map keys to struct fields.
-- **Field Encryption**: Built-in encryption for sensitive string fields via `marshal:"name,encrypt"` tag.
-- **JSON Marshaling**: Store complex structs/maps as compact JSON strings via `marshal` tag.
-- **Local Development**: SQLite-backed local store — no Cloud Datastore needed for development.
+- **Field Encryption**: Built-in encryption for sensitive string fields via `model:"name,encrypt"` tag.
+- **JSON Marshaling**: Store complex structs/maps as compact JSON strings via `model:"name,marshal"` tag.
+- **SQLite Backend**: High-performance SQLite-backed store — build local/embedded apps or develop offline using the same datastore API.
 - **QueryBuilder**: Fluent query API with filters, ordering, pagination, ancestor, and namespace support.
 - **API Parity**: Wraps standard `datastore` methods (`Put`, `Get`, `RunInTransaction`) for easy migration.
 
@@ -42,9 +42,12 @@ client, err = dsorm.New(ctx,
     dsorm.WithEncryptionKey([]byte("my-32-byte-secret-key-here......")),
 )
 
-// With Local SQLite Store (no Cloud Datastore needed)
-store := local.NewStore("/tmp/myapp.db")   // import "github.com/altlimit/dsorm/ds/local"
+// With Local SQLite Store (same API, no cloud dependency)
+// NewStore accepts a DIRECTORY path, not a database file path.
+// It creates separate .db files per namespace inside this directory.
+store := local.NewStore("/tmp/myapp")   // import "github.com/altlimit/dsorm/ds/local"
 client, err = dsorm.New(ctx, dsorm.WithStore(store))
+defer client.Close()  // Close when done (closes underlying store connections)
 ```
 
 ### 2. Defining Models
@@ -54,14 +57,14 @@ Embed `dsorm.Base` and use tags for keys, properties, and lifecycle management.
 ```go
 type User struct {
     dsorm.Base
-    ID        string            `model:"id"`                              // Key Name
-    Namespace string            `model:"ns"`                              // Key Namespace
-    Parent    *datastore.Key    `model:"parent"`                          // Key Parent
+    ID        string            `model:"id"`                              // Key Name (auto-excluded from datastore)
+    Namespace string            `model:"ns"`                              // Key Namespace (auto-excluded)
+    Parent    *datastore.Key    `model:"parent"`                          // Key Parent (auto-excluded)
     Username  string
     Email     string            `datastore:"email"`                       // Indexed property
     Bio       string            `datastore:"bio,noindex"`                 // Not indexed
-    Secret    string            `marshal:"secret,encrypt" datastore:"-"`  // Encrypted + JSON-stored
-    Profile   map[string]string `marshal:"profile" datastore:"-"`         // JSON-marshaled
+    Secret    string            `model:"secret,encrypt"`                  // Encrypted + JSON-stored (auto-excluded)
+    Profile   map[string]string `model:"profile,marshal" datastore:"-"`   // JSON-marshaled (datastore:"-" needed for maps)
     Tags      []string          `datastore:"tag"`                         // Multi-valued (each element indexed)
     CreatedAt time.Time         `model:"created"`                         // Auto-set on creation
     UpdatedAt time.Time         `model:"modified"`                        // Auto-set on every save
@@ -72,16 +75,19 @@ type User struct {
 
 | Tag | Purpose | Example |
 |-----|---------|---------|
-| `model:"id"` | Maps field to key ID/Name (`string` or `int64`) | `ID string \`model:"id"\`` |
-| `model:"parent"` | Maps to key parent (`*datastore.Key` or `*ParentModel`) | `Parent *datastore.Key \`model:"parent"\`` |
-| `model:"ns"` | Maps to key namespace | `NS string \`model:"ns"\`` |
+| `model:"id"` | Maps field to key ID/Name (`string` or `int64`). Auto-excluded from datastore. | `ID string \`model:"id"\`` |
+| `model:"parent"` | Maps to key parent. Auto-excluded. (`*datastore.Key` or `*ParentModel`) | `Parent *datastore.Key \`model:"parent"\`` |
+| `model:"ns"` | Maps to key namespace. Auto-excluded. | `NS string \`model:"ns"\`` |
+| `model:"id,store"` | Maps to key ID AND stores as datastore property | `ID string \`model:"id,store"\`` |
 | `model:"created"` | Auto-set `time.Time` on first Put | `CreatedAt time.Time \`model:"created"\`` |
 | `model:"modified"` | Auto-set `time.Time` on every Put | `UpdatedAt time.Time \`model:"modified"\`` |
+| `model:"name,marshal"` | JSON-marshal into a property. Auto-excluded from SaveStruct. | `Data map[string]string \`model:"data,marshal"\`` |
+| `model:"name,encrypt"` | JSON-marshal + AES encrypt. Auto-excluded. | `Secret string \`model:"secret,encrypt"\`` |
 | `datastore:"name"` | Property name for Datastore | `Email string \`datastore:"email"\`` |
 | `datastore:"-"` | Exclude from Datastore | `Temp string \`datastore:"-"\`` |
 | `datastore:",noindex"` | Store without indexing | `Bio string \`datastore:",noindex"\`` |
-| `marshal:"name"` | JSON-marshal into a property | `Data map[string]string \`marshal:"data" datastore:"-"\`` |
-| `marshal:"name,encrypt"` | JSON-marshal + AES encrypt | `Secret string \`marshal:"secret,encrypt" datastore:"-"\`` |
+
+> **Note:** Fields tagged with `model:"id"`, `model:"ns"`, and `model:"parent"` are automatically excluded from datastore storage — no need for `datastore:"-"`. Use `,store` (e.g., `model:"id,store"`) to opt-in. For `model:"...,marshal"` and `model:"...,encrypt"`, auto-exclusion works for simple types (`string`, `int64`), but fields with types unsupported by `datastore.SaveStruct` (e.g., `map`, custom structs) still require `datastore:"-"`.
 
 ### 3. CRUD Operations
 

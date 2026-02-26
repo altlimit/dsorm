@@ -24,6 +24,7 @@ type Store interface {
 	Run(ctx context.Context, q Query) Iterator
 	NewTransaction(ctx context.Context, opts ...datastore.TransactionOption) (TransactionStore, error)
 	RunInTransaction(ctx context.Context, f func(tx TransactionStore) error, opts ...datastore.TransactionOption) (*datastore.Commit, error)
+	Close() error
 }
 
 // Mutator is an optional interface for stores that support datastore mutations.

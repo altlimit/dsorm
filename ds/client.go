@@ -79,3 +79,8 @@ func (c *Client) onError(ctx context.Context, err error) {
 	}
 	log.Println(err)
 }
+
+// Close closes the underlying store.
+func (c *Client) Close() error {
+	return c.Store.Close()
+}

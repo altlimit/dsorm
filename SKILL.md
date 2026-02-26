@@ -11,8 +11,8 @@ description: Go ORM for Google Cloud Datastore with caching, lifecycle hooks, en
 - Auto key management via struct tags
 - Transparent caching (Memory, Redis, Memcache)
 - Lifecycle hooks (BeforeSave, AfterSave, OnLoad, BeforeDelete, AfterDelete)
-- Field encryption and JSON marshaling via `marshal` tag
-- Local SQLite backend for development (no Cloud Datastore needed)
+- Field encryption and JSON marshaling via `model` tag options
+- SQLite backend — build local/embedded apps or develop offline using the same datastore API
 - Generic helper functions `Query[T]` and `GetMulti[T]`
 
 ## Project Structure
@@ -40,16 +40,16 @@ Every model embeds `dsorm.Base` and uses struct tags:
 ```go
 type User struct {
     dsorm.Base
-    ID        string            `model:"id"`                        // Key name
-    Namespace string            `model:"ns"`                        // Key namespace
-    Parent    *datastore.Key    `model:"parent"`                    // Key parent
+    ID        string            `model:"id"`                        // Key name (auto-excluded from datastore)
+    Namespace string            `model:"ns"`                        // Key namespace (auto-excluded)
+    Parent    *datastore.Key    `model:"parent"`                    // Key parent (auto-excluded)
     CreatedAt time.Time         `model:"created"`                   // Auto-set on first save
     UpdatedAt time.Time         `model:"modified"`                  // Auto-set on every save
     Email     string            `datastore:"email"`                 // Indexed property
     Bio       string            `datastore:"bio,noindex"`           // Not indexed
     Ignored   string            `datastore:"-"`                     // Excluded from datastore
-    Secret    string            `marshal:"secret,encrypt" datastore:"-"` // Encrypted JSON property
-    Profile   map[string]string `marshal:"profile" datastore:"-"`   // JSON-marshaled property
+    Secret    string            `model:"secret,encrypt"`            // Encrypted JSON property (auto-excluded)
+    Profile   map[string]string `model:"profile,marshal" datastore:"-"`  // JSON-marshaled (datastore:"-" needed for maps)
     Tags      []string          `datastore:"tag"`                   // Multi-valued (indexed per element)
 }
 ```
@@ -58,16 +58,19 @@ type User struct {
 
 | Tag | Purpose | Example |
 |-----|---------|---------|
-| `model:"id"` | Maps field to datastore key ID/Name | `ID string \`model:"id"\`` |
-| `model:"parent"` | Maps to key's parent. Can be `*datastore.Key` or `*ParentModel` | `Parent *datastore.Key \`model:"parent"\`` |
-| `model:"ns"` | Maps to key's namespace | `NS string \`model:"ns"\`` |
+| `model:"id"` | Maps field to datastore key ID/Name. Auto-excluded from datastore properties. | `ID string \`model:"id"\`` |
+| `model:"parent"` | Maps to key's parent. Auto-excluded. Can be `*datastore.Key` or `*ParentModel` | `Parent *datastore.Key \`model:"parent"\`` |
+| `model:"ns"` | Maps to key's namespace. Auto-excluded. | `NS string \`model:"ns"\`` |
+| `model:"id,store"` | Maps to key ID AND stores in datastore properties | `ID string \`model:"id,store"\`` |
 | `model:"created"` | Auto-set `time.Time` on first Put | `CreatedAt time.Time \`model:"created"\`` |
 | `model:"modified"` | Auto-set `time.Time` on every Put | `UpdatedAt time.Time \`model:"modified"\`` |
+| `model:"name,marshal"` | JSON-marshal to a datastore property. Auto-excluded from SaveStruct. | `Data map[string]string \`model:"data,marshal"\`` |
+| `model:"name,encrypt"` | JSON-marshal + encrypt (implies marshal). Auto-excluded. | `Secret string \`model:"secret,encrypt"\`` |
 | `datastore:"name"` | Standard datastore property name | `Email string \`datastore:"email"\`` |
 | `datastore:"-"` | Exclude from datastore | `Temp string \`datastore:"-"\`` |
 | `datastore:",noindex"` | Store but don't index | `Bio string \`datastore:",noindex"\`` |
-| `marshal:"name"` | JSON-marshal to a datastore property | `Data map[string]string \`marshal:"data" datastore:"-"\`` |
-| `marshal:"name,encrypt"` | JSON-marshal + encrypt | `Secret string \`marshal:"secret,encrypt" datastore:"-"\`` |
+
+> **Note:** Fields tagged with `model:"id"`, `model:"ns"`, and `model:"parent"` are automatically excluded from datastore storage — no need for `datastore:"-"`. Use `,store` (e.g., `model:"id,store"`) to opt-in. For `model:"...,marshal"` and `model:"...,encrypt"`, auto-exclusion works for simple types (`string`, `int64`), but fields with types unsupported by `datastore.SaveStruct` (e.g., `map`, custom structs) still require `datastore:"-"`.
 
 ### Parent as Struct
 
@@ -98,9 +101,14 @@ client, err := dsorm.New(ctx,
     dsorm.WithEncryptionKey([]byte("32-byte-key-here................")),
 )
 
-// With local SQLite store (no Cloud Datastore needed)
-localStore := local.NewStore("/tmp/myapp.db")  // import "github.com/altlimit/dsorm/ds/local"
+// With local SQLite store (same API, no cloud dependency)
+// NewStore accepts a DIRECTORY path, not a database file path.
+// It creates separate .db files per namespace inside this directory.
+localStore := local.NewStore("/tmp/myapp")  // import "github.com/altlimit/dsorm/ds/local"
 client, err := dsorm.New(ctx, dsorm.WithStore(localStore))
+
+// Close the client when done (closes underlying store connections)
+defer client.Close()
 ```
 
 ## CRUD Operations
@@ -204,18 +212,21 @@ type OnLoad interface {
 }
 ```
 
-## Local Development
+## SQLite Backend
 
-The SQLite backend (`local.NewStore`) supports all features:
+The SQLite store (`local.NewStore`) is a high-performance alternative to Cloud Datastore, suitable for local/embedded applications or offline development. It implements the full `ds.Store` interface:
 - CRUD, queries with filters/ordering/pagination
 - Transactions
 - Namespace isolation (separate DB files per namespace)
 - Slice property indexing (each element indexed separately)
 
 ```go
-// With local SQLite store (no Cloud Datastore needed)
-store := local.NewStore("/tmp/dev.db")   // import "github.com/altlimit/dsorm/ds/local"
+// Same API, no cloud dependency
+// NewStore accepts a DIRECTORY path, not a database file path.
+// It creates separate .db files per namespace inside this directory.
+store := local.NewStore("/tmp/dev")   // import "github.com/altlimit/dsorm/ds/local"
 client, err := dsorm.New(ctx, dsorm.WithStore(store))
+defer client.Close()
 ```
 
 ## Environment Variables
