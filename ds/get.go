@@ -147,7 +147,7 @@ func (c *Client) getMulti(ctx context.Context,
 		}
 		return me
 	}
-	return c.Store.GetMulti(ctx, keys, vals.Interface())
+	return c.Client.GetMulti(ctx, keys, vals.Interface())
 }
 
 // loadCache attempts to fetch items from cache.
@@ -316,7 +316,7 @@ func (c *Client) loadDatastore(ctx context.Context, cacheItems []cacheItem,
 	}
 
 	var me datastore.MultiError
-	if err := c.Store.GetMulti(ctx, keys, vals); err == nil {
+	if err := c.Client.GetMulti(ctx, keys, vals); err == nil {
 		me = make(datastore.MultiError, len(keys))
 	} else if e, ok := err.(datastore.MultiError); ok {
 		me = e

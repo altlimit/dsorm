@@ -23,6 +23,7 @@ func TestTransactionSuite(t *testing.T) {
 			t.Run("TestTransactionCommit", TransactionCommitTest(item.ctx, item.cacher))
 			t.Run("TestTransactionCommitError", TransactionCommitErrorTest(item.ctx, item.cacher))
 			t.Run("TestTransactionRollback", TransactionRollbackTest(item.ctx, item.cacher))
+			t.Run("TestTransactionQueryHelper", TransactionQueryHelperTest(item.ctx, item.cacher))
 
 		})
 	}
@@ -374,6 +375,66 @@ func TransactionRollbackTest(ctx context.Context, cacher ds.Cache) func(t *testi
 
 		if dest.Value != entity.Value {
 			t.Errorf("expected dest.Value = %d, got %d", entity.Value, dest.Value)
+		}
+	}
+}
+
+func TransactionQueryHelperTest(ctx context.Context, cacher ds.Cache) func(t *testing.T) {
+	// TODO: With eventual migration to Firestore Datastore Mode - this test becomes obsolete
+	return func(t *testing.T) {
+		dsoClient, err := NewClient(ctx, cacher, t, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		dsclient, err := datastore.NewClient(ctx, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		type testEntity struct {
+			Value int64
+		}
+		entity := &testEntity{96}
+		ancestor := datastore.NameKey("TransactionQueryHelperTest", "ancestor", nil)
+
+		key := datastore.IncompleteKey("TransactionQueryHelperTest", ancestor)
+		if key, err = dsoClient.Put(ctx, key, entity); err != nil {
+			t.Fatalf("could not store entity due to error: %v", err)
+		}
+
+		defer func() { _ = dsoClient.Delete(ctx, key) }() // Cleanup
+
+		_, err = dsoClient.RunInTransaction(ctx, func(tx *ds.Transaction) error {
+			var dest []testEntity
+			q := datastore.NewQuery("TransactionQueryHelperTest").Ancestor(ancestor)
+			q = tx.Query(q)
+
+			if _, err := dsclient.GetAll(ctx, q, &dest); err != nil {
+				return err
+			}
+			if len(dest) != 1 || dest[0].Value != entity.Value {
+				return fmt.Errorf("expected Value=%d, got %d", entity.Value, dest[0].Value)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Errorf("expected err=nil, got %v", err)
+		}
+
+		// only ancestor queries are allowed in transactions!
+		_, err = dsoClient.RunInTransaction(ctx, func(tx *ds.Transaction) error {
+			var dest []testEntity
+			q := datastore.NewQuery("TransactionQueryHelperTest")
+			q = tx.Query(q)
+
+			if _, err := dsclient.GetAll(ctx, q, &dest); err != nil {
+				return err
+			}
+			return nil
+		})
+		if err == nil {
+			t.Error("expected err, got nil")
 		}
 	}
 }

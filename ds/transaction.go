@@ -2,18 +2,17 @@ package ds
 
 import (
 	"context"
-	"errors"
 	"sync"
 
 	"cloud.google.com/go/datastore"
 	"go.opencensus.io/trace"
 )
 
-// Transaction wraps ds.TransactionStore with caching.
+// Transaction wraps datastore.Transaction with caching.
 type Transaction struct {
 	c   *Client
 	ctx context.Context
-	tx  TransactionStore
+	tx  *datastore.Transaction
 	sync.Mutex
 	lockCacheItems []*Item
 }
@@ -33,11 +32,11 @@ func (t *Transaction) lockKeys(keys []*datastore.Key) {
 }
 
 // NewTransaction starts a transaction with cache-aware context.
-func (c *Client) NewTransaction(ctx context.Context, opts ...datastore.TransactionOption) (*Transaction, error) {
+func (c *Client) NewTransaction(ctx context.Context, opts ...datastore.TransactionOption) (t *Transaction, err error) {
 	var span *trace.Span
 	ctx, span = trace.StartSpan(ctx, "github.com/altlimit/dsorm.NewTransaction")
 	defer span.End()
-	tx, err := c.Store.NewTransaction(ctx, opts...)
+	tx, err := c.Client.NewTransaction(ctx, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +115,11 @@ func (t *Transaction) Rollback() (err error) {
 	return t.tx.Rollback()
 }
 
+// Query helper for underlying TX.
+func (t *Transaction) Query(q *datastore.Query) *datastore.Query {
+	return q.Transaction(t.tx)
+}
+
 // Mutate locks keys from mutations.
 func (t *Transaction) Mutate(muts ...*Mutation) ([]*datastore.PendingKey, error) {
 	var span *trace.Span
@@ -128,11 +132,7 @@ func (t *Transaction) Mutate(muts ...*Mutation) ([]*datastore.PendingKey, error)
 		keys[i] = mut.k
 	}
 	t.lockKeys(keys)
-	m, ok := t.tx.(TransactionMutator)
-	if !ok {
-		return nil, errors.New("transaction store does not support Mutate")
-	}
-	return m.Mutate(mutations...)
+	return t.tx.Mutate(mutations...)
 }
 
 // RunInTransaction wrapper ensuring cache interaction.
@@ -141,7 +141,7 @@ func (c *Client) RunInTransaction(ctx context.Context, f func(tx *Transaction) e
 	ctx, span = trace.StartSpan(ctx, "github.com/altlimit/dsorm.RunInTransaction")
 	defer span.End()
 
-	return c.Store.RunInTransaction(ctx, func(tx TransactionStore) error {
+	return c.Client.RunInTransaction(ctx, func(tx *datastore.Transaction) error {
 		txn := &Transaction{c: c, ctx: ctx, tx: tx}
 		if err := f(txn); err != nil {
 			return err

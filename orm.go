@@ -412,7 +412,6 @@ type options struct {
 	projectID       string
 	cache           ds.Cache
 	datastoreClient *datastore.Client
-	store           ds.Store
 	encryptionKey   []byte
 }
 
@@ -433,12 +432,6 @@ func WithCache(c ds.Cache) Option {
 func WithDatastoreClient(c *datastore.Client) Option {
 	return func(o *options) {
 		o.datastoreClient = c
-	}
-}
-
-func WithStore(s ds.Store) Option {
-	return func(o *options) {
-		o.store = s
 	}
 }
 
@@ -500,15 +493,7 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 		ctx = context.WithValue(ctx, encryptionKeyKey, o.encryptionKey)
 	}
 
-	var dsOpts []ds.ClientOption
-	if o.store != nil {
-		dsOpts = append(dsOpts, ds.WithStore(o.store))
-	} else {
-		dsOpts = append(dsOpts, ds.WithDatastoreClient(dsClient))
-	}
-	dsOpts = append(dsOpts, ds.WithCachePrefix(o.projectID+":"))
-
-	dsoClient, err := ds.NewClient(ctx, o.cache, dsOpts...)
+	dsoClient, err := ds.NewClient(ctx, o.cache, ds.WithDatastoreClient(dsClient), ds.WithCachePrefix(o.projectID+":"))
 	if err != nil {
 		return nil, err
 	}
@@ -780,7 +765,7 @@ func (db *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
 	return nil
 }
 
-func (db *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals interface{}) ([]*datastore.Key, string, error) {
+func (db *Client) Query(ctx context.Context, q *datastore.Query, cursor string, vals interface{}) ([]*datastore.Key, string, error) {
 	ctx = db.context(ctx)
 	var keys []*datastore.Key
 	var v reflect.Value
@@ -795,7 +780,11 @@ func (db *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, val
 	}
 
 	if cursor != "" {
-		q = q.Start(cursor)
+		c, err := datastore.DecodeCursor(cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		q = q.Start(c)
 	}
 	q = q.KeysOnly()
 	it := db.client.Run(ctx, q)
@@ -834,7 +823,7 @@ func (db *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, val
 			}
 		}
 	}
-	return keys, next, nil
+	return keys, next.String(), nil
 }
 
 // Transaction wraps ds.Transaction to provide dsorm functionality (ID mapping, lifecycle hooks).
@@ -1069,14 +1058,8 @@ func (db *Client) Client() *ds.Client {
 	return db.client
 }
 
-// RawClient exposes the underlying datastore.Client.
 func (db *Client) RawClient() *datastore.Client {
 	return db.rawClient
-}
-
-// InternalClient exposes the underlying ds.Client.
-func (db *Client) InternalClient() *ds.Client {
-	return db.client
 }
 
 func loadKeys(v reflect.Value, keys []*datastore.Key) error {
@@ -1097,7 +1080,7 @@ func loadKeys(v reflect.Value, keys []*datastore.Key) error {
 }
 
 // Query executes a query and returns a slice of models.
-func Query[T Model](ctx context.Context, db *Client, q *QueryBuilder, cursor string) ([]T, string, error) {
+func Query[T Model](ctx context.Context, db *Client, q *datastore.Query, cursor string) ([]T, string, error) {
 	var dst []T
 	_, next, err := db.Query(ctx, q, cursor, &dst)
 	if err != nil {
@@ -1149,6 +1132,7 @@ func GetMulti[T Model](ctx context.Context, db *Client, ids any) ([]T, error) {
 	for i := 0; i < dstVal.Len(); i++ {
 		if dstVal.Index(i).Kind() == reflect.Ptr && dstVal.Index(i).IsNil() {
 			newElem := reflect.New(dstVal.Index(i).Type().Elem())
+			dstVal.Index(i).Set(newElem)
 			dstVal.Index(i).Set(newElem)
 			if err := initModel(ctx, newElem.Interface()); err != nil {
 				return nil, err

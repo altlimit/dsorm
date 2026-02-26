@@ -144,5 +144,5 @@ func (c *Client) putMulti(ctx context.Context,
 			}
 		}
 	}
-	return c.Store.PutMulti(ctx, keys, vals)
+	return c.Client.PutMulti(ctx, keys, vals)
 }
