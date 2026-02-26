@@ -26,8 +26,9 @@ dsorm/
 │   ├── store.go      # Store/TransactionStore/Iterator interfaces
 │   ├── client.go     # ds.Client (caching layer)
 │   ├── cloud_store.go # Cloud Datastore adapter
-│   ├── local_store.go # SQLite adapter for local dev
-│   └── ds.go         # Shared utilities
+│   ├── ds.go         # Shared utilities
+│   └── local/
+│       └── local.go  # SQLite adapter (separate package, optional dependency)
 ├── cache/            # Cache backends (memory, redis, memcache)
 └── internal/         # encryption, structtag, util
 ```
@@ -98,7 +99,7 @@ client, err := dsorm.New(ctx,
 )
 
 // With local SQLite store (no Cloud Datastore needed)
-localStore, _ := ds.NewLocalStore("/tmp/myapp.db")
+localStore := local.NewStore("/tmp/myapp.db")  // import "github.com/altlimit/dsorm/ds/local"
 client, err := dsorm.New(ctx, dsorm.WithStore(localStore))
 ```
 
@@ -205,15 +206,16 @@ type OnLoad interface {
 
 ## Local Development
 
-The SQLite backend (`ds.NewLocalStore`) supports all features:
+The SQLite backend (`local.NewStore`) supports all features:
 - CRUD, queries with filters/ordering/pagination
 - Transactions
 - Namespace isolation (separate DB files per namespace)
 - Slice property indexing (each element indexed separately)
 
 ```go
-store, _ := ds.NewLocalStore("/tmp/dev.db")
-client, _ := dsorm.New(ctx, dsorm.WithStore(store))
+// With local SQLite store (no Cloud Datastore needed)
+store := local.NewStore("/tmp/dev.db")   // import "github.com/altlimit/dsorm/ds/local"
+client, err := dsorm.New(ctx, dsorm.WithStore(store))
 ```
 
 ## Environment Variables

@@ -43,7 +43,7 @@ client, err = dsorm.New(ctx,
 )
 
 // With Local SQLite Store (no Cloud Datastore needed)
-store, _ := ds.NewLocalStore("/tmp/dev.db")
+store := local.NewStore("/tmp/myapp.db")   // import "github.com/altlimit/dsorm/ds/local"
 client, err = dsorm.New(ctx, dsorm.WithStore(store))
 ```
 

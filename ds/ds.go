@@ -29,8 +29,8 @@ var (
 
 // testing hooks
 var (
-	marshal   = marshalPropertyList
-	unmarshal = unmarshalPropertyList
+	marshal   = MarshalPropertyList
+	unmarshal = UnmarshalPropertyList
 )
 
 const (
@@ -121,7 +121,7 @@ func createCacheKey(prefix string, key *datastore.Key) string {
 	return cacheKey
 }
 
-func marshalPropertyList(pl datastore.PropertyList) ([]byte, error) {
+func MarshalPropertyList(pl datastore.PropertyList) ([]byte, error) {
 	buf := bytes.Buffer{}
 	if err := gob.NewEncoder(&buf).Encode(&pl); err != nil {
 		return nil, err
@@ -129,7 +129,7 @@ func marshalPropertyList(pl datastore.PropertyList) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func unmarshalPropertyList(data []byte, pl *datastore.PropertyList) error {
+func UnmarshalPropertyList(data []byte, pl *datastore.PropertyList) error {
 	return gob.NewDecoder(bytes.NewBuffer(data)).Decode(pl)
 }
 

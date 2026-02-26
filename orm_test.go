@@ -11,7 +11,7 @@ import (
 
 	"cloud.google.com/go/datastore"
 	"github.com/altlimit/dsorm"
-	"github.com/altlimit/dsorm/ds"
+	"github.com/altlimit/dsorm/ds/local"
 )
 
 // Global test DB instance for convenience, or strictly local?
@@ -50,7 +50,7 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 
-	localStore := ds.NewLocalStore(tempDir)
+	localStore := local.NewStore(tempDir)
 	localClient, err := dsorm.New(ctx, dsorm.WithStore(localStore))
 	if err != nil {
 		panic(err)

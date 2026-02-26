@@ -1,4 +1,4 @@
-package ds
+package local
 
 import (
 	"context"
@@ -17,14 +17,15 @@ import (
 	"time"
 
 	"cloud.google.com/go/datastore"
+	"github.com/altlimit/dsorm/ds"
 	"google.golang.org/api/iterator"
 	_ "modernc.org/sqlite"
 )
 
 // Compile-time interface assertions
-var _ Store = (*localStore)(nil)
+var _ ds.Store = (*Store)(nil)
 
-type localStore struct {
+type Store struct {
 	basePath string
 	dbs      map[string]*sql.DB
 	mu       sync.RWMutex
@@ -33,8 +34,8 @@ type localStore struct {
 	kindCache map[string]map[string]bool
 }
 
-func NewLocalStore(basePath string) Store {
-	return &localStore{
+func NewStore(basePath string) *Store {
+	return &Store{
 		basePath:  basePath,
 		dbs:       make(map[string]*sql.DB),
 		kindCache: make(map[string]map[string]bool),
@@ -42,7 +43,7 @@ func NewLocalStore(basePath string) Store {
 }
 
 // Close closes all underlying database connections.
-func (c *localStore) Close() error {
+func (c *Store) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var firstErr error
@@ -56,7 +57,7 @@ func (c *localStore) Close() error {
 	return firstErr
 }
 
-func (c *localStore) getDB(namespace string) (*sql.DB, error) {
+func (c *Store) getDB(namespace string) (*sql.DB, error) {
 	c.mu.RLock()
 	db, ok := c.dbs[namespace]
 	c.mu.RUnlock()
@@ -93,7 +94,7 @@ func (c *localStore) getDB(namespace string) (*sql.DB, error) {
 	return db, nil
 }
 
-func (c *localStore) ensureKind(namespace, kind string, db *sql.DB) error {
+func (c *Store) ensureKind(namespace, kind string, db *sql.DB) error {
 	c.mu.RLock()
 	exists := c.kindCache[namespace][kind]
 	c.mu.RUnlock()
@@ -193,7 +194,7 @@ func setBatchError(me datastore.MultiError, indices []int, err error) {
 	}
 }
 
-func (c *localStore) Get(ctx context.Context, key *datastore.Key, dst interface{}) error {
+func (c *Store) Get(ctx context.Context, key *datastore.Key, dst interface{}) error {
 	col, id := keyToColAndID(key)
 	db, err := c.getDB(key.Namespace)
 	if err != nil {
@@ -216,7 +217,7 @@ func (c *localStore) Get(ctx context.Context, key *datastore.Key, dst interface{
 	return unmarshalDocLocal(propsBlob, reflect.ValueOf(dst))
 }
 
-func (c *localStore) GetMulti(ctx context.Context, keys []*datastore.Key, dst interface{}) error {
+func (c *Store) GetMulti(ctx context.Context, keys []*datastore.Key, dst interface{}) error {
 	if len(keys) == 0 {
 		return nil
 	}
@@ -316,7 +317,7 @@ func (c *localStore) GetMulti(ctx context.Context, keys []*datastore.Key, dst in
 	return nil
 }
 
-func (c *localStore) Put(ctx context.Context, key *datastore.Key, src interface{}) (*datastore.Key, error) {
+func (c *Store) Put(ctx context.Context, key *datastore.Key, src interface{}) (*datastore.Key, error) {
 	keys, err := c.PutMulti(ctx, []*datastore.Key{key}, []interface{}{src})
 	if err != nil {
 		if me, ok := err.(datastore.MultiError); ok {
@@ -327,7 +328,7 @@ func (c *localStore) Put(ctx context.Context, key *datastore.Key, src interface{
 	return keys[0], nil
 }
 
-func (c *localStore) PutMulti(ctx context.Context, keys []*datastore.Key, src interface{}) ([]*datastore.Key, error) {
+func (c *Store) PutMulti(ctx context.Context, keys []*datastore.Key, src interface{}) ([]*datastore.Key, error) {
 	v := reflect.ValueOf(src)
 	if v.Kind() == reflect.Ptr {
 		v = v.Elem()
@@ -419,7 +420,7 @@ func (c *localStore) PutMulti(ctx context.Context, keys []*datastore.Key, src in
 			}
 
 			// Generate exact gob props blob for Get recovery
-			propsBlob, err := marshalPropertyList(pl)
+			propsBlob, err := ds.MarshalPropertyList(pl)
 			if err != nil {
 				me[i] = err
 				hasErr = true
@@ -498,7 +499,7 @@ func (c *localStore) PutMulti(ctx context.Context, keys []*datastore.Key, src in
 	return keys, nil
 }
 
-func (c *localStore) Delete(ctx context.Context, key *datastore.Key) error {
+func (c *Store) Delete(ctx context.Context, key *datastore.Key) error {
 	col, id := keyToColAndID(key)
 	db, err := c.getDB(key.Namespace)
 	if err != nil {
@@ -514,7 +515,7 @@ func (c *localStore) Delete(ctx context.Context, key *datastore.Key) error {
 	return err
 }
 
-func (c *localStore) DeleteMulti(ctx context.Context, keys []*datastore.Key) error {
+func (c *Store) DeleteMulti(ctx context.Context, keys []*datastore.Key) error {
 	if len(keys) == 0 {
 		return nil
 	}
@@ -577,7 +578,7 @@ func (c *localStore) DeleteMulti(ctx context.Context, keys []*datastore.Key) err
 
 func unmarshalDocLocal(propsBlob []byte, dst reflect.Value) error {
 	var pl datastore.PropertyList
-	if err := unmarshalPropertyList(propsBlob, &pl); err != nil {
+	if err := ds.UnmarshalPropertyList(propsBlob, &pl); err != nil {
 		return err
 	}
 
@@ -629,7 +630,7 @@ func (it *localIterator) Cursor() (string, error) {
 	return fmt.Sprintf("%d:%d", nextPage, it.totalPages), nil
 }
 
-func (c *localStore) Run(ctx context.Context, q Query) Iterator {
+func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 	col := q.Kind()
 
 	// Determine namespace: prefer explicit query namespace, then ancestor namespace
@@ -857,12 +858,12 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 	}
 }
 
-func (c *localStore) RunInTransaction(ctx context.Context, f func(tx TransactionStore) error, opts ...datastore.TransactionOption) (*datastore.Commit, error) {
+func (c *Store) RunInTransaction(ctx context.Context, f func(tx ds.TransactionStore) error, opts ...datastore.TransactionOption) (*datastore.Commit, error) {
 	txStore := &localTxStore{
-		localStore: c,
-		puts:       make(map[string]interface{}),
-		putKeys:    make(map[string]*datastore.Key),
-		dels:       make(map[string]*datastore.Key),
+		Store:   c,
+		puts:    make(map[string]interface{}),
+		putKeys: make(map[string]*datastore.Key),
+		dels:    make(map[string]*datastore.Key),
 	}
 	if err := f(txStore); err != nil {
 		return nil, err
@@ -870,17 +871,17 @@ func (c *localStore) RunInTransaction(ctx context.Context, f func(tx Transaction
 	return txStore.Commit()
 }
 
-func (c *localStore) NewTransaction(ctx context.Context, opts ...datastore.TransactionOption) (TransactionStore, error) {
+func (c *Store) NewTransaction(ctx context.Context, opts ...datastore.TransactionOption) (ds.TransactionStore, error) {
 	return &localTxStore{
-		localStore: c,
-		puts:       make(map[string]interface{}),
-		putKeys:    make(map[string]*datastore.Key),
-		dels:       make(map[string]*datastore.Key),
+		Store:   c,
+		puts:    make(map[string]interface{}),
+		putKeys: make(map[string]*datastore.Key),
+		dels:    make(map[string]*datastore.Key),
 	}, nil
 }
 
 type localTxStore struct {
-	*localStore
+	*Store
 	mu      sync.Mutex
 	puts    map[string]interface{}
 	putKeys map[string]*datastore.Key
@@ -897,7 +898,7 @@ func (c *localTxStore) Get(key *datastore.Key, dst interface{}) error {
 		return datastore.ErrNoSuchEntity
 	}
 
-	return c.localStore.Get(context.Background(), key, dst)
+	return c.Store.Get(context.Background(), key, dst)
 }
 
 func (c *localTxStore) GetMulti(keys []*datastore.Key, dst interface{}) error {
@@ -921,7 +922,7 @@ func (c *localTxStore) GetMulti(keys []*datastore.Key, dst interface{}) error {
 			continue
 		}
 
-		if err := c.localStore.Get(context.Background(), k, v.Index(i).Interface()); err != nil {
+		if err := c.Store.Get(context.Background(), k, v.Index(i).Interface()); err != nil {
 			me[i] = err
 			hasErr = true
 		}
@@ -1019,7 +1020,7 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 	}()
 
 	for ns := range nsSet {
-		db, err := c.localStore.getDB(ns)
+		db, err := c.Store.getDB(ns)
 		if err != nil {
 			return nil, err
 		}
@@ -1038,7 +1039,7 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 			putKeys = append(putKeys, c.putKeys[k])
 			putSrcs = append(putSrcs, v)
 		}
-		if _, err := c.localStore.PutMulti(context.Background(), putKeys, putSrcs); err != nil {
+		if _, err := c.Store.PutMulti(context.Background(), putKeys, putSrcs); err != nil {
 			return nil, err
 		}
 	}
@@ -1049,7 +1050,7 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 		for _, k := range c.dels {
 			delKeys = append(delKeys, k)
 		}
-		if err := c.localStore.DeleteMulti(context.Background(), delKeys); err != nil {
+		if err := c.Store.DeleteMulti(context.Background(), delKeys); err != nil {
 			return nil, err
 		}
 	}
