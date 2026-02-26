@@ -885,3 +885,58 @@ func testTransactionPendingKey(t *testing.T, testDB *dsorm.Client) {
 		t.Error("ID is 0, expected it to be populated from PendingKey")
 	}
 }
+
+func TestSlicePropertyQuery(t *testing.T) {
+	runAllStores(t, testSlicePropertyQuery)
+}
+
+func testSlicePropertyQuery(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	type User struct {
+		dsorm.Base
+		ID      int64     `datastore:"-" model:"id"`
+		Name    string    `datastore:"name"`
+		Created time.Time `datastore:"created" model:"created"`
+		Tags    []string  `datastore:"tag"`
+	}
+
+	user := &User{
+		Name: "Alice",
+		Tags: []string{"tag1", "tag2"},
+	}
+
+	if err := testDB.Put(ctx, user); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// Query for tag1 — should find the user
+	q := dsorm.NewQuery("User").FilterField("tag", "=", "tag1")
+	users, _, err := dsorm.Query[*User](ctx, testDB, q, "")
+	if err != nil {
+		t.Fatalf("Query tag1 failed: %v", err)
+	}
+	if len(users) < 1 {
+		t.Errorf("Expected at least 1 result for tag1, got %d", len(users))
+	}
+
+	// Query for tag2 — should also find the user
+	q2 := dsorm.NewQuery("User").FilterField("tag", "=", "tag2")
+	users2, _, err := dsorm.Query[*User](ctx, testDB, q2, "")
+	if err != nil {
+		t.Fatalf("Query tag2 failed: %v", err)
+	}
+	if len(users2) < 1 {
+		t.Errorf("Expected at least 1 result for tag2, got %d", len(users2))
+	}
+
+	// Verify the returned user has both tags
+	if len(users) > 0 {
+		if users[0].Name != "Alice" {
+			t.Errorf("Expected name 'Alice', got '%s'", users[0].Name)
+		}
+		if len(users[0].Tags) != 2 {
+			t.Errorf("Expected 2 tags, got %d: %v", len(users[0].Tags), users[0].Tags)
+		}
+	}
+}

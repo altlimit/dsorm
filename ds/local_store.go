@@ -72,7 +72,7 @@ func (c *localStore) getDB(namespace string) (*sql.DB, error) {
 
 	dbName := "default.db"
 	if namespace != "" {
-		dbName = fmt.Sprintf("default-%s.db", namespace)
+		dbName = fmt.Sprintf("%s.db", namespace)
 	}
 	dbPath := filepath.Join(c.basePath, dbName)
 
@@ -432,19 +432,30 @@ func (c *localStore) PutMulti(ctx context.Context, keys []*datastore.Key, src in
 					continue
 				}
 
-				dataVal := convertFilterValue(p.Value)
 				if _, ok := p.Value.(*datastore.Entity); ok {
 					continue
 				}
 
-				dataJSON, err := json.Marshal(dataVal)
-				if err != nil {
-					me[i] = fmt.Errorf("marshal index value %q: %w", p.Name, err)
-					hasErr = true
-					continue
+				// Handle multi-valued properties (slices) by creating
+				// separate index rows for each element, matching Cloud
+				// Datastore's behavior.
+				var vals []interface{}
+				if sl, ok := p.Value.([]interface{}); ok {
+					vals = sl
+				} else {
+					vals = []interface{}{p.Value}
 				}
-				idxPlaceholders = append(idxPlaceholders, "(?, ?, ?)")
-				idxArgs = append(idxArgs, id, p.Name, string(dataJSON))
+				for _, elem := range vals {
+					dataVal := convertFilterValue(elem)
+					dataJSON, err := json.Marshal(dataVal)
+					if err != nil {
+						me[i] = fmt.Errorf("marshal index value %q: %w", p.Name, err)
+						hasErr = true
+						continue
+					}
+					idxPlaceholders = append(idxPlaceholders, "(?, ?, ?)")
+					idxArgs = append(idxArgs, id, p.Name, string(dataJSON))
+				}
 			}
 
 			placeholders = append(placeholders, "(?, ?, ?)")
