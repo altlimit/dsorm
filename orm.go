@@ -1150,7 +1150,6 @@ func GetMulti[T Model](ctx context.Context, db *Client, ids any) ([]T, error) {
 		if dstVal.Index(i).Kind() == reflect.Ptr && dstVal.Index(i).IsNil() {
 			newElem := reflect.New(dstVal.Index(i).Type().Elem())
 			dstVal.Index(i).Set(newElem)
-			dstVal.Index(i).Set(newElem)
 			if err := initModel(ctx, newElem.Interface()); err != nil {
 				return nil, err
 			}

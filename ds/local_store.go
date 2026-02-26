@@ -594,7 +594,6 @@ func unmarshalDocLocal(propsBlob []byte, dst reflect.Value) error {
 }
 
 type localIterator struct {
-	rows       *sql.Rows
 	idx        int
 	keys       []*datastore.Key
 	blobs      [][]byte
@@ -922,7 +921,7 @@ func (c *localTxStore) GetMulti(keys []*datastore.Key, dst interface{}) error {
 			continue
 		}
 
-		if err := c.localStore.Get(context.Background(), k, v.Index(i).Addr().Interface()); err != nil {
+		if err := c.localStore.Get(context.Background(), k, v.Index(i).Interface()); err != nil {
 			me[i] = err
 			hasErr = true
 		}

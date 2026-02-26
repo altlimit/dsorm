@@ -673,6 +673,99 @@ func testTransactions(t *testing.T, testDB *dsorm.Client) {
 	}
 }
 
+func TestTransactionCRUD(t *testing.T) {
+	runAllStores(t, testTransactionCRUD)
+}
+
+func testTransactionCRUD(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+	baseID := time.Now().UnixNano()
+
+	// --- Transaction PutMulti + GetMulti ---
+	t.Run("PutMulti_GetMulti", func(t *testing.T) {
+		m1 := &LifecycleModel{ID: baseID + 1, Value: "tx-put-1"}
+		m2 := &LifecycleModel{ID: baseID + 2, Value: "tx-put-2"}
+
+		_, err := testDB.Transact(ctx, func(tx *dsorm.Transaction) error {
+			return tx.PutMulti([]*LifecycleModel{m1, m2})
+		})
+		if err != nil {
+			t.Fatalf("Transact PutMulti failed: %v", err)
+		}
+
+		// Verify via GetMulti in a new transaction
+		_, err = testDB.Transact(ctx, func(tx *dsorm.Transaction) error {
+			fetched := []*LifecycleModel{
+				{ID: baseID + 1},
+				{ID: baseID + 2},
+			}
+			if err := tx.GetMulti(fetched); err != nil {
+				return err
+			}
+			if fetched[0].Value != "tx-put-1" {
+				t.Errorf("Expected tx-put-1, got %s", fetched[0].Value)
+			}
+			if fetched[1].Value != "tx-put-2" {
+				t.Errorf("Expected tx-put-2, got %s", fetched[1].Value)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("Transact GetMulti failed: %v", err)
+		}
+	})
+
+	// --- Transaction Delete ---
+	t.Run("Delete", func(t *testing.T) {
+		m := &LifecycleModel{ID: baseID + 10, Value: "to-delete"}
+		if err := testDB.Put(ctx, m); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+
+		_, err := testDB.Transact(ctx, func(tx *dsorm.Transaction) error {
+			return tx.Delete(&LifecycleModel{ID: baseID + 10})
+		})
+		if err != nil {
+			t.Fatalf("Transact Delete failed: %v", err)
+		}
+
+		// Verify deleted
+		check := &LifecycleModel{ID: baseID + 10}
+		if err := testDB.Get(ctx, check); err != datastore.ErrNoSuchEntity {
+			t.Errorf("Expected ErrNoSuchEntity, got %v", err)
+		}
+	})
+
+	// --- Transaction DeleteMulti ---
+	t.Run("DeleteMulti", func(t *testing.T) {
+		m1 := &LifecycleModel{ID: baseID + 20, Value: "del-1"}
+		m2 := &LifecycleModel{ID: baseID + 21, Value: "del-2"}
+		if err := testDB.PutMulti(ctx, []*LifecycleModel{m1, m2}); err != nil {
+			t.Fatalf("PutMulti failed: %v", err)
+		}
+
+		_, err := testDB.Transact(ctx, func(tx *dsorm.Transaction) error {
+			return tx.DeleteMulti([]*LifecycleModel{
+				{ID: baseID + 20},
+				{ID: baseID + 21},
+			})
+		})
+		if err != nil {
+			t.Fatalf("Transact DeleteMulti failed: %v", err)
+		}
+
+		// Verify all deleted
+		check1 := &LifecycleModel{ID: baseID + 20}
+		check2 := &LifecycleModel{ID: baseID + 21}
+		if err := testDB.Get(ctx, check1); err != datastore.ErrNoSuchEntity {
+			t.Errorf("Expected ErrNoSuchEntity for ID %d, got %v", baseID+20, err)
+		}
+		if err := testDB.Get(ctx, check2); err != datastore.ErrNoSuchEntity {
+			t.Errorf("Expected ErrNoSuchEntity for ID %d, got %v", baseID+21, err)
+		}
+	})
+}
+
 type ParentModel struct {
 	dsorm.Base
 	ID string `model:"id"`
