@@ -940,3 +940,357 @@ func testSlicePropertyQuery(t *testing.T, testDB *dsorm.Client) {
 		}
 	}
 }
+
+// ------------------------------------------------------------------
+// Comprehensive Query Tests
+// ------------------------------------------------------------------
+
+type QueryModel struct {
+	dsorm.Base
+	ID    int64  `model:"id"`
+	Group string `datastore:"group"` // scoping field to isolate test runs
+	Label string `datastore:"label"`
+	Score int    `datastore:"score"`
+}
+
+func TestQueryFeatures(t *testing.T) {
+	runAllStores(t, testQueryFeatures)
+}
+
+func testQueryFeatures(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	// Unique group per test run to isolate from leftover data
+	group := fmt.Sprintf("grp-%d", time.Now().UnixNano())
+
+	// Seed 5 models with distinct scores and labels
+	baseID := time.Now().UnixNano()
+	seeds := []struct {
+		label string
+		score int
+	}{
+		{"alpha", 10},
+		{"bravo", 20},
+		{"charlie", 30},
+		{"delta", 40},
+		{"echo", 50},
+	}
+	for i, s := range seeds {
+		m := &QueryModel{ID: baseID + int64(i), Group: group, Label: s.label, Score: s.score}
+		if err := testDB.Put(ctx, m); err != nil {
+			t.Fatalf("Seed Put %d failed: %v", i, err)
+		}
+	}
+
+	// Helper: new query scoped to our group
+	newQ := func() *dsorm.QueryBuilder {
+		return dsorm.NewQuery("QueryModel").FilterField("group", "=", group)
+	}
+
+	// --- Limit ---
+	t.Run("Limit", func(t *testing.T) {
+		q := newQ().Limit(2)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) != 2 {
+			t.Errorf("Expected 2 results, got %d", len(results))
+		}
+	})
+
+	// --- Offset ---
+	t.Run("Offset", func(t *testing.T) {
+		q := newQ().Order("score").Limit(2).Offset(2)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) != 2 {
+			t.Errorf("Expected 2 results, got %d", len(results))
+		}
+		if len(results) >= 1 && results[0].Score != 30 {
+			t.Errorf("Expected first result to have score 30, got %d", results[0].Score)
+		}
+	})
+
+	// --- Order Ascending ---
+	t.Run("OrderAsc", func(t *testing.T) {
+		q := newQ().Order("score")
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) != 5 {
+			t.Fatalf("Expected 5 results, got %d", len(results))
+		}
+		for i := 1; i < len(results); i++ {
+			if results[i].Score < results[i-1].Score {
+				t.Errorf("Results not sorted ascending: score[%d]=%d < score[%d]=%d",
+					i, results[i].Score, i-1, results[i-1].Score)
+			}
+		}
+	})
+
+	// --- Order Descending ---
+	t.Run("OrderDesc", func(t *testing.T) {
+		q := newQ().Order("-score")
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) != 5 {
+			t.Fatalf("Expected 5 results, got %d", len(results))
+		}
+		for i := 1; i < len(results); i++ {
+			if results[i].Score > results[i-1].Score {
+				t.Errorf("Results not sorted descending: score[%d]=%d > score[%d]=%d",
+					i, results[i].Score, i-1, results[i-1].Score)
+			}
+		}
+	})
+
+	// --- Cursor / Pagination ---
+	t.Run("Cursor", func(t *testing.T) {
+		q := newQ().Order("score").Limit(3)
+		page1, cursor, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Page 1 failed: %v", err)
+		}
+		if len(page1) != 3 {
+			t.Fatalf("Page 1: expected 3 results, got %d", len(page1))
+		}
+		if cursor == "" {
+			t.Fatal("Expected non-empty cursor after page 1")
+		}
+
+		// Page 2
+		page2, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, cursor)
+		if err != nil {
+			t.Fatalf("Page 2 failed: %v", err)
+		}
+		if len(page2) != 2 {
+			t.Errorf("Page 2: expected 2 results, got %d", len(page2))
+		}
+
+		// Ensure no overlap between pages
+		page1IDs := make(map[int64]bool)
+		for _, r := range page1 {
+			page1IDs[r.ID] = true
+		}
+		for _, r := range page2 {
+			if page1IDs[r.ID] {
+				t.Errorf("Page 2 result ID %d was already in page 1", r.ID)
+			}
+		}
+	})
+
+	// --- Inequality: Greater Than ---
+	t.Run("InequalityGT", func(t *testing.T) {
+		q := newQ().FilterField("score", ">", 30)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) < 2 {
+			t.Errorf("Expected at least 2 results (score 40, 50), got %d", len(results))
+		}
+		for _, r := range results {
+			if r.Score <= 30 {
+				t.Errorf("Unexpected result with score %d (should be > 30)", r.Score)
+			}
+		}
+	})
+
+	// --- Inequality: Greater Than or Equal ---
+	t.Run("InequalityGTE", func(t *testing.T) {
+		q := newQ().FilterField("score", ">=", 30)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) < 3 {
+			t.Errorf("Expected at least 3 results (score 30, 40, 50), got %d", len(results))
+		}
+		for _, r := range results {
+			if r.Score < 30 {
+				t.Errorf("Unexpected result with score %d (should be >= 30)", r.Score)
+			}
+		}
+	})
+
+	// --- Inequality: Less Than ---
+	t.Run("InequalityLT", func(t *testing.T) {
+		q := newQ().FilterField("score", "<", 30)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) < 2 {
+			t.Errorf("Expected at least 2 results (score 10, 20), got %d", len(results))
+		}
+		for _, r := range results {
+			if r.Score >= 30 {
+				t.Errorf("Unexpected result with score %d (should be < 30)", r.Score)
+			}
+		}
+	})
+
+	// --- Inequality: Less Than or Equal ---
+	t.Run("InequalityLTE", func(t *testing.T) {
+		q := newQ().FilterField("score", "<=", 30)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) < 3 {
+			t.Errorf("Expected at least 3 results (score 10, 20, 30), got %d", len(results))
+		}
+		for _, r := range results {
+			if r.Score > 30 {
+				t.Errorf("Unexpected result with score %d (should be <= 30)", r.Score)
+			}
+		}
+	})
+
+	// --- Multiple Filters ---
+	t.Run("MultipleFilters", func(t *testing.T) {
+		q := newQ().
+			FilterField("label", "=", "charlie")
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) != 1 {
+			t.Errorf("Expected 1 result, got %d", len(results))
+		}
+		for _, r := range results {
+			if r.Label != "charlie" || r.Score != 30 {
+				t.Errorf("Unexpected result: label=%q score=%d", r.Label, r.Score)
+			}
+		}
+	})
+
+	// --- Order + Filter combined ---
+	t.Run("OrderWithFilter", func(t *testing.T) {
+		q := newQ().
+			FilterField("score", ">=", 20).
+			Order("score").
+			Limit(3)
+		results, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) != 3 {
+			t.Errorf("Expected 3, got %d", len(results))
+		}
+		if len(results) >= 3 {
+			if results[0].Score != 20 || results[1].Score != 30 || results[2].Score != 40 {
+				t.Errorf("Expected scores [20,30,40], got [%d,%d,%d]",
+					results[0].Score, results[1].Score, results[2].Score)
+			}
+		}
+	})
+}
+
+// --- Ancestor Query Test ---
+func TestAncestorQuery(t *testing.T) {
+	runAllStores(t, testAncestorQuery)
+}
+
+func testAncestorQuery(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	parent := &ParentModel{ID: fmt.Sprintf("qparent-%d", time.Now().UnixNano())}
+	child1 := &ChildModel{ID: "qchild-1", Parent: parent}
+	child2 := &ChildModel{ID: "qchild-2", Parent: parent}
+
+	if err := testDB.Put(ctx, child1); err != nil {
+		t.Fatalf("Put child1 failed: %v", err)
+	}
+	if err := testDB.Put(ctx, child2); err != nil {
+		t.Fatalf("Put child2 failed: %v", err)
+	}
+
+	// Also save a child under a different parent
+	other := &ParentModel{ID: "qother-parent"}
+	otherChild := &ChildModel{ID: "qchild-other", Parent: other}
+	if err := testDB.Put(ctx, otherChild); err != nil {
+		t.Fatalf("Put otherChild failed: %v", err)
+	}
+
+	parentKey := testDB.Key(parent)
+	q := dsorm.NewQuery("ChildModel").Ancestor(parentKey)
+	results, _, err := dsorm.Query[*ChildModel](ctx, testDB, q, "")
+	if err != nil {
+		t.Fatalf("Ancestor query failed: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Errorf("Expected 2 children under parent, got %d", len(results))
+	}
+	for _, r := range results {
+		if r.ID != "qchild-1" && r.ID != "qchild-2" {
+			t.Errorf("Unexpected child ID: %s", r.ID)
+		}
+	}
+}
+
+// --- Namespace Query Test ---
+func TestNamespaceQuery(t *testing.T) {
+	runAllStores(t, testNamespaceQuery)
+}
+
+type NSQueryModel struct {
+	dsorm.Base
+	ID    string `model:"id"`
+	NS    string `model:"ns"`
+	Value string `datastore:"value"`
+}
+
+func testNamespaceQuery(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	ns := fmt.Sprintf("ns-query-%d", time.Now().UnixNano())
+
+	// Use unique IDs per run to avoid collision
+	m1 := &NSQueryModel{ID: fmt.Sprintf("ns-1-%d", time.Now().UnixNano()), NS: ns, Value: "hello"}
+	m2 := &NSQueryModel{ID: fmt.Sprintf("ns-2-%d", time.Now().UnixNano()), NS: ns, Value: "world"}
+
+	if err := testDB.Put(ctx, m1); err != nil {
+		t.Fatalf("Put m1 failed: %v", err)
+	}
+	if err := testDB.Put(ctx, m2); err != nil {
+		t.Fatalf("Put m2 failed: %v", err)
+	}
+
+	// Query with filter in the custom namespace
+	q := dsorm.NewQuery("NSQueryModel").
+		Namespace(ns).
+		FilterField("value", "=", "hello")
+	results, _, err := dsorm.Query[*NSQueryModel](ctx, testDB, q, "")
+	if err != nil {
+		t.Fatalf("Namespace query failed: %v", err)
+	}
+	if len(results) < 1 {
+		t.Errorf("Expected at least 1 result in namespace %q, got %d", ns, len(results))
+	}
+	for _, r := range results {
+		if r == nil {
+			continue
+		}
+		if r.Value != "hello" {
+			t.Errorf("Unexpected value %q in namespace query", r.Value)
+		}
+	}
+
+	// Query all in namespace
+	q2 := dsorm.NewQuery("NSQueryModel").Namespace(ns)
+	allResults, _, err := dsorm.Query[*NSQueryModel](ctx, testDB, q2, "")
+	if err != nil {
+		t.Fatalf("Namespace all query failed: %v", err)
+	}
+	if len(allResults) != 2 {
+		t.Errorf("Expected 2 results in namespace %q, got %d", ns, len(allResults))
+	}
+}

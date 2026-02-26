@@ -54,6 +54,9 @@ func (b *cloudStore) Run(ctx context.Context, q Query) Iterator {
 	if q.IsKeysOnly() {
 		dq = dq.KeysOnly()
 	}
+	if ns := q.GetNamespace(); ns != "" {
+		dq = dq.Namespace(ns)
+	}
 	if ancestor := q.GetAncestor(); ancestor != nil {
 		dq = dq.Ancestor(ancestor)
 	}

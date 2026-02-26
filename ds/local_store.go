@@ -741,12 +741,13 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 	if len(joins) > 0 {
 		queryStr += " " + strings.Join(joins, " ")
 	}
-	if len(conditions) > 0 {
-		queryStr += " WHERE " + strings.Join(conditions, " AND ")
-	}
 
+	// Build ORDER BY LEFT JOINs before WHERE so they appear in the
+	// correct SQL position. Collect their args separately so we can
+	// combine all args in SQL placeholder order.
+	var orderJoinArgs []interface{}
+	var orderStrs []string
 	if len(q.Orders()) > 0 {
-		var orderStrs []string
 		for _, o := range q.Orders() {
 			dir := "ASC"
 			if o.Direction == "desc" || strings.HasPrefix(strings.ToLower(o.Direction), "-") {
@@ -757,21 +758,40 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 			idxAlias++
 
 			queryStr += fmt.Sprintf(" LEFT JOIN %q %s ON main.key = %s.key AND %s.name = ?", col+"_idx", alias, alias, alias)
-			args = append(args, o.Field)
+			orderJoinArgs = append(orderJoinArgs, o.Field)
 
 			orderStrs = append(orderStrs, fmt.Sprintf("%s.value %s", alias, dir))
 		}
+	}
+
+	if len(conditions) > 0 {
+		queryStr += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	if len(orderStrs) > 0 {
 		queryStr += " ORDER BY " + strings.Join(orderStrs, ", ")
 	}
 
+	// Combine args: ORDER BY LEFT JOIN args first (they appear before WHERE in SQL),
+	// then condition/filter args (they appear in WHERE).
+	finalArgs := append(orderJoinArgs, args...)
+
+	// Parse cursor early so we can adjust LIMIT to account for
+	// cursor-skipped rows (the cursor skip happens post-query).
+	cursorIdx := 0
+	if cStr := q.GetCursor(); cStr != "" {
+		if cInt, err := strconv.Atoi(cStr); err == nil {
+			cursorIdx = cInt
+		}
+	}
+
 	if q.GetLimit() > 0 {
-		queryStr += " LIMIT " + strconv.Itoa(q.GetLimit())
+		queryStr += " LIMIT " + strconv.Itoa(q.GetLimit()+cursorIdx)
 	}
 	if q.GetOffset() > 0 {
 		queryStr += " OFFSET " + strconv.Itoa(q.GetOffset())
 	}
 
-	rows, err := db.Query(queryStr, args...)
+	rows, err := db.Query(queryStr, finalArgs...)
 	if err != nil {
 		return &localIterator{doneErr: err}
 	}
@@ -802,17 +822,10 @@ func (c *localStore) Run(ctx context.Context, q Query) Iterator {
 		return &localIterator{doneErr: err}
 	}
 
-	idx := 0
-	if cStr := q.GetCursor(); cStr != "" {
-		if cInt, err := strconv.Atoi(cStr); err == nil {
-			idx = cInt
-		}
-	}
-
 	return &localIterator{
 		keys:  keys,
 		blobs: blobs,
-		idx:   idx,
+		idx:   cursorIdx,
 	}
 }
 
