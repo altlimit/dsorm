@@ -1387,3 +1387,266 @@ func testNamespaceQuery(t *testing.T, testDB *dsorm.Client) {
 		t.Errorf("Expected 2 results in namespace %q, got %d", ns, len(allResults))
 	}
 }
+
+// ------------------------------------------------------------------
+// Data Type Tests
+// ------------------------------------------------------------------
+
+type DataTypeModel struct {
+	dsorm.Base
+	ID       int64              `model:"id"`
+	StrVal   string             `datastore:"str_val"`
+	IntVal   int                `datastore:"int_val"`
+	FloatVal float64            `datastore:"float_val"`
+	BoolVal  bool               `datastore:"bool_val"`
+	TimeVal  time.Time          `datastore:"time_val"`
+	BytesVal []byte             `datastore:"bytes_val,noindex"`
+	GeoVal   datastore.GeoPoint `datastore:"geo_val,noindex"`
+	KeyVal   *datastore.Key     `datastore:"key_val"`
+}
+
+func TestDataTypes(t *testing.T) {
+	runAllStores(t, testDataTypes)
+}
+
+func testDataTypes(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+	baseID := time.Now().UnixNano()
+	refTime := time.Date(2025, 6, 15, 10, 30, 0, 0, time.UTC)
+	refKey := datastore.NameKey("RefKind", "ref-1", nil)
+
+	// --- CRUD: Put then Get, verify all types round-trip ---
+	t.Run("CRUD_RoundTrip", func(t *testing.T) {
+		m := &DataTypeModel{
+			ID:       baseID + 1,
+			StrVal:   "hello world",
+			IntVal:   42,
+			FloatVal: 3.14,
+			BoolVal:  true,
+			TimeVal:  refTime,
+			BytesVal: []byte{0xDE, 0xAD, 0xBE, 0xEF},
+			GeoVal:   datastore.GeoPoint{Lat: 37.7749, Lng: -122.4194},
+			KeyVal:   refKey,
+		}
+
+		if err := testDB.Put(ctx, m); err != nil {
+			t.Fatalf("Put failed: %v", err)
+		}
+
+		loaded := &DataTypeModel{ID: baseID + 1}
+		if err := testDB.Get(ctx, loaded); err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+
+		if loaded.StrVal != "hello world" {
+			t.Errorf("StrVal: expected 'hello world', got %q", loaded.StrVal)
+		}
+		if loaded.IntVal != 42 {
+			t.Errorf("IntVal: expected 42, got %d", loaded.IntVal)
+		}
+		if loaded.FloatVal != 3.14 {
+			t.Errorf("FloatVal: expected 3.14, got %f", loaded.FloatVal)
+		}
+		if loaded.BoolVal != true {
+			t.Errorf("BoolVal: expected true, got %v", loaded.BoolVal)
+		}
+		if !loaded.TimeVal.Equal(refTime) {
+			t.Errorf("TimeVal: expected %v, got %v", refTime, loaded.TimeVal)
+		}
+		if len(loaded.BytesVal) != 4 || loaded.BytesVal[0] != 0xDE || loaded.BytesVal[3] != 0xEF {
+			t.Errorf("BytesVal: expected [DE AD BE EF], got %X", loaded.BytesVal)
+		}
+		if loaded.GeoVal.Lat != 37.7749 || loaded.GeoVal.Lng != -122.4194 {
+			t.Errorf("GeoVal: expected {37.7749, -122.4194}, got {%f, %f}", loaded.GeoVal.Lat, loaded.GeoVal.Lng)
+		}
+		if loaded.KeyVal == nil || loaded.KeyVal.Name != "ref-1" || loaded.KeyVal.Kind != "RefKind" {
+			t.Errorf("KeyVal: expected NameKey('RefKind','ref-1'), got %v", loaded.KeyVal)
+		}
+	})
+
+	// --- Zero/Empty values ---
+	t.Run("ZeroValues", func(t *testing.T) {
+		m := &DataTypeModel{
+			ID: baseID + 2,
+			// All fields at zero values
+		}
+		if err := testDB.Put(ctx, m); err != nil {
+			t.Fatalf("Put zero values failed: %v", err)
+		}
+
+		loaded := &DataTypeModel{ID: baseID + 2}
+		if err := testDB.Get(ctx, loaded); err != nil {
+			t.Fatalf("Get zero values failed: %v", err)
+		}
+
+		if loaded.StrVal != "" {
+			t.Errorf("StrVal: expected empty, got %q", loaded.StrVal)
+		}
+		if loaded.IntVal != 0 {
+			t.Errorf("IntVal: expected 0, got %d", loaded.IntVal)
+		}
+		if loaded.FloatVal != 0 {
+			t.Errorf("FloatVal: expected 0, got %f", loaded.FloatVal)
+		}
+		if loaded.BoolVal != false {
+			t.Errorf("BoolVal: expected false, got %v", loaded.BoolVal)
+		}
+	})
+
+	// --- Query: String filter ---
+	t.Run("FilterString", func(t *testing.T) {
+		group := fmt.Sprintf("str-%d", baseID)
+		m1 := &DataTypeModel{ID: baseID + 10, StrVal: group}
+		m2 := &DataTypeModel{ID: baseID + 11, StrVal: group}
+		m3 := &DataTypeModel{ID: baseID + 12, StrVal: "other"}
+
+		if err := testDB.PutMulti(ctx, []*DataTypeModel{m1, m2, m3}); err != nil {
+			t.Fatalf("PutMulti failed: %v", err)
+		}
+
+		q := dsorm.NewQuery("DataTypeModel").FilterField("str_val", "=", group)
+		results, _, err := dsorm.Query[*DataTypeModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) < 2 {
+			t.Errorf("Expected at least 2 results for str filter, got %d", len(results))
+		}
+	})
+
+	// --- Query: Int filter with inequality ---
+	t.Run("FilterIntInequality", func(t *testing.T) {
+		// Seed models with distinct int values and a unique group marker
+		group := fmt.Sprintf("int-grp-%d", baseID)
+		seeds := []struct {
+			intVal int
+			id     int64
+		}{
+			{10, baseID + 20},
+			{25, baseID + 21},
+			{50, baseID + 22},
+			{75, baseID + 23},
+			{100, baseID + 24},
+		}
+		for _, s := range seeds {
+			m := &DataTypeModel{ID: s.id, StrVal: group, IntVal: s.intVal}
+			if err := testDB.Put(ctx, m); err != nil {
+				t.Fatalf("Put seed failed: %v", err)
+			}
+		}
+
+		// Scope queries to our group
+		newQ := func() *dsorm.QueryBuilder {
+			return dsorm.NewQuery("DataTypeModel").FilterField("str_val", "=", group)
+		}
+
+		// GT
+		q := newQ().FilterField("int_val", ">", 50)
+		results, _, err := dsorm.Query[*DataTypeModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("int > 50 query failed: %v", err)
+		}
+		if len(results) < 2 {
+			t.Errorf("int > 50: expected at least 2 results (75, 100), got %d", len(results))
+		}
+		for _, r := range results {
+			if r.IntVal <= 50 {
+				t.Errorf("int > 50: unexpected result with IntVal=%d", r.IntVal)
+			}
+		}
+
+		// LT
+		q2 := newQ().FilterField("int_val", "<", 50)
+		results2, _, err := dsorm.Query[*DataTypeModel](ctx, testDB, q2, "")
+		if err != nil {
+			t.Fatalf("int < 50 query failed: %v", err)
+		}
+		if len(results2) < 2 {
+			t.Errorf("int < 50: expected at least 2 results (10, 25), got %d", len(results2))
+		}
+		for _, r := range results2 {
+			if r.IntVal >= 50 {
+				t.Errorf("int < 50: unexpected result with IntVal=%d", r.IntVal)
+			}
+		}
+
+		// GTE with order
+		q3 := newQ().FilterField("int_val", ">=", 25).Order("int_val")
+		results3, _, err := dsorm.Query[*DataTypeModel](ctx, testDB, q3, "")
+		if err != nil {
+			t.Fatalf("int >= 25 ordered query failed: %v", err)
+		}
+		if len(results3) < 4 {
+			t.Errorf("int >= 25: expected at least 4 results, got %d", len(results3))
+		}
+		// Verify ascending order
+		for i := 1; i < len(results3); i++ {
+			if results3[i].IntVal < results3[i-1].IntVal {
+				t.Errorf("int >= 25 not sorted: [%d]=%d < [%d]=%d",
+					i, results3[i].IntVal, i-1, results3[i-1].IntVal)
+			}
+		}
+	})
+
+	// --- Query: Bool filter ---
+	t.Run("FilterBool", func(t *testing.T) {
+		group := fmt.Sprintf("bool-%d", baseID)
+		m1 := &DataTypeModel{ID: baseID + 30, StrVal: group, BoolVal: true}
+		m2 := &DataTypeModel{ID: baseID + 31, StrVal: group, BoolVal: false}
+		m3 := &DataTypeModel{ID: baseID + 32, StrVal: group, BoolVal: true}
+
+		if err := testDB.PutMulti(ctx, []*DataTypeModel{m1, m2, m3}); err != nil {
+			t.Fatalf("PutMulti failed: %v", err)
+		}
+
+		q := dsorm.NewQuery("DataTypeModel").
+			FilterField("str_val", "=", group).
+			FilterField("bool_val", "=", true)
+		results, _, err := dsorm.Query[*DataTypeModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Bool query failed: %v", err)
+		}
+		if len(results) < 2 {
+			t.Errorf("Expected at least 2 true results, got %d", len(results))
+		}
+		for _, r := range results {
+			if !r.BoolVal {
+				t.Errorf("Expected BoolVal=true, got false")
+			}
+		}
+	})
+
+	// --- Query: Time filter ---
+	t.Run("FilterTime", func(t *testing.T) {
+		group := fmt.Sprintf("time-%d", baseID)
+		t1 := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+		t2 := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
+		t3 := time.Date(2025, 12, 1, 0, 0, 0, 0, time.UTC)
+
+		m1 := &DataTypeModel{ID: baseID + 40, StrVal: group, TimeVal: t1}
+		m2 := &DataTypeModel{ID: baseID + 41, StrVal: group, TimeVal: t2}
+		m3 := &DataTypeModel{ID: baseID + 42, StrVal: group, TimeVal: t3}
+
+		if err := testDB.PutMulti(ctx, []*DataTypeModel{m1, m2, m3}); err != nil {
+			t.Fatalf("PutMulti failed: %v", err)
+		}
+
+		// Filter time > mid-2025
+		cutoff := time.Date(2025, 3, 1, 0, 0, 0, 0, time.UTC)
+		q := dsorm.NewQuery("DataTypeModel").
+			FilterField("str_val", "=", group).
+			FilterField("time_val", ">", cutoff)
+		results, _, err := dsorm.Query[*DataTypeModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Time query failed: %v", err)
+		}
+		if len(results) < 2 {
+			t.Errorf("Expected at least 2 time results after cutoff, got %d", len(results))
+		}
+		for _, r := range results {
+			if !r.TimeVal.After(cutoff) {
+				t.Errorf("Expected TimeVal after %v, got %v", cutoff, r.TimeVal)
+			}
+		}
+	})
+}

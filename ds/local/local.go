@@ -1,10 +1,12 @@
 package local
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -108,22 +110,31 @@ func (c *Store) ensureKind(namespace, kind string, db *sql.DB) error {
 		return nil
 	}
 
-	idxTable := kind + "_idx"
-	idxName := fmt.Sprintf("idx_%s_name_value", kind)
+	propsTable := kind + "_props"
 
 	query := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %q (
 			key TEXT PRIMARY KEY,
-			parent_key TEXT,
-			props BLOB
+			parent_key TEXT
 		);
 		CREATE TABLE IF NOT EXISTS %q (
-			key TEXT,
-			name TEXT,
-			value JSON
+			key TEXT NOT NULL,
+			name TEXT NOT NULL,
+			ord INTEGER NOT NULL DEFAULT 0,
+			value TEXT,
+			no_index INTEGER NOT NULL DEFAULT 0,
+			data_type TEXT NOT NULL DEFAULT 'string'
 		);
-		CREATE INDEX IF NOT EXISTS %q ON %q(name, value);
-	`, kind, idxTable, idxName, idxTable)
+		CREATE UNIQUE INDEX IF NOT EXISTS %q ON %q(key, name, ord);
+		CREATE INDEX IF NOT EXISTS %q ON %q(name, value) WHERE no_index = 0 AND data_type IN ('string','key','time','bytes');
+		CREATE INDEX IF NOT EXISTS %q ON %q(name, CAST(value AS REAL)) WHERE no_index = 0 AND data_type IN ('int','float');
+		CREATE INDEX IF NOT EXISTS %q ON %q(name, value) WHERE no_index = 0 AND data_type = 'bool';
+	`, kind, propsTable,
+		"uq_"+kind+"_props", propsTable,
+		"idx_"+kind+"_str", propsTable,
+		"idx_"+kind+"_num", propsTable,
+		"idx_"+kind+"_bool", propsTable,
+	)
 
 	if _, err := db.Exec(query); err != nil {
 		return err
@@ -175,6 +186,218 @@ func convertFilterValue(v interface{}) interface{} {
 	}
 }
 
+// propertyToRow converts a datastore.Property value to its (value string, data_type) for storage.
+func propertyToRow(p datastore.Property) (string, string) {
+	if p.Value == nil {
+		return "", "null"
+	}
+	switch v := p.Value.(type) {
+	case string:
+		return v, "string"
+	case int64:
+		return strconv.FormatInt(v, 10), "int"
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), "float"
+	case bool:
+		if v {
+			return "true", "bool"
+		}
+		return "false", "bool"
+	case time.Time:
+		return v.Format(time.RFC3339Nano), "time"
+	case *datastore.Key:
+		return v.Encode(), "key"
+	case []byte:
+		return base64.StdEncoding.EncodeToString(v), "bytes"
+	case datastore.GeoPoint:
+		data, _ := json.Marshal(v)
+		return string(data), "geo"
+	case *datastore.Entity:
+		var buf bytes.Buffer
+		gob.NewEncoder(&buf).Encode(v)
+		return base64.StdEncoding.EncodeToString(buf.Bytes()), "entity"
+	default:
+		data, _ := json.Marshal(v)
+		return string(data), "string"
+	}
+}
+
+// rowToProperty reconstructs a datastore.Property from kind_props row data.
+func rowToProperty(name, value, dataType string, noIndex bool) datastore.Property {
+	p := datastore.Property{Name: name, NoIndex: noIndex}
+	switch dataType {
+	case "null":
+		p.Value = nil
+	case "string":
+		p.Value = value
+	case "int":
+		v, _ := strconv.ParseInt(value, 10, 64)
+		p.Value = v
+	case "float":
+		v, _ := strconv.ParseFloat(value, 64)
+		p.Value = v
+	case "bool":
+		p.Value = value == "true"
+	case "time":
+		v, _ := time.Parse(time.RFC3339Nano, value)
+		p.Value = v
+	case "key":
+		v, _ := datastore.DecodeKey(value)
+		p.Value = v
+	case "bytes":
+		v, _ := base64.StdEncoding.DecodeString(value)
+		p.Value = v
+	case "geo":
+		var gp datastore.GeoPoint
+		json.Unmarshal([]byte(value), &gp)
+		p.Value = gp
+	case "entity":
+		data, _ := base64.StdEncoding.DecodeString(value)
+		var e datastore.Entity
+		gob.NewDecoder(bytes.NewReader(data)).Decode(&e)
+		p.Value = &e
+	default:
+		p.Value = value
+	}
+	return p
+}
+
+// filterDataType determines the storage data_type from a Go filter value.
+func filterDataType(v interface{}) string {
+	switch v.(type) {
+	case int, int8, int16, int32, int64:
+		return "int"
+	case float32, float64:
+		return "float"
+	case bool:
+		return "bool"
+	case time.Time:
+		return "time"
+	case *datastore.Key:
+		return "key"
+	case []byte:
+		return "bytes"
+	case string:
+		return "string"
+	default:
+		return "string"
+	}
+}
+
+// filterValueStr converts a filter value to the string representation used in kind_props.
+func filterValueStr(v interface{}) string {
+	cv := convertFilterValue(v)
+	switch val := cv.(type) {
+	case string:
+		return val
+	case int64:
+		return strconv.FormatInt(val, 10)
+	case int:
+		return strconv.Itoa(val)
+	case float64:
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	case bool:
+		if val {
+			return "true"
+		}
+		return "false"
+	default:
+		data, _ := json.Marshal(val)
+		return string(data)
+	}
+}
+
+// loadPropsForKeys loads PropertyLists from kind_props for the given keys.
+// Returns a map from key string to PropertyList.
+func loadPropsForKeys(db *sql.DB, col string, keyStrs []string) (map[string]datastore.PropertyList, error) {
+	if len(keyStrs) == 0 {
+		return nil, nil
+	}
+	propsTable := col + "_props"
+	var placeholders []string
+	var args []interface{}
+	for _, k := range keyStrs {
+		placeholders = append(placeholders, "?")
+		args = append(args, k)
+	}
+	query := fmt.Sprintf(`SELECT key, name, ord, value, no_index, data_type FROM %q WHERE key IN (%s) ORDER BY key, name, ord`,
+		propsTable, strings.Join(placeholders, ","))
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]datastore.PropertyList)
+	// Track which (key,name) combos have multiple ords for slice reconstruction
+	type propGroup struct {
+		name    string
+		values  []interface{}
+		noIndex bool
+	}
+	keyProps := make(map[string][]*propGroup)     // key -> ordered list of propGroups
+	keyPropIdx := make(map[string]map[string]int) // key -> name -> index in keyProps[key]
+
+	for rows.Next() {
+		var keyStr, name, dataType string
+		var ord int
+		var value sql.NullString
+		var noIndex int
+		if err := rows.Scan(&keyStr, &name, &ord, &value, &noIndex, &dataType); err != nil {
+			return nil, err
+		}
+
+		valStr := ""
+		if value.Valid {
+			valStr = value.String
+		}
+		p := rowToProperty(name, valStr, dataType, noIndex == 1)
+
+		if _, ok := keyPropIdx[keyStr]; !ok {
+			keyPropIdx[keyStr] = make(map[string]int)
+		}
+
+		if idx, exists := keyPropIdx[keyStr][name]; exists {
+			// Multi-valued property: accumulate values
+			keyProps[keyStr][idx].values = append(keyProps[keyStr][idx].values, p.Value)
+		} else {
+			// First occurrence of this property name
+			keyPropIdx[keyStr][name] = len(keyProps[keyStr])
+			keyProps[keyStr] = append(keyProps[keyStr], &propGroup{
+				name:    name,
+				values:  []interface{}{p.Value},
+				noIndex: noIndex == 1,
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Build PropertyLists from grouped data
+	for keyStr, groups := range keyProps {
+		var pl datastore.PropertyList
+		for _, g := range groups {
+			if len(g.values) == 1 {
+				pl = append(pl, datastore.Property{
+					Name:    g.name,
+					Value:   g.values[0],
+					NoIndex: g.noIndex,
+				})
+			} else {
+				// Multi-valued: store as []interface{} slice
+				pl = append(pl, datastore.Property{
+					Name:    g.name,
+					Value:   g.values,
+					NoIndex: g.noIndex,
+				})
+			}
+		}
+		result[keyStr] = pl
+	}
+	return result, nil
+}
+
 const epoch = 1735689600000
 
 func generateID() int64 {
@@ -204,9 +427,9 @@ func (c *Store) Get(ctx context.Context, key *datastore.Key, dst interface{}) er
 		return err
 	}
 
-	query := fmt.Sprintf(`SELECT props FROM %q WHERE key = ?`, col)
-	var propsBlob []byte
-	err = db.QueryRow(query, id).Scan(&propsBlob)
+	// Check existence in kind table
+	var exists int
+	err = db.QueryRow(fmt.Sprintf(`SELECT 1 FROM %q WHERE key = ?`, col), id).Scan(&exists)
 	if err != nil {
 		if err == sql.ErrNoRows || strings.Contains(err.Error(), "no such table") {
 			return datastore.ErrNoSuchEntity
@@ -214,7 +437,14 @@ func (c *Store) Get(ctx context.Context, key *datastore.Key, dst interface{}) er
 		return err
 	}
 
-	return unmarshalDocLocal(propsBlob, reflect.ValueOf(dst))
+	// Load properties from kind_props
+	propsMap, err := loadPropsForKeys(db, col, []string{id})
+	if err != nil {
+		return err
+	}
+	pl := propsMap[id]
+
+	return loadPropertyList(pl, reflect.ValueOf(dst))
 }
 
 func (c *Store) GetMulti(ctx context.Context, keys []*datastore.Key, dst interface{}) error {
@@ -268,7 +498,8 @@ func (c *Store) GetMulti(ctx context.Context, keys []*datastore.Key, dst interfa
 			args = append(args, id)
 		}
 
-		query := fmt.Sprintf(`SELECT key, props FROM %q WHERE key IN (%s)`, col, strings.Join(placeholders, ","))
+		// Check which keys exist in kind table
+		query := fmt.Sprintf(`SELECT key FROM %q WHERE key IN (%s)`, col, strings.Join(placeholders, ","))
 		rows, err := db.Query(query, args...)
 		if err != nil {
 			setBatchError(me, batchIdxs[bk], err)
@@ -276,29 +507,53 @@ func (c *Store) GetMulti(ctx context.Context, keys []*datastore.Key, dst interfa
 			continue
 		}
 
+		var foundKeys []string
 		found := make(map[string]bool)
 		for rows.Next() {
 			var keyStr string
-			var propsBlob []byte
-			if err := rows.Scan(&keyStr, &propsBlob); err != nil {
+			if err := rows.Scan(&keyStr); err != nil {
 				rows.Close()
 				setBatchError(me, batchIdxs[bk], err)
 				hasErr = true
 				break
 			}
 			found[keyStr] = true
-			for _, origIdx := range idToIdxs[keyStr] {
-				if err := unmarshalDocLocal(propsBlob, v.Index(origIdx).Addr()); err != nil {
-					me[origIdx] = err
-					hasErr = true
-				}
-			}
+			foundKeys = append(foundKeys, keyStr)
 		}
 		if err := rows.Err(); err != nil {
 			setBatchError(me, batchIdxs[bk], err)
 			hasErr = true
 		}
 		rows.Close()
+
+		// Load properties for found keys
+		if len(foundKeys) > 0 {
+			propsMap, err := loadPropsForKeys(db, col, foundKeys)
+			if err != nil {
+				setBatchError(me, batchIdxs[bk], err)
+				hasErr = true
+			} else {
+				for keyStr, pl := range propsMap {
+					for _, origIdx := range idToIdxs[keyStr] {
+						if err := loadPropertyList(pl, v.Index(origIdx).Addr()); err != nil {
+							me[origIdx] = err
+							hasErr = true
+						}
+					}
+				}
+				// Handle found keys with no properties
+				for _, keyStr := range foundKeys {
+					if _, hasPl := propsMap[keyStr]; !hasPl {
+						for _, origIdx := range idToIdxs[keyStr] {
+							if err := loadPropertyList(nil, v.Index(origIdx).Addr()); err != nil {
+								me[origIdx] = err
+								hasErr = true
+							}
+						}
+					}
+				}
+			}
+		}
 
 		// Mark missing keys as ErrNoSuchEntity
 		for id, idxs := range idToIdxs {
@@ -367,11 +622,13 @@ func (c *Store) PutMulti(ctx context.Context, keys []*datastore.Key, src interfa
 			continue
 		}
 
-		var args []interface{}
-		var placeholders []string
+		propsTable := col + "_props"
 
-		var idxArgs []interface{}
-		var idxPlaceholders []string
+		var mainArgs []interface{}
+		var mainPlaceholders []string
+
+		var propsArgs []interface{}
+		var propsPlaceholders []string
 
 		var delArgs []interface{}
 		var delPlaceholders []string
@@ -419,74 +676,57 @@ func (c *Store) PutMulti(ctx context.Context, keys []*datastore.Key, src interfa
 				}
 			}
 
-			// Generate exact gob props blob for Get recovery
-			propsBlob, err := ds.MarshalPropertyList(pl)
-			if err != nil {
-				me[i] = err
-				hasErr = true
-				continue
-			}
-
-			// Build index entries
+			// Build property rows for kind_props
 			for _, p := range pl {
+				noIndex := 0
 				if p.NoIndex {
-					continue
+					noIndex = 1
 				}
 
-				if _, ok := p.Value.(*datastore.Entity); ok {
-					continue
-				}
-
-				// Handle multi-valued properties (slices) by creating
-				// separate index rows for each element, matching Cloud
-				// Datastore's behavior.
+				// Handle multi-valued properties (slices)
 				var vals []interface{}
 				if sl, ok := p.Value.([]interface{}); ok {
 					vals = sl
 				} else {
 					vals = []interface{}{p.Value}
 				}
-				for _, elem := range vals {
-					dataVal := convertFilterValue(elem)
-					dataJSON, err := json.Marshal(dataVal)
-					if err != nil {
-						me[i] = fmt.Errorf("marshal index value %q: %w", p.Name, err)
-						hasErr = true
-						continue
-					}
-					idxPlaceholders = append(idxPlaceholders, "(?, ?, ?)")
-					idxArgs = append(idxArgs, id, p.Name, string(dataJSON))
+
+				for ord, elemVal := range vals {
+					singleProp := datastore.Property{Name: p.Name, Value: elemVal, NoIndex: p.NoIndex}
+					valStr, dataType := propertyToRow(singleProp)
+					propsPlaceholders = append(propsPlaceholders, "(?, ?, ?, ?, ?, ?)")
+					propsArgs = append(propsArgs, id, p.Name, ord, valStr, noIndex, dataType)
 				}
 			}
 
-			placeholders = append(placeholders, "(?, ?, ?)")
-			args = append(args, id, parentKey, propsBlob)
+			mainPlaceholders = append(mainPlaceholders, "(?, ?)")
+			mainArgs = append(mainArgs, id, parentKey)
 		}
 
-		// Delete old index entries first
+		// Delete old property rows first
 		if len(delPlaceholders) > 0 {
-			delQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, col+"_idx", strings.Join(delPlaceholders, ","))
+			delQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, propsTable, strings.Join(delPlaceholders, ","))
 			if _, err := db.Exec(delQuery, delArgs...); err != nil {
-				setBatchError(me, batchIdxs[bk], err)
-				hasErr = true
-				continue // Skip main insert and index insert on error
-			}
-		}
-
-		// Insert/replace main rows
-		if len(placeholders) > 0 {
-			query := fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, parent_key, props) VALUES %s`, col, strings.Join(placeholders, ", "))
-			if _, err := db.Exec(query, args...); err != nil {
 				setBatchError(me, batchIdxs[bk], err)
 				hasErr = true
 				continue
 			}
 		}
 
-		// Insert new index entries
-		if len(idxPlaceholders) > 0 {
-			idxQuery := fmt.Sprintf(`INSERT INTO %q (key, name, value) VALUES %s`, col+"_idx", strings.Join(idxPlaceholders, ", "))
-			if _, err := db.Exec(idxQuery, idxArgs...); err != nil {
+		// Insert/replace main rows (key + parent_key only)
+		if len(mainPlaceholders) > 0 {
+			query := fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, parent_key) VALUES %s`, col, strings.Join(mainPlaceholders, ", "))
+			if _, err := db.Exec(query, mainArgs...); err != nil {
+				setBatchError(me, batchIdxs[bk], err)
+				hasErr = true
+				continue
+			}
+		}
+
+		// Insert property rows
+		if len(propsPlaceholders) > 0 {
+			propsQuery := fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, name, ord, value, no_index, data_type) VALUES %s`, propsTable, strings.Join(propsPlaceholders, ", "))
+			if _, err := db.Exec(propsQuery, propsArgs...); err != nil {
 				setBatchError(me, batchIdxs[bk], err)
 				hasErr = true
 			}
@@ -505,11 +745,13 @@ func (c *Store) Delete(ctx context.Context, key *datastore.Key) error {
 	if err != nil {
 		return err
 	}
-	delIdxQuery := fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col+"_idx")
-	if _, err := db.Exec(delIdxQuery, id); err != nil {
+	// Delete property rows
+	delPropsQuery := fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col+"_props")
+	if _, err := db.Exec(delPropsQuery, id); err != nil {
 		return err
 	}
 
+	// Delete main row
 	query := fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col)
 	_, err = db.Exec(query, id)
 	return err
@@ -554,9 +796,9 @@ func (c *Store) DeleteMulti(ctx context.Context, keys []*datastore.Key) error {
 
 		inClause := strings.Join(placeholders, ",")
 
-		// Delete index entries
-		delIdxQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, col+"_idx", inClause)
-		if _, err := db.Exec(delIdxQuery, args...); err != nil {
+		// Delete property rows
+		delPropsQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, col+"_props", inClause)
+		if _, err := db.Exec(delPropsQuery, args...); err != nil {
 			setBatchError(me, batchIdxs[bk], err)
 			hasErr = true
 			continue
@@ -576,12 +818,8 @@ func (c *Store) DeleteMulti(ctx context.Context, keys []*datastore.Key) error {
 	return nil
 }
 
-func unmarshalDocLocal(propsBlob []byte, dst reflect.Value) error {
-	var pl datastore.PropertyList
-	if err := ds.UnmarshalPropertyList(propsBlob, &pl); err != nil {
-		return err
-	}
-
+// loadPropertyList loads a PropertyList into a destination value.
+func loadPropertyList(pl datastore.PropertyList, dst reflect.Value) error {
 	if pls, ok := dst.Interface().(datastore.PropertyLoadSaver); ok {
 		return pls.Load(pl)
 	}
@@ -597,7 +835,7 @@ func unmarshalDocLocal(propsBlob []byte, dst reflect.Value) error {
 type localIterator struct {
 	idx        int
 	keys       []*datastore.Key
-	blobs      [][]byte
+	propLists  []datastore.PropertyList
 	page       int
 	totalPages int
 	doneErr    error
@@ -611,11 +849,11 @@ func (it *localIterator) Next(dst interface{}) (*datastore.Key, error) {
 		return nil, iterator.Done
 	}
 	k := it.keys[it.idx]
-	blob := it.blobs[it.idx]
+	pl := it.propLists[it.idx]
 	it.idx++
 
 	if dst != nil {
-		if err := unmarshalDocLocal(blob, reflect.ValueOf(dst)); err != nil {
+		if err := loadPropertyList(pl, reflect.ValueOf(dst)); err != nil {
 			return nil, err
 		}
 	}
@@ -653,6 +891,8 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 		return &localIterator{doneErr: iterator.Done}
 	}
 
+	propsTable := col + "_props"
+
 	var conditions []string
 	var args []interface{}
 	var joins []string
@@ -668,10 +908,26 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 		alias := fmt.Sprintf("i%d", idxAlias)
 		idxAlias++
 
-		joins = append(joins, fmt.Sprintf("JOIN %q %s ON main.key = %s.key", col+"_idx", alias, alias))
+		dt := filterDataType(f.Value)
+		isNumeric := dt == "int" || dt == "float"
+
+		joins = append(joins, fmt.Sprintf("JOIN %q %s ON main.key = %s.key AND %s.no_index = 0", propsTable, alias, alias, alias))
 
 		conditions = append(conditions, fmt.Sprintf("%s.name = ?", alias))
 		args = append(args, f.Field)
+
+		// Add data_type condition for proper index usage
+		if isNumeric {
+			conditions = append(conditions, fmt.Sprintf("%s.data_type IN ('int','float')", alias))
+		} else {
+			conditions = append(conditions, fmt.Sprintf("%s.data_type = ?", alias))
+			args = append(args, dt)
+		}
+
+		valExpr := alias + ".value"
+		if isNumeric {
+			valExpr = fmt.Sprintf("CAST(%s.value AS REAL)", alias)
+		}
 
 		opUpper := strings.ToUpper(strings.TrimSpace(op))
 
@@ -686,45 +942,25 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 				var placeholders []string
 				for i := 0; i < vVal.Len(); i++ {
 					elem := vVal.Index(i).Interface()
-					elemVal := convertFilterValue(elem)
-					elemJSON, err := json.Marshal(elemVal)
-					if err != nil {
-						return &localIterator{doneErr: fmt.Errorf("marshal IN filter value: %w", err)}
-					}
 					placeholders = append(placeholders, "?")
-					args = append(args, string(elemJSON))
+					args = append(args, filterValueStr(elem))
 				}
 				if len(placeholders) > 0 {
-					conditions = append(conditions, fmt.Sprintf("%s.value %s (%s)", alias, realOp, strings.Join(placeholders, ",")))
+					conditions = append(conditions, fmt.Sprintf("%s %s (%s)", valExpr, realOp, strings.Join(placeholders, ",")))
 				} else {
 					if realOp == "IN" {
-						conditions = append(conditions, "1=0") // IN empty matches nothing
+						conditions = append(conditions, "1=0")
 					} else {
-						conditions = append(conditions, "1=1") // NOT IN empty matches everything
+						conditions = append(conditions, "1=1")
 					}
 				}
 			} else {
-				// Single value IN fallback
-				dataVal := convertFilterValue(f.Value)
-				dataJSON, err := json.Marshal(dataVal)
-				if err != nil {
-					return &localIterator{doneErr: fmt.Errorf("marshal IN filter value: %w", err)}
-				}
-				conditions = append(conditions, fmt.Sprintf("%s.value %s (?)", alias, realOp))
-				args = append(args, string(dataJSON))
+				conditions = append(conditions, fmt.Sprintf("%s %s (?)", valExpr, realOp))
+				args = append(args, filterValueStr(f.Value))
 			}
 		} else {
-			dataVal := convertFilterValue(f.Value)
-			dataJSON, err := json.Marshal(dataVal)
-			if err != nil {
-				return &localIterator{doneErr: fmt.Errorf("marshal filter value: %w", err)}
-			}
-			if op == "=" {
-				conditions = append(conditions, fmt.Sprintf("%s.value = ?", alias))
-			} else {
-				conditions = append(conditions, fmt.Sprintf("%s.value %s ?", alias, op))
-			}
-			args = append(args, string(dataJSON))
+			conditions = append(conditions, fmt.Sprintf("%s %s ?", valExpr, op))
+			args = append(args, filterValueStr(f.Value))
 		}
 	}
 
@@ -735,7 +971,6 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 			Name: anc.Name,
 		})
 		if parentKeyStr == "" {
-			// The ancestor IS the parent, so build the parent_key string from the ancestor key itself
 			pCol, pID := keyToColAndID(anc)
 			parentKeyStr = pCol + ":" + pID
 		}
@@ -743,14 +978,12 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 		args = append(args, parentKeyStr)
 	}
 
-	queryStr := fmt.Sprintf("SELECT DISTINCT main.key, main.props FROM %q main", col)
+	queryStr := fmt.Sprintf("SELECT DISTINCT main.key FROM %q main", col)
 	if len(joins) > 0 {
 		queryStr += " " + strings.Join(joins, " ")
 	}
 
-	// Build ORDER BY LEFT JOINs before WHERE so they appear in the
-	// correct SQL position. Collect their args separately so we can
-	// combine all args in SQL placeholder order.
+	// Build ORDER BY LEFT JOINs
 	var orderJoinArgs []interface{}
 	var orderStrs []string
 	if len(q.Orders()) > 0 {
@@ -763,10 +996,26 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 			alias := fmt.Sprintf("i%d", idxAlias)
 			idxAlias++
 
-			queryStr += fmt.Sprintf(" LEFT JOIN %q %s ON main.key = %s.key AND %s.name = ?", col+"_idx", alias, alias, alias)
+			queryStr += fmt.Sprintf(" LEFT JOIN %q %s ON main.key = %s.key AND %s.name = ? AND %s.no_index = 0", propsTable, alias, alias, alias, alias)
 			orderJoinArgs = append(orderJoinArgs, o.Field)
 
-			orderStrs = append(orderStrs, fmt.Sprintf("%s.value %s", alias, dir))
+			// Determine if the order field is numeric by checking filters
+			orderIsNumeric := false
+			for _, f := range q.Filters() {
+				if f.Field == o.Field {
+					dt := filterDataType(f.Value)
+					if dt == "int" || dt == "float" {
+						orderIsNumeric = true
+					}
+					break
+				}
+			}
+
+			if orderIsNumeric {
+				orderStrs = append(orderStrs, fmt.Sprintf("CAST(%s.value AS REAL) %s", alias, dir))
+			} else {
+				orderStrs = append(orderStrs, fmt.Sprintf("%s.value %s", alias, dir))
+			}
 		}
 	}
 
@@ -776,15 +1025,13 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 	if len(orderStrs) > 0 {
 		queryStr += " ORDER BY " + strings.Join(orderStrs, ", ")
 	} else {
-		// Default: sort by key ascending, matching Cloud Datastore behavior.
 		queryStr += " ORDER BY main.key ASC"
 	}
 
-	// Combine args: ORDER BY LEFT JOIN args first (they appear before WHERE in SQL),
-	// then condition/filter args (they appear in WHERE).
+	// Combine args: ORDER BY LEFT JOIN args first, then condition args.
 	finalArgs := append(orderJoinArgs, args...)
 
-	// Parse page-based cursor (format: "page:totalPages").
+	// Parse page-based cursor.
 	page := 1
 	if cStr := q.GetCursor(); cStr != "" {
 		parts := strings.SplitN(cStr, ":", 2)
@@ -793,7 +1040,7 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 		}
 	}
 
-	// Run a COUNT query to determine total rows for pagination.
+	// Pagination
 	totalPages := 0
 	limit := q.GetLimit()
 	if limit > 0 {
@@ -804,12 +1051,11 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 		if len(conditions) > 0 {
 			countQuery += " WHERE " + strings.Join(conditions, " AND ")
 		}
-		// COUNT query only needs filter args (no order join args).
 		var totalRows int
 		if err := db.QueryRow(countQuery, args...).Scan(&totalRows); err != nil {
 			return &localIterator{doneErr: fmt.Errorf("count query: %w", err)}
 		}
-		totalPages = (totalRows + limit - 1) / limit // ceil division
+		totalPages = (totalRows + limit - 1) / limit
 
 		offset := (page - 1) * limit
 		if q.GetOffset() > 0 {
@@ -828,34 +1074,38 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 	}
 	defer rows.Close()
 
-	// Eagerly load all results. We defer rows.Close() above so we must
-	// consume them before returning. This is acceptable for the local
-	// development store where result sets are small.
-	var keys []*datastore.Key
-	var blobs [][]byte
+	// Collect all matching keys
+	var resultKeys []*datastore.Key
+	var keyStrs []string
 
 	for rows.Next() {
 		var keyStr string
-		var propsBlob []byte
-		if err := rows.Scan(&keyStr, &propsBlob); err != nil {
+		if err := rows.Scan(&keyStr); err != nil {
 			return &localIterator{doneErr: err}
 		}
-
-		b := make([]byte, len(propsBlob))
-		copy(b, propsBlob)
-
 		k := keyFromStrAndKind(col, keyStr)
-		keys = append(keys, k)
-		blobs = append(blobs, b)
+		resultKeys = append(resultKeys, k)
+		keyStrs = append(keyStrs, keyStr)
 	}
-
 	if err := rows.Err(); err != nil {
 		return &localIterator{doneErr: err}
 	}
 
+	// Load properties for all result keys
+	var propLists []datastore.PropertyList
+	if len(keyStrs) > 0 {
+		propsMap, err := loadPropsForKeys(db, col, keyStrs)
+		if err != nil {
+			return &localIterator{doneErr: err}
+		}
+		for _, ks := range keyStrs {
+			propLists = append(propLists, propsMap[ks])
+		}
+	}
+
 	return &localIterator{
-		keys:       keys,
-		blobs:      blobs,
+		keys:       resultKeys,
+		propLists:  propLists,
 		page:       page,
 		totalPages: totalPages,
 	}
