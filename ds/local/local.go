@@ -775,6 +775,9 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 	}
 	if len(orderStrs) > 0 {
 		queryStr += " ORDER BY " + strings.Join(orderStrs, ", ")
+	} else {
+		// Default: sort by key ascending, matching Cloud Datastore behavior.
+		queryStr += " ORDER BY main.key ASC"
 	}
 
 	// Combine args: ORDER BY LEFT JOIN args first (they appear before WHERE in SQL),
