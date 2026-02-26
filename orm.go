@@ -463,19 +463,21 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 	var dsClient *datastore.Client
 	var err error
 
-	if o.datastoreClient != nil {
-		dsClient = o.datastoreClient
-	} else {
-		if o.projectID == "" {
-			o.projectID = os.Getenv("DATASTORE_PROJECT_ID")
-		}
-		if o.projectID == "" {
-			o.projectID = os.Getenv("GOOGLE_CLOUD_PROJECT")
-		}
+	if o.store == nil {
+		if o.datastoreClient != nil {
+			dsClient = o.datastoreClient
+		} else {
+			if o.projectID == "" {
+				o.projectID = os.Getenv("DATASTORE_PROJECT_ID")
+			}
+			if o.projectID == "" {
+				o.projectID = os.Getenv("GOOGLE_CLOUD_PROJECT")
+			}
 
-		dsClient, err = datastore.NewClient(ctx, o.projectID)
-		if err != nil {
-			return nil, err
+			dsClient, err = datastore.NewClient(ctx, o.projectID)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
