@@ -1650,3 +1650,165 @@ func testDataTypes(t *testing.T, testDB *dsorm.Client) {
 		}
 	})
 }
+
+// ------------------------------------------------------------------
+// Cross-Type Filter Safety Test
+// ------------------------------------------------------------------
+
+// TestCrossTypeFilter verifies that filtering runs type-safe comparisons.
+// For example, filtering amount = 0 (int) must NOT match a record where
+// amount = "yes" (string), even though SQLite's CAST("yes" AS REAL) == 0.
+func TestCrossTypeFilter(t *testing.T) {
+	ctx := context.Background()
+
+	tempDir, err := os.MkdirTemp("", "dsorm_crosstype_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	store := local.NewStore(tempDir)
+	defer store.Close()
+
+	kind := "MixedKind"
+
+	// Entity 1: amount = int64(0)
+	k1 := datastore.IDKey(kind, 1, nil)
+	pl1 := datastore.PropertyList{
+		{Name: "amount", Value: int64(0)},
+		{Name: "label", Value: "zero-int"},
+	}
+	if _, err := store.Put(ctx, k1, &pl1); err != nil {
+		t.Fatalf("Put pl1 failed: %v", err)
+	}
+
+	// Entity 2: amount = "yes" (string — CAST("yes" AS REAL) == 0 in SQLite)
+	k2 := datastore.IDKey(kind, 2, nil)
+	pl2 := datastore.PropertyList{
+		{Name: "amount", Value: "yes"},
+		{Name: "label", Value: "string-yes"},
+	}
+	if _, err := store.Put(ctx, k2, &pl2); err != nil {
+		t.Fatalf("Put pl2 failed: %v", err)
+	}
+
+	// Entity 3: amount = int64(100)
+	k3 := datastore.IDKey(kind, 3, nil)
+	pl3 := datastore.PropertyList{
+		{Name: "amount", Value: int64(100)},
+		{Name: "label", Value: "hundred-int"},
+	}
+	if _, err := store.Put(ctx, k3, &pl3); err != nil {
+		t.Fatalf("Put pl3 failed: %v", err)
+	}
+
+	// Entity 4: amount = "0" (string that looks like zero)
+	k4 := datastore.IDKey(kind, 4, nil)
+	pl4 := datastore.PropertyList{
+		{Name: "amount", Value: "0"},
+		{Name: "label", Value: "string-zero"},
+	}
+	if _, err := store.Put(ctx, k4, &pl4); err != nil {
+		t.Fatalf("Put pl4 failed: %v", err)
+	}
+
+	// --- Test: amount = 0 (int) should match ONLY entity 1 ---
+	t.Run("IntEqualZero", func(t *testing.T) {
+		q := dsorm.NewQuery(kind).FilterField("amount", "=", int64(0))
+		it := store.Run(ctx, q)
+		var results []string
+		for {
+			var pl datastore.PropertyList
+			_, err := it.Next(&pl)
+			if err != nil {
+				break
+			}
+			for _, p := range pl {
+				if p.Name == "label" {
+					results = append(results, p.Value.(string))
+				}
+			}
+		}
+		if len(results) != 1 {
+			t.Errorf("Expected 1 result for amount=0(int), got %d: %v", len(results), results)
+		}
+		if len(results) == 1 && results[0] != "zero-int" {
+			t.Errorf("Expected 'zero-int', got %q", results[0])
+		}
+	})
+
+	// --- Test: amount = "yes" (string) should match ONLY entity 2 ---
+	t.Run("StringEqualYes", func(t *testing.T) {
+		q := dsorm.NewQuery(kind).FilterField("amount", "=", "yes")
+		it := store.Run(ctx, q)
+		var results []string
+		for {
+			var pl datastore.PropertyList
+			_, err := it.Next(&pl)
+			if err != nil {
+				break
+			}
+			for _, p := range pl {
+				if p.Name == "label" {
+					results = append(results, p.Value.(string))
+				}
+			}
+		}
+		if len(results) != 1 {
+			t.Errorf("Expected 1 result for amount='yes', got %d: %v", len(results), results)
+		}
+		if len(results) == 1 && results[0] != "string-yes" {
+			t.Errorf("Expected 'string-yes', got %q", results[0])
+		}
+	})
+
+	// --- Test: amount > 0 (int) should match ONLY entity 3, NOT "yes" or "0" strings ---
+	t.Run("IntGreaterThanZero", func(t *testing.T) {
+		q := dsorm.NewQuery(kind).FilterField("amount", ">", int64(0))
+		it := store.Run(ctx, q)
+		var results []string
+		for {
+			var pl datastore.PropertyList
+			_, err := it.Next(&pl)
+			if err != nil {
+				break
+			}
+			for _, p := range pl {
+				if p.Name == "label" {
+					results = append(results, p.Value.(string))
+				}
+			}
+		}
+		if len(results) != 1 {
+			t.Errorf("Expected 1 result for amount>0(int), got %d: %v", len(results), results)
+		}
+		if len(results) == 1 && results[0] != "hundred-int" {
+			t.Errorf("Expected 'hundred-int', got %q", results[0])
+		}
+	})
+
+	// --- Test: amount = "0" (string) should match ONLY entity 4, NOT int64(0) ---
+	t.Run("StringEqualZero", func(t *testing.T) {
+		q := dsorm.NewQuery(kind).FilterField("amount", "=", "0")
+		it := store.Run(ctx, q)
+		var results []string
+		for {
+			var pl datastore.PropertyList
+			_, err := it.Next(&pl)
+			if err != nil {
+				break
+			}
+			for _, p := range pl {
+				if p.Name == "label" {
+					results = append(results, p.Value.(string))
+				}
+			}
+		}
+		if len(results) != 1 {
+			t.Errorf("Expected 1 result for amount='0'(string), got %d: %v", len(results), results)
+		}
+		if len(results) == 1 && results[0] != "string-zero" {
+			t.Errorf("Expected 'string-zero', got %q", results[0])
+		}
+	})
+}
