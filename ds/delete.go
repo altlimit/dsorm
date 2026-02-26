@@ -69,5 +69,5 @@ func (c *Client) deleteMulti(ctx context.Context, keys []*datastore.Key) error {
 		}
 	}
 
-	return c.Client.DeleteMulti(ctx, keys)
+	return c.Store.DeleteMulti(ctx, keys)
 }
