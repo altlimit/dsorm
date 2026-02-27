@@ -884,11 +884,8 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 		return &localIterator{doneErr: err}
 	}
 
-	c.mu.RLock()
-	exists := c.kindCache[ns][col]
-	c.mu.RUnlock()
-	if !exists {
-		return &localIterator{doneErr: iterator.Done}
+	if err := c.ensureKind(ns, col, db); err != nil {
+		return &localIterator{doneErr: err}
 	}
 
 	propsTable := col + "_props"
