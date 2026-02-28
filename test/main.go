@@ -8,8 +8,8 @@ import (
 
 	"google.golang.org/appengine/v2"
 
-	ds "github.com/altlimit/dsorm/ds"
 	"github.com/altlimit/dsorm/cache/memcache"
+	"github.com/altlimit/dsorm/ds"
 )
 
 func main() {
@@ -54,6 +54,46 @@ func handleTestMemcache(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, ok := items["test-key"]; ok {
 		http.Error(w, "Item found after delete", 500)
+		return
+	}
+
+	// 3. Test Increment with expiration
+	incrKey := "test-incr-expire"
+	// Clean up any leftover from previous runs
+	cacher.DeleteMulti(ctx, []string{incrKey})
+
+	val, err := cacher.Increment(ctx, incrKey, 1, 2*time.Second)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Increment (first) failed: %v", err), 500)
+		return
+	}
+	if val != 1 {
+		http.Error(w, fmt.Sprintf("Increment (first) expected 1, got %d", val), 500)
+		return
+	}
+
+	// Increment again — should add to existing value
+	val, err = cacher.Increment(ctx, incrKey, 5, 2*time.Second)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Increment (second) failed: %v", err), 500)
+		return
+	}
+	if val != 6 {
+		http.Error(w, fmt.Sprintf("Increment (second) expected 6, got %d", val), 500)
+		return
+	}
+
+	// Wait for expiration
+	time.Sleep(3 * time.Second)
+
+	// Key should be gone
+	items, err = cacher.GetMulti(ctx, []string{incrKey})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("GetMulti after incr expire failed: %v", err), 500)
+		return
+	}
+	if _, ok := items[incrKey]; ok {
+		http.Error(w, "Increment key should have expired but still exists", 500)
 		return
 	}
 

@@ -2,42 +2,43 @@ package memcache
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"google.golang.org/appengine/v2"
 	"google.golang.org/appengine/v2/memcache"
 
-	dsorm "github.com/altlimit/dsorm/ds"
+	"github.com/altlimit/dsorm/ds"
 )
 
 type backend struct{}
 
-// NewCache will return a dsorm.Cache backed by AppEngine's memcache.
-func NewCache() dsorm.Cache {
+// NewCache will return a ds.Cache backed by AppEngine's memcache.
+func NewCache() ds.Cache {
 	return &backend{}
 }
 
-func (m *backend) AddMulti(ctx context.Context, items []*dsorm.Item) error {
-	return convertToDSOMultiError(memcache.AddMulti(ctx, convertToMemcacheItems(items)))
+func (m *backend) AddMulti(ctx context.Context, items []*ds.Item) error {
+	return convertToDSMultiError(memcache.AddMulti(ctx, convertToMemcacheItems(items)))
 }
 
-func (m *backend) CompareAndSwapMulti(ctx context.Context, items []*dsorm.Item) error {
-	return convertToDSOMultiError(memcache.CompareAndSwapMulti(ctx, convertToMemcacheItems(items)))
+func (m *backend) CompareAndSwapMulti(ctx context.Context, items []*ds.Item) error {
+	return convertToDSMultiError(memcache.CompareAndSwapMulti(ctx, convertToMemcacheItems(items)))
 }
 
 func (m *backend) DeleteMulti(ctx context.Context, keys []string) error {
-	return convertToDSOMultiError(memcache.DeleteMulti(ctx, keys))
+	return convertToDSMultiError(memcache.DeleteMulti(ctx, keys))
 }
 
-func (m *backend) GetMulti(ctx context.Context, keys []string) (map[string]*dsorm.Item, error) {
+func (m *backend) GetMulti(ctx context.Context, keys []string) (map[string]*ds.Item, error) {
 	items, err := memcache.GetMulti(ctx, keys)
 	if err != nil {
-		return nil, convertToDSOMultiError(err)
+		return nil, convertToDSMultiError(err)
 	}
 	return convertFromMemcacheItems(items), nil
 }
 
-func (m *backend) SetMulti(ctx context.Context, items []*dsorm.Item) error {
+func (m *backend) SetMulti(ctx context.Context, items []*ds.Item) error {
 	return memcache.SetMulti(ctx, convertToMemcacheItems(items))
 }
 
@@ -46,10 +47,21 @@ func (m *backend) Increment(ctx context.Context, key string, delta int64, expira
 	if err != nil {
 		return 0, err
 	}
+	// If this was the initial creation (newVal equals delta) and an expiration
+	// is requested, set the key with the TTL so it auto-expires.
+	if expiration > 0 && newVal == uint64(delta) {
+		if err := memcache.Set(ctx, &memcache.Item{
+			Key:        key,
+			Value:      []byte(fmt.Sprintf("%d", newVal)),
+			Expiration: expiration,
+		}); err != nil {
+			return 0, err
+		}
+	}
 	return int64(newVal), nil
 }
 
-func convertToMemcacheItems(items []*dsorm.Item) []*memcache.Item {
+func convertToMemcacheItems(items []*ds.Item) []*memcache.Item {
 	newItems := make([]*memcache.Item, len(items))
 	for i, item := range items {
 		if memcacheItem, ok := item.GetCASInfo().(*memcache.Item); ok {
@@ -70,10 +82,10 @@ func convertToMemcacheItems(items []*dsorm.Item) []*memcache.Item {
 	return newItems
 }
 
-func convertFromMemcacheItems(items map[string]*memcache.Item) map[string]*dsorm.Item {
-	newItems := make(map[string]*dsorm.Item)
+func convertFromMemcacheItems(items map[string]*memcache.Item) map[string]*ds.Item {
+	newItems := make(map[string]*ds.Item)
 	for key, item := range items {
-		newItems[key] = &dsorm.Item{
+		newItems[key] = &ds.Item{
 			Expiration: item.Expiration,
 			Flags:      item.Flags,
 			Key:        item.Key,
@@ -84,17 +96,17 @@ func convertFromMemcacheItems(items map[string]*memcache.Item) map[string]*dsorm
 	return newItems
 }
 
-func convertToDSOMultiError(err error) error {
+func convertToDSMultiError(err error) error {
 	if ame, ok := err.(appengine.MultiError); ok {
-		me := make(dsorm.MultiError, len(ame))
+		me := make(ds.MultiError, len(ame))
 		for i, aerr := range ame {
 			switch aerr {
 			case memcache.ErrNotStored:
-				me[i] = dsorm.ErrNotStored
+				me[i] = ds.ErrNotStored
 			case memcache.ErrCacheMiss:
-				me[i] = dsorm.ErrCacheMiss
+				me[i] = ds.ErrCacheMiss
 			case memcache.ErrCASConflict:
-				me[i] = dsorm.ErrCASConflict
+				me[i] = ds.ErrCASConflict
 			default:
 				me[i] = aerr
 			}

@@ -154,6 +154,7 @@ func (c *Client) RunInTransaction(ctx context.Context, f func(tx *Transaction) e
 // commitCache applies aggregated cache locks.
 func (t *Transaction) commitCache() error {
 	t.Lock()
+	defer t.Unlock()
 	if t.c.cacher != nil {
 		return t.c.cacher.SetMulti(t.ctx, t.lockCacheItems)
 	}

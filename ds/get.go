@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"reflect"
 	"sync"
-	"time"
 
 	"cloud.google.com/go/datastore"
 	"github.com/pkg/errors"
@@ -201,10 +200,6 @@ func itemLock() []byte {
 	b := make([]byte, 4)
 	binary.LittleEndian.PutUint32(b, rand.Uint32())
 	return b
-}
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
 }
 
 func (c *Client) lockCache(ctx context.Context, cacheItems []cacheItem) {

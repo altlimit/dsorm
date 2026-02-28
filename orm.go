@@ -456,14 +456,18 @@ func appendMarshaledProp(ctx context.Context, props []datastore.Property, tag st
 
 // Client wraps datastore and cache operations.
 type Client struct {
-	client *ds.Client
-	encKey []byte
+	client   *ds.Client
+	encKey   []byte
+	appCache cache.Cache
 }
 
 // Cache returns an application-level cache.Cache for general-purpose
 // caching operations (Get, Set, Delete, Load, Save, RateLimit, etc).
 func (c *Client) Cache() cache.Cache {
-	return cache.New(c.client.Cacher())
+	if c.appCache == nil {
+		c.appCache = cache.New(c.client.Cacher())
+	}
+	return c.appCache
 }
 
 type options struct {

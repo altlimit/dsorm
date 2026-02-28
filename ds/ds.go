@@ -191,7 +191,7 @@ func groupErrors(errs []error, total, limit int) error {
 func getCacheLocks(prefix string, keys []*datastore.Key) ([]string, []*Item) {
 	lockCacheKeys := make([]string, 0, len(keys))
 	lockCacheItems := make([]*Item, 0, len(keys))
-	set := make(map[string]interface{})
+	set := make(map[string]struct{})
 	for _, key := range keys {
 		// Worst case scenario is that we lock the entity for cacheLockTime.
 		// datastore.Delete will raise the appropriate error.
@@ -206,7 +206,7 @@ func getCacheLocks(prefix string, keys []*datastore.Key) ([]string, []*Item) {
 				}
 				lockCacheItems = append(lockCacheItems, item)
 				lockCacheKeys = append(lockCacheKeys, item.Key)
-				set[cacheKey] = nil
+				set[cacheKey] = struct{}{}
 			}
 		}
 	}
