@@ -9,6 +9,7 @@ import (
 // ensure cloudStore implements the interfaces
 var _ Store = (*cloudStore)(nil)
 var _ Mutator = (*cloudStore)(nil)
+var _ CloudAccess = (*cloudStore)(nil)
 var _ TransactionMutator = (*cloudTransaction)(nil)
 
 type cloudStore struct {
@@ -18,6 +19,11 @@ type cloudStore struct {
 // NewCloudStore wraps a datastore.Client
 func NewCloudStore(client *datastore.Client) *cloudStore {
 	return &cloudStore{client: client}
+}
+
+// DatastoreClient returns the underlying *datastore.Client.
+func (b *cloudStore) DatastoreClient() *datastore.Client {
+	return b.client
 }
 
 func (b *cloudStore) Close() error {

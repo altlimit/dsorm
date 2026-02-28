@@ -24,9 +24,12 @@ import (
 )
 
 type (
-	// Model defines the basic methods required for a struct to be managed by dsorm.
+	// Model is the interface that all dsorm-managed structs must implement.
+	// Embed [Base] in your struct to get a default implementation.
 	Model interface {
+		// IsNew reports whether the entity has not yet been loaded from the datastore.
 		IsNew() bool
+		// Key returns the datastore key for this entity, or nil if not yet assigned.
 		Key() *datastore.Key
 	}
 
@@ -36,28 +39,58 @@ type (
 		getInitProps() []datastore.Property
 	}
 
+	// OnLoad is an optional interface that a model can implement to run
+	// custom logic immediately after the entity is loaded from the datastore.
+	// It is called after all properties have been deserialized and decrypted.
 	OnLoad interface {
 		OnLoad(context.Context) error
 	}
 
+	// BeforeSave is an optional interface that a model can implement to run
+	// validation or transformation logic before the entity is written to the
+	// datastore. The Model parameter contains the previously saved state of
+	// the entity (nil for new entities), allowing comparison between old and
+	// new values.
 	BeforeSave interface {
 		BeforeSave(context.Context, Model) error
 	}
 
+	// BeforeDelete is an optional interface that a model can implement to run
+	// cleanup or validation logic before the entity is deleted from the datastore.
 	BeforeDelete interface {
 		BeforeDelete(context.Context) error
 	}
 
+	// AfterDelete is an optional interface that a model can implement to run
+	// side-effect logic (e.g. cache invalidation, cascading deletes) after the
+	// entity has been successfully deleted from the datastore.
 	AfterDelete interface {
 		AfterDelete(context.Context) error
 	}
 
+	// AfterSave is an optional interface that a model can implement to run
+	// side-effect logic after the entity has been successfully written to the
+	// datastore. The Model parameter contains the previously saved state
+	// (nil for new entities), enabling change-detection workflows such as
+	// audit logging or sending notifications.
 	AfterSave interface {
 		AfterSave(context.Context, Model) error
 	}
 
-	// Base provides default implementation for Model interface and common fields.
-	// Embed this in your struct to use dsorm.
+	// Base provides a default implementation of the [Model] interface along
+	// with datastore.PropertyLoadSaver and datastore.KeyLoader. Embed this
+	// struct in your model to gain automatic key mapping, property
+	// marshaling/encryption, lifecycle hooks, and change tracking.
+	//
+	// Fields are configured via the "model" struct tag:
+	//
+	//	model:"id"                  — maps the field as the entity's datastore key ID (string or int64)
+	//	model:"parent"              — maps the field as the entity's parent key
+	//	model:"ns"                  — maps the field as the entity's namespace
+	//	model:"created"             — auto-set to UTC now on first save
+	//	model:"modified"            — auto-set to UTC now on every save
+	//	model:"<name>,marshal"      — JSON-marshal the field into a single datastore property
+	//	model:"<name>,encrypt"      — JSON-marshal and AES-encrypt the field
 	Base struct {
 		key *datastore.Key `datastore:"-" json:"-"`
 
@@ -82,6 +115,9 @@ func (b *Base) initModel(ctx context.Context, e any) error {
 	return nil
 }
 
+// Key returns the datastore key for this entity. The key is populated
+// automatically when the entity is loaded from the datastore or after
+// a successful Put operation.
 func (b *Base) Key() *datastore.Key {
 	return b.key
 }
@@ -241,6 +277,8 @@ func (b *Base) getInitProps() []datastore.Property {
 	return b.initProps
 }
 
+// IsNew reports whether the entity has not yet been loaded from the datastore.
+// It returns true for freshly constructed structs that have never been Get'd.
 func (b *Base) IsNew() bool {
 	return len(b.initProps) == 0
 }
@@ -417,9 +455,8 @@ func appendMarshaledProp(ctx context.Context, props []datastore.Property, tag st
 
 // Client wraps datastore and cache operations.
 type Client struct {
-	client    *ds.Client
-	rawClient *datastore.Client
-	encKey    []byte
+	client *ds.Client
+	encKey []byte
 }
 
 type options struct {
@@ -430,32 +467,48 @@ type options struct {
 	encryptionKey   []byte
 }
 
+// Option configures a [Client] created via [New].
 type Option func(*options)
 
+// WithProjectID sets the Google Cloud project ID. If not specified, the
+// DATASTORE_PROJECT_ID or GOOGLE_CLOUD_PROJECT environment variables are
+// used as fallbacks.
 func WithProjectID(id string) Option {
 	return func(o *options) {
 		o.projectID = id
 	}
 }
 
+// WithCache overrides the auto-detected caching backend with the provided
+// implementation. By default, [New] selects App Engine Memcache, Redis
+// (via REDIS_ADDR env), or in-memory cache, in that order.
 func WithCache(c ds.Cache) Option {
 	return func(o *options) {
 		o.cache = c
 	}
 }
 
+// WithDatastoreClient provides an existing cloud.google.com/go/datastore
+// client instead of creating one internally. Useful for environments that
+// require custom client configuration (e.g. emulator endpoints).
 func WithDatastoreClient(c *datastore.Client) Option {
 	return func(o *options) {
 		o.datastoreClient = c
 	}
 }
 
+// WithStore replaces the default Google Cloud Datastore backend with a
+// custom [ds.Store] implementation (e.g. the local in-memory store for
+// testing).
 func WithStore(s ds.Store) Option {
 	return func(o *options) {
 		o.store = s
 	}
 }
 
+// WithEncryptionKey sets the AES encryption key used for fields tagged
+// with model:"<name>,encrypt". If not set, the DATASTORE_ENCRYPTION_KEY
+// environment variable is used as a fallback at load/save time.
 func WithEncryptionKey(key []byte) Option {
 	return func(o *options) {
 		o.encryptionKey = key
@@ -466,8 +519,13 @@ type contextKey string
 
 var encryptionKeyKey contextKey = "dsorm_encryption_key"
 
-// New creates a new Client with options value.
-// It auto-detects caching backend: App Engine (Memcache), Redis (env REDIS_ADDR), or Memory.
+// New creates a new [Client] with the given options.
+//
+// Caching backend is auto-detected in the following order unless overridden
+// with [WithCache]:
+//  1. App Engine Memcache (when running on App Engine)
+//  2. Redis (when REDIS_ADDR environment variable is set)
+//  3. In-memory cache (fallback)
 func New(ctx context.Context, opts ...Option) (*Client, error) {
 	o := &options{}
 	for _, opt := range opts {
@@ -530,9 +588,8 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 	}
 
 	return &Client{
-		rawClient: dsClient,
-		client:    dsoClient,
-		encKey:    o.encryptionKey,
+		client: dsoClient,
+		encKey: o.encryptionKey,
 	}, nil
 }
 
@@ -543,7 +600,9 @@ func (db *Client) context(ctx context.Context) context.Context {
 	return ctx
 }
 
-// Keys returns a slice of keys for the given slice of entities.
+// Keys returns a slice of datastore keys derived from a slice of model
+// structs. Each entity's key is built from its model:"id", model:"parent",
+// and model:"ns" struct tags.
 func (db *Client) Keys(val interface{}) []*datastore.Key {
 	t := reflect.TypeOf(val)
 	var keys []*datastore.Key
@@ -556,7 +615,9 @@ func (db *Client) Keys(val interface{}) []*datastore.Key {
 	return keys
 }
 
-// Key returns the datastore key for the given entity.
+// Key returns the datastore key for a single model struct. The key is
+// constructed from the struct's model:"id" (string or int64), model:"parent"
+// (datastore.Key or parent model pointer), and model:"ns" (namespace) tags.
 func (db *Client) Key(val interface{}) *datastore.Key {
 	t := reflect.TypeOf(val)
 	v := reflect.ValueOf(val)
@@ -605,7 +666,10 @@ func (db *Client) Key(val interface{}) *datastore.Key {
 	return key
 }
 
-// Get loads the entity for the given key/struct into the struct.
+// Get loads a single entity from the datastore into val. The entity's key
+// is derived from val's struct tags (see [Client.Key]). After loading, the
+// entity's [Base.LoadKey] is called to map the key back into the struct
+// fields.
 func (db *Client) Get(ctx context.Context, val interface{}) error {
 	ctx = db.context(ctx)
 	if err := initModel(ctx, val); err != nil {
@@ -623,7 +687,10 @@ func (db *Client) Get(ctx context.Context, val interface{}) error {
 	return nil
 }
 
-// GetMulti loads multiple entities.
+// GetMulti loads multiple entities from the datastore. vals must be a
+// slice of pointer-to-struct (e.g. []*MyModel). Entities that do not
+// exist in the datastore are set to nil in the slice rather than
+// returning an error. Only non-ErrNoSuchEntity errors are returned.
 func (db *Client) GetMulti(ctx context.Context, vals interface{}) error {
 	ctx = db.context(ctx)
 	v := reflect.ValueOf(vals)
@@ -661,7 +728,11 @@ func (db *Client) GetMulti(ctx context.Context, vals interface{}) error {
 	return nil
 }
 
-// Put saves an entity.
+// Put saves a single entity to the datastore. For new entities with an
+// auto-generated int64 ID, the ID is written back into the struct after
+// a successful save. If val implements [BeforeSave], it is called before
+// writing. If val implements [AfterSave], it is called after writing with
+// the previous state of the entity.
 func (db *Client) Put(ctx context.Context, val interface{}) error {
 	ctx = db.context(ctx)
 	if err := initModel(ctx, val); err != nil {
@@ -688,7 +759,10 @@ func (db *Client) Put(ctx context.Context, val interface{}) error {
 	return nil
 }
 
-// PutMulti saves multiple entities.
+// PutMulti saves multiple entities to the datastore. vals must be a slice
+// of pointer-to-struct. Auto-generated IDs are written back into each
+// struct. [BeforeSave] and [AfterSave] hooks are called for each entity
+// that implements them. AfterSave hooks run concurrently.
 func (db *Client) PutMulti(ctx context.Context, vals interface{}) error {
 	ctx = db.context(ctx)
 	v := reflect.ValueOf(vals)
@@ -734,6 +808,9 @@ func (db *Client) PutMulti(ctx context.Context, vals interface{}) error {
 	return nil
 }
 
+// Delete removes a single entity from the datastore. If val implements
+// [BeforeDelete], it is called before deletion. If val implements
+// [AfterDelete], it is called after successful deletion.
 func (db *Client) Delete(ctx context.Context, val interface{}) error {
 	ctx = db.context(ctx)
 	if bd, ok := val.(BeforeDelete); ok {
@@ -751,6 +828,9 @@ func (db *Client) Delete(ctx context.Context, val interface{}) error {
 	return nil
 }
 
+// DeleteMulti removes multiple entities from the datastore. vals can be
+// a slice of model structs or a []*datastore.Key. [BeforeDelete] and
+// [AfterDelete] hooks are called for each entity that implements them.
 func (db *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
 	ctx = db.context(ctx)
 	v := reflect.ValueOf(vals)
@@ -796,6 +876,11 @@ func (db *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
 	return nil
 }
 
+// Query executes a query using a keys-only strategy: it first fetches all
+// matching keys, then hydrates the entities via [Client.GetMulti]. If vals
+// is non-nil, it must be a pointer to a slice (e.g. *[]*MyModel) and will
+// be populated with the loaded entities. The returned string is the cursor
+// for pagination; pass it back as the cursor argument to resume.
 func (db *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals interface{}) ([]*datastore.Key, string, error) {
 	ctx = db.context(ctx)
 	var keys []*datastore.Key
@@ -853,7 +938,9 @@ func (db *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, val
 	return keys, next, nil
 }
 
-// Transaction wraps ds.Transaction to provide dsorm functionality (ID mapping, lifecycle hooks).
+// Transaction wraps a datastore transaction with dsorm functionality
+// including automatic key mapping, lifecycle hooks, and pending key
+// resolution for auto-ID entities.
 type Transaction struct {
 	tx      *ds.Transaction
 	client  *Client
@@ -866,7 +953,8 @@ type pendingItem struct {
 	item interface{}
 }
 
-// Get loads entity to val within the transaction.
+// Get loads a single entity within the transaction. Behaves like
+// [Client.Get] but operates within the transaction's isolation.
 func (t *Transaction) Get(val interface{}) error {
 	if err := initModel(t.ctx, val); err != nil {
 		return err
@@ -883,7 +971,9 @@ func (t *Transaction) Get(val interface{}) error {
 	return nil
 }
 
-// GetMulti loads multiple entities within the transaction.
+// GetMulti loads multiple entities within the transaction. Behaves like
+// [Client.GetMulti]: entities that do not exist are set to nil in the
+// slice.
 func (t *Transaction) GetMulti(vals interface{}) error {
 	v := reflect.ValueOf(vals)
 	if v.Kind() != reflect.Slice {
@@ -920,7 +1010,9 @@ func (t *Transaction) GetMulti(vals interface{}) error {
 	return nil
 }
 
-// Put saves an entity within the transaction.
+// Put saves a single entity within the transaction. For new entities with
+// auto-generated IDs, the ID is resolved after [Client.Transact] commits
+// successfully.
 func (t *Transaction) Put(val interface{}) error {
 	if err := initModel(t.ctx, val); err != nil {
 		return err
@@ -948,7 +1040,8 @@ func (t *Transaction) Put(val interface{}) error {
 	return nil
 }
 
-// PutMulti saves multiple entities within the transaction.
+// PutMulti saves multiple entities within the transaction. Auto-generated
+// IDs are resolved after [Client.Transact] commits.
 func (t *Transaction) PutMulti(vals interface{}) error {
 	v := reflect.ValueOf(vals)
 	if v.Kind() != reflect.Slice {
@@ -997,7 +1090,7 @@ func (t *Transaction) PutMulti(vals interface{}) error {
 	return nil
 }
 
-// Delete deletes an entity within the transaction.
+// Delete removes a single entity within the transaction.
 func (t *Transaction) Delete(val interface{}) error {
 	if bd, ok := val.(BeforeDelete); ok {
 		if err := bd.BeforeDelete(t.ctx); err != nil {
@@ -1014,7 +1107,7 @@ func (t *Transaction) Delete(val interface{}) error {
 	return nil
 }
 
-// DeleteMulti deletes multiple entities within the transaction.
+// DeleteMulti removes multiple entities within the transaction.
 func (t *Transaction) DeleteMulti(vals interface{}) error {
 	v := reflect.ValueOf(vals)
 	if v.Kind() != reflect.Slice {
@@ -1042,7 +1135,10 @@ func (t *Transaction) DeleteMulti(vals interface{}) error {
 	return nil
 }
 
-// Transact runs a function in a transaction.
+// Transact runs f inside a datastore transaction. If f returns nil, the
+// transaction is committed and any pending auto-generated IDs are resolved
+// back into their corresponding structs via [Base.LoadKey]. If f returns
+// an error, the transaction is rolled back.
 func (db *Client) Transact(ctx context.Context, f func(tx *Transaction) error) (*datastore.Commit, error) {
 	var pending []pendingItem
 
@@ -1081,23 +1177,22 @@ func (db *Client) Transact(ctx context.Context, f func(tx *Transaction) error) (
 
 }
 
-// Close closes the underlying store connection.
+// Close closes the underlying datastore and cache connections.
 func (db *Client) Close() error {
 	return db.client.Close()
 }
 
-func (db *Client) Client() *ds.Client {
-	return db.client
-}
-
-// RawClient exposes the underlying datastore.Client.
-func (db *Client) RawClient() *datastore.Client {
-	return db.rawClient
-}
-
-// InternalClient exposes the underlying ds.Client.
-func (db *Client) InternalClient() *ds.Client {
-	return db.client
+// Store returns the underlying [ds.Store]. To access backend-specific
+// clients, type-assert to [ds.CloudAccess] or [ds.LocalAccess]:
+//
+//	if ca, ok := db.Store().(ds.CloudAccess); ok {
+//	    raw := ca.DatastoreClient()
+//	}
+//	if la, ok := db.Store().(ds.LocalAccess); ok {
+//	    sqlDB, err := la.DB("")
+//	}
+func (db *Client) Store() ds.Store {
+	return db.client.Store
 }
 
 func loadKeys(v reflect.Value, keys []*datastore.Key) error {
@@ -1117,7 +1212,8 @@ func loadKeys(v reflect.Value, keys []*datastore.Key) error {
 	return nil
 }
 
-// Query executes a query and returns a slice of models.
+// Query is a generic convenience wrapper around [Client.Query] that returns
+// a typed slice. It handles allocation and type assertion internally.
 func Query[T Model](ctx context.Context, db *Client, q *QueryBuilder, cursor string) ([]T, string, error) {
 	var dst []T
 	_, next, err := db.Query(ctx, q, cursor, &dst)
@@ -1127,7 +1223,10 @@ func Query[T Model](ctx context.Context, db *Client, q *QueryBuilder, cursor str
 	return dst, next, nil
 }
 
-// GetMulti loads multiple entities by IDs (int64, string, *datastore.Key) or struct slice.
+// GetMulti is a generic convenience wrapper around [Client.GetMulti] that
+// accepts a slice of IDs (int, int64, string, or *datastore.Key) or model
+// structs and returns a typed slice. Entities that do not exist in the
+// datastore are set to nil in the returned slice.
 func GetMulti[T Model](ctx context.Context, db *Client, ids any) ([]T, error) {
 	v := reflect.ValueOf(ids)
 	if v.Kind() != reflect.Slice {

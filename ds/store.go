@@ -2,6 +2,7 @@ package ds
 
 import (
 	"context"
+	"database/sql"
 
 	"cloud.google.com/go/datastore"
 )
@@ -30,6 +31,26 @@ type Store interface {
 // Mutator is an optional interface for stores that support datastore mutations.
 type Mutator interface {
 	Mutate(ctx context.Context, muts ...*datastore.Mutation) ([]*datastore.Key, error)
+}
+
+// CloudAccess is an optional interface that cloud-backed Store implementations
+// can implement to expose the underlying *datastore.Client:
+//
+//	if ca, ok := store.(CloudAccess); ok {
+//	    dsClient := ca.DatastoreClient()
+//	}
+type CloudAccess interface {
+	DatastoreClient() *datastore.Client
+}
+
+// LocalAccess is an optional interface that local Store implementations
+// can implement to expose the underlying *sql.DB for a given namespace:
+//
+//	if la, ok := store.(LocalAccess); ok {
+//	    db, err := la.DB("")
+//	}
+type LocalAccess interface {
+	DB(namespace string) (*sql.DB, error)
 }
 
 // Filter represents a query filter natively in the ds package.

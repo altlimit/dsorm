@@ -26,6 +26,7 @@ import (
 
 // Compile-time interface assertions
 var _ ds.Store = (*Store)(nil)
+var _ ds.LocalAccess = (*Store)(nil)
 
 type Store struct {
 	basePath string
@@ -94,6 +95,12 @@ func (c *Store) getDB(namespace string) (*sql.DB, error) {
 	c.kindCache[namespace] = make(map[string]bool)
 
 	return db, nil
+}
+
+// DB returns the *sql.DB for the given namespace, creating it if needed.
+// Pass an empty string for the default namespace.
+func (c *Store) DB(namespace string) (*sql.DB, error) {
+	return c.getDB(namespace)
 }
 
 func (c *Store) ensureKind(namespace, kind string, db *sql.DB) error {

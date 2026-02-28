@@ -325,7 +325,7 @@ func testPropertyMarshaling(t *testing.T, testDB *dsorm.Client) {
 	encCtx := context.Background()
 	secret := []byte("different-secret-32-bytes-long!!") // 32 bytes, different from TestMain
 
-	storeOpts := dsorm.WithStore(testDB.InternalClient().Store)
+	storeOpts := dsorm.WithStore(testDB.Store())
 	encDB, err := dsorm.New(encCtx, dsorm.WithEncryptionKey(secret), storeOpts)
 	if err != nil {
 		t.Fatalf("New DB with enc key failed: %v", err)
@@ -343,7 +343,7 @@ func testPropertyMarshaling(t *testing.T, testDB *dsorm.Client) {
 	}
 
 	// Verify encryption in Datastore (raw check)
-	store := encDB.InternalClient().Store
+	store := encDB.Store()
 	// Need key
 	key := encDB.Key(em)
 	var rawProps datastore.PropertyList
@@ -464,7 +464,7 @@ func testDatastoreTags(t *testing.T, testDB *dsorm.Client) {
 	}
 
 	// Verify via Raw Client
-	store := testDB.InternalClient().Store
+	store := testDB.Store()
 	// Need key - use db.Key to generate it as we rely on ID
 	key := testDB.Key(m)
 	var rawProps datastore.PropertyList
