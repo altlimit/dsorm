@@ -2,7 +2,7 @@
 
 # dsorm
 
-`dsorm` is a high-performance Go ORM for Google Cloud Datastore with built-in caching support (Memory, Redis, Memcache). It extends the official client with lifecycle hooks, struct tags for keys, field encryption, and a robust caching layer to minimize Datastore costs and latency.
+`dsorm` is a high-performance Go ORM for Google Cloud Datastore with built-in caching support (Memory, Redis, Memcache). It extends the official client with lifecycle hooks, struct tags for keys, field encryption, a robust caching layer to minimize Datastore costs and latency, and an application-level cache utility with rate limiting and JSON helpers.
 
 ## Features
 
@@ -186,6 +186,46 @@ func (u *User) AfterSave(ctx context.Context, old dsorm.Model) error   { ... }
 func (u *User) BeforeDelete(ctx context.Context) error                 { ... }
 func (u *User) AfterDelete(ctx context.Context) error                  { ... }
 func (u *User) OnLoad(ctx context.Context) error                       { ... }
+```
+
+### 7. Cache Utility
+
+The `cache` package (`github.com/altlimit/dsorm/cache`) provides an application-level caching layer on top of any `ds.Cache` backend (Memory, Redis, Memcache). It simplifies single-key operations, adds atomic increment, typed JSON helpers, and built-in rate limiting.
+
+```go
+import (
+    dscache "github.com/altlimit/dsorm/cache"
+    "github.com/altlimit/dsorm/cache/memory"
+    "github.com/altlimit/dsorm/cache/redis"
+)
+
+// Wrap any ds.Cache backend
+c := dscache.New(memory.NewCache())
+// or
+redisCache, _ := redis.NewCache("localhost:6379")
+c = dscache.New(redisCache)
+
+// Single-key operations
+err := c.Set(ctx, "user:alice", []byte(`{"name":"Alice"}`), 5*time.Minute)
+item, err := c.Get(ctx, "user:alice")  // returns *ds.Item or ds.ErrCacheMiss
+err = c.Delete(ctx, "user:alice")
+
+// Atomic increment (creates key if missing)
+count, err := c.Increment(ctx, "page:views", 1, 24*time.Hour)
+
+// Typed JSON helpers (generics)
+type Profile struct { Name string; Score int }
+err = dscache.Save(ctx, c, "profile:alice", Profile{Name: "Alice", Score: 42}, time.Hour)
+profile, err := dscache.Load[Profile](ctx, c, "profile:alice")
+
+// Rate limiting
+result, err := c.RateLimit(ctx, "api:user:alice", 100, time.Minute)
+if !result.Allowed {
+    // result.Remaining == 0, result.ResetAt tells when the window resets
+}
+
+// Access the underlying ds.Cache for batch operations
+raw := c.Unwrap()
 ```
 
 ## Configuration

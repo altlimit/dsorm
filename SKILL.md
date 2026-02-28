@@ -29,7 +29,11 @@ dsorm/
 │   ├── ds.go         # Shared utilities
 │   └── local/
 │       └── local.go  # SQLite adapter (separate package, optional dependency)
-├── cache/            # Cache backends (memory, redis, memcache)
+├── cache/
+│   ├── cache.go      # Application-level Cache interface, New(), Load/Save, RateLimit
+│   ├── memory/       # In-memory LRU backend
+│   ├── redis/        # Redis/Valkey backend
+│   └── memcache/     # AppEngine Memcache backend
 └── internal/         # encryption, structtag, util
 ```
 
@@ -210,6 +214,58 @@ type AfterDelete interface {
 type OnLoad interface {
     OnLoad(ctx context.Context) error  // Called after Get/GetMulti
 }
+```
+
+## Cache Utility
+
+The `cache` package (`github.com/altlimit/dsorm/cache`) wraps any `ds.Cache` backend into a convenient application-level API with single-key operations, atomic increment, typed JSON helpers, and rate limiting.
+
+```go
+import (
+    dscache "github.com/altlimit/dsorm/cache"
+    "github.com/altlimit/dsorm/cache/memory"
+    "github.com/altlimit/dsorm/cache/redis"
+)
+
+// Wrap any ds.Cache backend
+c := dscache.New(memory.NewCache())
+// or with Redis
+redisCache, _ := redis.NewCache("localhost:6379")
+c = dscache.New(redisCache)
+```
+
+### Single-Key Operations
+
+```go
+err := c.Set(ctx, "user:alice", []byte(`{"name":"Alice"}`), 5*time.Minute)
+item, err := c.Get(ctx, "user:alice")  // returns *ds.Item; ds.ErrCacheMiss if missing
+err = c.Delete(ctx, "user:alice")
+count, err := c.Increment(ctx, "views", 1, 24*time.Hour)  // atomic; creates key if missing
+```
+
+### Typed JSON Helpers (Generics)
+
+```go
+type Profile struct { Name string; Score int }
+err := dscache.Save(ctx, c, "profile:alice", Profile{Name: "Alice", Score: 42}, time.Hour)
+profile, err := dscache.Load[Profile](ctx, c, "profile:alice")
+```
+
+### Rate Limiting
+
+```go
+result, err := c.RateLimit(ctx, "api:user:alice", 100, time.Minute)
+if !result.Allowed {
+    // result.Remaining == 0, result.ResetAt tells when the window resets
+}
+```
+
+### Unwrap
+
+Access the underlying `ds.Cache` for batch operations:
+
+```go
+raw := c.Unwrap() // returns ds.Cache
 ```
 
 ## SQLite Backend
