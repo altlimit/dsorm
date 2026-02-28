@@ -84,3 +84,8 @@ func (c *Client) onError(ctx context.Context, err error) {
 func (c *Client) Close() error {
 	return c.Store.Close()
 }
+
+// Cacher returns the underlying Cache implementation used by the client.
+func (c *Client) Cacher() Cache {
+	return c.cacher
+}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/datastore"
+	"github.com/altlimit/dsorm/cache"
 	"github.com/altlimit/dsorm/cache/memcache"
 	"github.com/altlimit/dsorm/cache/memory"
 	"github.com/altlimit/dsorm/cache/redis"
@@ -459,6 +460,12 @@ type Client struct {
 	encKey []byte
 }
 
+// Cache returns an application-level cache.Cache for general-purpose
+// caching operations (Get, Set, Delete, Load, Save, RateLimit, etc).
+func (c *Client) Cache() cache.Cache {
+	return cache.New(c.client.Cacher())
+}
+
 type options struct {
 	projectID       string
 	cache           ds.Cache
@@ -557,11 +564,7 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 		if appengine.IsAppEngine() || appengine.IsDevAppServer() {
 			o.cache = memcache.NewCache()
 		} else if redisAddr := os.Getenv("REDIS_ADDR"); redisAddr != "" {
-			pool, err := redis.NewPool(redisAddr, "", 0)
-			if err != nil {
-				return nil, err
-			}
-			o.cache, err = redis.NewCache(ctx, pool)
+			o.cache, err = redis.NewCache(redisAddr)
 			if err != nil {
 				return nil, err
 			}
@@ -593,9 +596,9 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 	}, nil
 }
 
-func (db *Client) context(ctx context.Context) context.Context {
-	if db.encKey != nil && ctx.Value(encryptionKeyKey) == nil {
-		return context.WithValue(ctx, encryptionKeyKey, db.encKey)
+func (c *Client) context(ctx context.Context) context.Context {
+	if c.encKey != nil && ctx.Value(encryptionKeyKey) == nil {
+		return context.WithValue(ctx, encryptionKeyKey, c.encKey)
 	}
 	return ctx
 }
@@ -603,13 +606,13 @@ func (db *Client) context(ctx context.Context) context.Context {
 // Keys returns a slice of datastore keys derived from a slice of model
 // structs. Each entity's key is built from its model:"id", model:"parent",
 // and model:"ns" struct tags.
-func (db *Client) Keys(val interface{}) []*datastore.Key {
+func (c *Client) Keys(val interface{}) []*datastore.Key {
 	t := reflect.TypeOf(val)
 	var keys []*datastore.Key
 	if t.Kind() == reflect.Slice {
 		v := reflect.ValueOf(val)
 		for i := 0; i < v.Len(); i++ {
-			keys = append(keys, db.Key(v.Index(i).Interface()))
+			keys = append(keys, c.Key(v.Index(i).Interface()))
 		}
 	}
 	return keys
@@ -618,7 +621,7 @@ func (db *Client) Keys(val interface{}) []*datastore.Key {
 // Key returns the datastore key for a single model struct. The key is
 // constructed from the struct's model:"id" (string or int64), model:"parent"
 // (datastore.Key or parent model pointer), and model:"ns" (namespace) tags.
-func (db *Client) Key(val interface{}) *datastore.Key {
+func (c *Client) Key(val interface{}) *datastore.Key {
 	t := reflect.TypeOf(val)
 	v := reflect.ValueOf(val)
 	if t.Kind() == reflect.Ptr {
@@ -645,7 +648,7 @@ func (db *Client) Key(val interface{}) *datastore.Key {
 					key.Namespace = p.Namespace
 				}
 			} else if vv.Kind() == reflect.Ptr && !vv.IsNil() && vv.Elem().Kind() == reflect.Struct {
-				p := db.Key(vv.Interface())
+				p := c.Key(vv.Interface())
 				key.Parent = p
 				if p != nil && p.Namespace != "" {
 					key.Namespace = p.Namespace
@@ -670,13 +673,13 @@ func (db *Client) Key(val interface{}) *datastore.Key {
 // is derived from val's struct tags (see [Client.Key]). After loading, the
 // entity's [Base.LoadKey] is called to map the key back into the struct
 // fields.
-func (db *Client) Get(ctx context.Context, val interface{}) error {
-	ctx = db.context(ctx)
+func (c *Client) Get(ctx context.Context, val interface{}) error {
+	ctx = c.context(ctx)
 	if err := initModel(ctx, val); err != nil {
 		return err
 	}
-	key := db.Key(val)
-	if err := db.client.Get(ctx, key, val); err != nil {
+	key := c.Key(val)
+	if err := c.client.Get(ctx, key, val); err != nil {
 		return err
 	}
 	if v, ok := val.(datastore.KeyLoader); ok {
@@ -691,13 +694,13 @@ func (db *Client) Get(ctx context.Context, val interface{}) error {
 // slice of pointer-to-struct (e.g. []*MyModel). Entities that do not
 // exist in the datastore are set to nil in the slice rather than
 // returning an error. Only non-ErrNoSuchEntity errors are returned.
-func (db *Client) GetMulti(ctx context.Context, vals interface{}) error {
-	ctx = db.context(ctx)
+func (c *Client) GetMulti(ctx context.Context, vals interface{}) error {
+	ctx = c.context(ctx)
 	v := reflect.ValueOf(vals)
 	if v.Kind() != reflect.Slice {
 		return fmt.Errorf("datastore.DB.GetMulti: must be slice type not '%v'", v.Kind())
 	}
-	keys := db.Keys(vals)
+	keys := c.Keys(vals)
 	for i, k := range keys {
 		if k != nil {
 			vv := v.Index(i)
@@ -708,7 +711,7 @@ func (db *Client) GetMulti(ctx context.Context, vals interface{}) error {
 			}
 		}
 	}
-	err := db.client.GetMulti(ctx, keys, vals)
+	err := c.client.GetMulti(ctx, keys, vals)
 	if err != nil {
 		if mErr, ok := err.(datastore.MultiError); ok {
 			for i, e := range mErr {
@@ -733,13 +736,13 @@ func (db *Client) GetMulti(ctx context.Context, vals interface{}) error {
 // a successful save. If val implements [BeforeSave], it is called before
 // writing. If val implements [AfterSave], it is called after writing with
 // the previous state of the entity.
-func (db *Client) Put(ctx context.Context, val interface{}) error {
-	ctx = db.context(ctx)
+func (c *Client) Put(ctx context.Context, val interface{}) error {
+	ctx = c.context(ctx)
 	if err := initModel(ctx, val); err != nil {
 		return err
 	}
-	k := db.Key(val)
-	k, err := db.client.Put(ctx, k, val)
+	k := c.Key(val)
+	k, err := c.client.Put(ctx, k, val)
 	if err != nil {
 		return err
 	}
@@ -763,8 +766,8 @@ func (db *Client) Put(ctx context.Context, val interface{}) error {
 // of pointer-to-struct. Auto-generated IDs are written back into each
 // struct. [BeforeSave] and [AfterSave] hooks are called for each entity
 // that implements them. AfterSave hooks run concurrently.
-func (db *Client) PutMulti(ctx context.Context, vals interface{}) error {
-	ctx = db.context(ctx)
+func (c *Client) PutMulti(ctx context.Context, vals interface{}) error {
+	ctx = c.context(ctx)
 	v := reflect.ValueOf(vals)
 	if v.Kind() != reflect.Slice {
 		return fmt.Errorf("datastore.DB.PutMulti: must be slice type not '%v'", v.Kind())
@@ -778,8 +781,8 @@ func (db *Client) PutMulti(ctx context.Context, vals interface{}) error {
 
 		if a, ok := e.(AfterSave); ok {
 			// capture closure for AfterSave execution later
-			// db.Key(e) gives us current state key
-			k := db.Key(e)
+			// c.Key(e) gives us current state key
+			k := c.Key(e)
 			old, err := reconstructOldModel(ctx, e, k)
 			if err != nil {
 				return err
@@ -790,8 +793,8 @@ func (db *Client) PutMulti(ctx context.Context, vals interface{}) error {
 			})
 		}
 	}
-	keys := db.Keys(vals)
-	keys, err := db.client.PutMulti(ctx, keys, vals)
+	keys := c.Keys(vals)
+	keys, err := c.client.PutMulti(ctx, keys, vals)
 	if err != nil {
 		return err
 	}
@@ -811,14 +814,14 @@ func (db *Client) PutMulti(ctx context.Context, vals interface{}) error {
 // Delete removes a single entity from the datastore. If val implements
 // [BeforeDelete], it is called before deletion. If val implements
 // [AfterDelete], it is called after successful deletion.
-func (db *Client) Delete(ctx context.Context, val interface{}) error {
-	ctx = db.context(ctx)
+func (c *Client) Delete(ctx context.Context, val interface{}) error {
+	ctx = c.context(ctx)
 	if bd, ok := val.(BeforeDelete); ok {
 		if err := bd.BeforeDelete(ctx); err != nil {
 			return err
 		}
 	}
-	err := db.client.Delete(ctx, db.Key(val))
+	err := c.client.Delete(ctx, c.Key(val))
 	if err != nil {
 		return err
 	}
@@ -831,11 +834,11 @@ func (db *Client) Delete(ctx context.Context, val interface{}) error {
 // DeleteMulti removes multiple entities from the datastore. vals can be
 // a slice of model structs or a []*datastore.Key. [BeforeDelete] and
 // [AfterDelete] hooks are called for each entity that implements them.
-func (db *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
-	ctx = db.context(ctx)
+func (c *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
+	ctx = c.context(ctx)
 	v := reflect.ValueOf(vals)
 	if v.Kind() != reflect.Slice {
-		return fmt.Errorf("datastore.db.DeleteMulti: must be slice type not '%v'", v.Kind())
+		return fmt.Errorf("datastore.c.DeleteMulti: must be slice type not '%v'", v.Kind())
 	}
 
 	// BeforeDelete Hooks
@@ -852,9 +855,9 @@ func (db *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
 	if vKeys, ok := vals.([]*datastore.Key); ok {
 		keys = vKeys
 	} else {
-		keys = db.Keys(vals)
+		keys = c.Keys(vals)
 	}
-	if err := db.client.DeleteMulti(ctx, keys); err != nil {
+	if err := c.client.DeleteMulti(ctx, keys); err != nil {
 		return err
 	}
 
@@ -881,8 +884,8 @@ func (db *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
 // is non-nil, it must be a pointer to a slice (e.g. *[]*MyModel) and will
 // be populated with the loaded entities. The returned string is the cursor
 // for pagination; pass it back as the cursor argument to resume.
-func (db *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals interface{}) ([]*datastore.Key, string, error) {
-	ctx = db.context(ctx)
+func (c *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals interface{}) ([]*datastore.Key, string, error) {
+	ctx = c.context(ctx)
 	var keys []*datastore.Key
 	var v reflect.Value
 	if vals != nil {
@@ -899,7 +902,7 @@ func (db *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, val
 		q = q.Start(cursor)
 	}
 	q = q.KeysOnly()
-	it := db.client.Run(ctx, q)
+	it := c.client.Run(ctx, q)
 	for {
 		k, err := it.Next(nil)
 		if err == iterator.Done {
@@ -930,7 +933,7 @@ func (db *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, val
 			if err := loadKeys(vSlice, keys); err != nil {
 				return nil, "", err
 			}
-			if err := db.GetMulti(ctx, vSlice.Interface()); err != nil {
+			if err := c.GetMulti(ctx, vSlice.Interface()); err != nil {
 				return nil, "", err
 			}
 		}
@@ -1139,13 +1142,13 @@ func (t *Transaction) DeleteMulti(vals interface{}) error {
 // transaction is committed and any pending auto-generated IDs are resolved
 // back into their corresponding structs via [Base.LoadKey]. If f returns
 // an error, the transaction is rolled back.
-func (db *Client) Transact(ctx context.Context, f func(tx *Transaction) error) (*datastore.Commit, error) {
+func (c *Client) Transact(ctx context.Context, f func(tx *Transaction) error) (*datastore.Commit, error) {
 	var pending []pendingItem
 
-	cmt, err := db.client.RunInTransaction(ctx, func(tx *ds.Transaction) error {
+	cmt, err := c.client.RunInTransaction(ctx, func(tx *ds.Transaction) error {
 		dsormTx := &Transaction{
 			tx:     tx,
-			client: db,
+			client: c,
 			ctx:    ctx,
 		}
 		if err := f(dsormTx); err != nil {
@@ -1178,21 +1181,21 @@ func (db *Client) Transact(ctx context.Context, f func(tx *Transaction) error) (
 }
 
 // Close closes the underlying datastore and cache connections.
-func (db *Client) Close() error {
-	return db.client.Close()
+func (c *Client) Close() error {
+	return c.client.Close()
 }
 
 // Store returns the underlying [ds.Store]. To access backend-specific
 // clients, type-assert to [ds.CloudAccess] or [ds.LocalAccess]:
 //
-//	if ca, ok := db.Store().(ds.CloudAccess); ok {
+//	if ca, ok := c.Store().(ds.CloudAccess); ok {
 //	    raw := ca.DatastoreClient()
 //	}
-//	if la, ok := db.Store().(ds.LocalAccess); ok {
+//	if la, ok := c.Store().(ds.LocalAccess); ok {
 //	    sqlDB, err := la.DB("")
 //	}
-func (db *Client) Store() ds.Store {
-	return db.client.Store
+func (c *Client) Store() ds.Store {
+	return c.client.Store
 }
 
 func loadKeys(v reflect.Value, keys []*datastore.Key) error {
@@ -1214,9 +1217,9 @@ func loadKeys(v reflect.Value, keys []*datastore.Key) error {
 
 // Query is a generic convenience wrapper around [Client.Query] that returns
 // a typed slice. It handles allocation and type assertion internally.
-func Query[T Model](ctx context.Context, db *Client, q *QueryBuilder, cursor string) ([]T, string, error) {
+func Query[T Model](ctx context.Context, c *Client, q *QueryBuilder, cursor string) ([]T, string, error) {
 	var dst []T
-	_, next, err := db.Query(ctx, q, cursor, &dst)
+	_, next, err := c.Query(ctx, q, cursor, &dst)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1227,7 +1230,7 @@ func Query[T Model](ctx context.Context, db *Client, q *QueryBuilder, cursor str
 // accepts a slice of IDs (int, int64, string, or *datastore.Key) or model
 // structs and returns a typed slice. Entities that do not exist in the
 // datastore are set to nil in the returned slice.
-func GetMulti[T Model](ctx context.Context, db *Client, ids any) ([]T, error) {
+func GetMulti[T Model](ctx context.Context, c *Client, ids any) ([]T, error) {
 	v := reflect.ValueOf(ids)
 	if v.Kind() != reflect.Slice {
 		return nil, fmt.Errorf("dsorm.GetMulti: ids must be a slice, got %v", v.Kind())
@@ -1257,7 +1260,7 @@ func GetMulti[T Model](ctx context.Context, db *Client, ids any) ([]T, error) {
 		default:
 			// check if it's a struct or ptr to struct, assume it's a Model we can derive key from
 			if item.Kind() == reflect.Struct || (item.Kind() == reflect.Ptr && item.Elem().Kind() == reflect.Struct) {
-				keys[i] = db.Key(val)
+				keys[i] = c.Key(val)
 			} else {
 				return nil, fmt.Errorf("dsorm.GetMulti: unsupported ID type at index %d: %T", i, val)
 			}
@@ -1278,7 +1281,7 @@ func GetMulti[T Model](ctx context.Context, db *Client, ids any) ([]T, error) {
 	if err := loadKeys(dstVal, keys); err != nil {
 		return nil, err
 	}
-	if err := db.GetMulti(ctx, dst); err != nil {
+	if err := c.GetMulti(ctx, dst); err != nil {
 		return nil, err
 	}
 	return dst, nil

@@ -54,6 +54,11 @@ type Cache interface {
 
 	// SetMulti sets items blindly. Returns error per item on failure.
 	SetMulti(ctx context.Context, items []*Item) error
+
+	// Increment atomically increments a key's integer value by delta.
+	// Returns the new value after incrementing. Creates the key with
+	// value=delta and the given expiration if the key does not exist.
+	Increment(ctx context.Context, key string, delta int64, expiration time.Duration) (int64, error)
 }
 
 // Item cache entry.

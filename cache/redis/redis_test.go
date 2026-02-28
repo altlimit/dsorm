@@ -6,13 +6,12 @@ import (
 	"testing"
 	"time"
 
-	dso "github.com/altlimit/dsorm/ds"
 	"github.com/altlimit/dsorm/cache/redis"
-	redigo "github.com/opencensus-integrations/redigo/redis"
+	dso "github.com/altlimit/dsorm/ds"
+	"github.com/valkey-io/valkey-go"
 )
 
 var (
-	redisPool  *redigo.Pool
 	redisAddr  = os.Getenv("REDIS_ADDR")
 	goodClient dso.Cache
 )
@@ -28,44 +27,20 @@ func TestRedisCache(t *testing.T) {
 		redisAddr = "localhost:6379"
 	}
 
-	redisPool = &redigo.Pool{
-		Dial: func() (redigo.Conn, error) {
-			return redigo.Dial("tcp", redisAddr, redigo.DialReadTimeout(time.Second))
-		},
-	}
-
-	client, err := redis.NewCache(context.Background(), redisPool)
+	client, err := redis.NewCache(redisAddr)
 	if err != nil {
-		t.Fatalf("cannot test redis, error connecting to pool: %v", err)
+		t.Fatalf("cannot test redis, error connecting: %v", err)
 	}
 	goodClient = client
 
 	t.Run("TestNewCache", NewCacheTest())
+	t.Run("TestIncrement", IncrementTest())
 }
 
 func NewCacheTest() func(t *testing.T) {
-	badPool := &redigo.Pool{
-		Dial: func() (redigo.Conn, error) {
-			return redigo.Dial("tcp", "badaddress:999", redigo.DialReadTimeout(time.Second))
-		},
-	}
-
-	closingPool := &redigo.Pool{
-		Wait:      true,
-		MaxActive: 1,
-		Dial: func() (redigo.Conn, error) {
-			conn, err := redigo.Dial("tcp", redisAddr, redigo.DialReadTimeout(time.Second))
-			if err == nil {
-				err = conn.Close()
-			}
-			return conn, err
-		},
-	}
-
 	ctx := context.Background()
 	type args struct {
-		ctx  context.Context
-		pool *redigo.Pool
+		addr string
 	}
 	var tests = []struct {
 		name      string
@@ -75,24 +50,14 @@ func NewCacheTest() func(t *testing.T) {
 		{
 			"Good Client",
 			args{
-				ctx:  ctx,
-				pool: redisPool,
+				addr: redisAddr,
 			},
 			false,
 		},
 		{
-			"Bad Pool",
+			"Bad Address",
 			args{
-				ctx:  ctx,
-				pool: badPool,
-			},
-			true,
-		},
-		{
-			"Closing Pool",
-			args{
-				ctx:  ctx,
-				pool: closingPool,
+				addr: "badaddress:999",
 			},
 			true,
 		},
@@ -100,10 +65,60 @@ func NewCacheTest() func(t *testing.T) {
 	return func(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
-				if _, err := redis.NewCache(tt.in.ctx, tt.in.pool); (err != nil) != tt.expectErr {
+				ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+				defer cancel()
+				_ = ctx
+				if _, err := redis.NewCache(tt.in.addr); (err != nil) != tt.expectErr {
 					t.Errorf("expectErr = %v, err = %v", tt.expectErr, err)
 				}
 			})
 		}
+	}
+}
+
+func IncrementTest() func(t *testing.T) {
+	return func(t *testing.T) {
+		if goodClient == nil {
+			t.Skip("no redis client")
+		}
+		ctx := context.Background()
+
+		// Flush the test key
+		vClient, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{redisAddr}})
+		if err != nil {
+			t.Fatalf("failed to create client for cleanup: %v", err)
+		}
+		defer vClient.Close()
+		vClient.Do(ctx, vClient.B().Del().Key("test:incr").Build())
+
+		// Test increment from zero
+		val, err := goodClient.Increment(ctx, "test:incr", 1, time.Minute)
+		if err != nil {
+			t.Fatalf("Increment failed: %v", err)
+		}
+		if val != 1 {
+			t.Errorf("expected 1, got %d", val)
+		}
+
+		// Test increment again
+		val, err = goodClient.Increment(ctx, "test:incr", 5, time.Minute)
+		if err != nil {
+			t.Fatalf("Increment failed: %v", err)
+		}
+		if val != 6 {
+			t.Errorf("expected 6, got %d", val)
+		}
+
+		// Test negative delta
+		val, err = goodClient.Increment(ctx, "test:incr", -2, time.Minute)
+		if err != nil {
+			t.Fatalf("Increment failed: %v", err)
+		}
+		if val != 4 {
+			t.Errorf("expected 4, got %d", val)
+		}
+
+		// Cleanup
+		vClient.Do(ctx, vClient.B().Del().Key("test:incr").Build())
 	}
 }

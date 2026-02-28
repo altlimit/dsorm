@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/opencensus-integrations/redigo/redis"
+	"github.com/valkey-io/valkey-go"
 
 	dsorm "github.com/altlimit/dsorm/ds"
 )
@@ -34,70 +34,87 @@ const (
 	else
 		return redis.error_reply("cas conflict")
 	end`
+
+	incrScript = `local val = redis.call("INCRBY", KEYS[1], ARGV[1])
+	if tonumber(ARGV[2]) > 0 then
+		redis.call("PEXPIRE", KEYS[1], ARGV[2])
+	end
+	return val`
 )
 
-// NewPool creates a new redis pool
-func NewPool(address, password string, db int) (*redis.Pool, error) {
-	return &redis.Pool{
-		MaxIdle:     3,
-		IdleTimeout: 240 * time.Second,
-		Dial: func() (redis.Conn, error) {
-			c, err := redis.Dial("tcp", address)
-			if err != nil {
-				return nil, err
-			}
-			if password != "" {
-				if _, err := c.Do("AUTH", password); err != nil {
-					c.Close()
-					return nil, err
-				}
-			}
-			if db != 0 {
-				if _, err := c.Do("SELECT", db); err != nil {
-					c.Close()
-					return nil, err
-				}
-			}
-			return c, nil
-		},
-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
-			if time.Since(t) < time.Minute {
-				return nil
-			}
-			_, err := c.Do("PING")
-			return err
-		},
-	}, nil
+// Option configures a redis cache backend.
+type Option func(*backend)
+
+// WithPassword sets the password for the redis connection.
+func WithPassword(password string) Option {
+	return func(b *backend) {
+		b.password = password
+	}
 }
 
-// NewCache will return a dsorm.Cache backed by
-// the provided redis pool. It will try and load a script
-// into the redis script cache and return an error if it is
-// unable to. Anytime the redis script cache is flushed, a new
-// redis dsorm.Cache must be initialized to reload the script.
-func NewCache(ctx context.Context, pool *redis.Pool) (n dsorm.Cache, err error) {
-	conn := pool.GetWithContext(ctx).(redis.ConnWithContext)
+// WithDB selects the redis database index.
+func WithDB(db int) Option {
+	return func(b *backend) {
+		b.db = db
+	}
+}
 
-	defer func() {
-		if cerr := conn.CloseContext(ctx); cerr != nil && err == nil {
-			err = cerr
-		}
-	}()
-
-	b := backend{store: pool}
-
-	if b.casSha, err = redis.String(conn.DoContext(ctx, "SCRIPT", "LOAD", casScript)); err != nil {
-		return
+// NewCache creates a new dsorm.Cache backed by Redis/Valkey.
+// addr is the address of the Redis/Valkey server (e.g. "localhost:6379").
+func NewCache(addr string, opts ...Option) (dsorm.Cache, error) {
+	b := &backend{}
+	for _, opt := range opts {
+		opt(b)
 	}
 
-	n = &b
+	clientOpts := valkey.ClientOption{
+		InitAddress: []string{addr},
+	}
+	if b.password != "" {
+		clientOpts.Password = b.password
+	}
+	if b.db != 0 {
+		clientOpts.SelectDB = b.db
+	}
 
-	return
+	client, err := valkey.NewClient(clientOpts)
+	if err != nil {
+		return nil, fmt.Errorf("redis: failed to create client: %w", err)
+	}
+
+	b.client = client
+	b.ownsClient = true
+
+	// Validate connectivity
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Do(ctx, client.B().Ping().Build()).Error(); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("redis: ping failed: %w", err)
+	}
+
+	return b, nil
+}
+
+// NewCacheFromClient creates a dsorm.Cache from an existing valkey.Client.
+// This is useful for advanced configurations (cluster, sentinel, etc).
+// The caller retains ownership of the client and must close it themselves.
+func NewCacheFromClient(client valkey.Client) dsorm.Cache {
+	return &backend{client: client}
 }
 
 type backend struct {
-	store  *redis.Pool
-	casSha string
+	client     valkey.Client
+	ownsClient bool
+	password   string
+	db         int
+}
+
+// Close releases the underlying client if it was created by NewCache.
+func (b *backend) Close() {
+	if b.ownsClient && b.client != nil {
+		b.client.Close()
+	}
 }
 
 var bufPool = sync.Pool{
@@ -106,102 +123,164 @@ var bufPool = sync.Pool{
 	},
 }
 
-func (b *backend) AddMulti(ctx context.Context, items []*dsorm.Item) (err error) {
-	redisConn := b.store.GetWithContext(ctx).(redis.ConnWithContext)
+func (b *backend) AddMulti(ctx context.Context, items []*dsorm.Item) error {
+	if len(items) == 0 {
+		return nil
+	}
 
+	cmds := make(valkey.Commands, 0, len(items))
+	buf := bufPool.Get().(*bytes.Buffer)
 	defer func() {
-		if cerr := redisConn.CloseContext(ctx); cerr != nil && err == nil {
-			err = cerr
-		}
-	}()
-
-	err = set(ctx, redisConn, true, items)
-
-	return
-}
-
-func set(ctx context.Context, conn redis.ConnWithContext, nx bool, items []*dsorm.Item) error {
-	me := make(dsorm.MultiError, len(items))
-	meChan := make(chan error, len(items))
-
-	hasErr := false
-	var flushErr error
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		defer close(meChan)
-
-		buf := bufPool.Get().(*bytes.Buffer)
-	Loop:
-		for _, item := range items {
-			select {
-			case <-ctx.Done():
-				break Loop
-			default:
-			}
-			buf.Reset()
-			buf.Grow(4 + len(item.Value))
-			_ = binary.Write(buf, binary.LittleEndian, item.Flags) // Always returns nil since we're using bytes.Buffer
-			_, _ = buf.Write(item.Value)
-
-			args := []interface{}{item.Key, buf.Bytes()}
-			if nx {
-				args = append(args, "NX")
-			}
-
-			if item.Expiration != 0 {
-				expire := item.Expiration.Truncate(time.Millisecond) / time.Millisecond
-				args = append(args, "PX", int64(expire))
-			}
-
-			if err := conn.SendContext(ctx, "SET", args...); err != nil {
-				meChan <- err
-			}
-		}
-		flushErr = conn.FlushContext(ctx)
 		if buf.Cap() <= maxCacheSize {
 			bufPool.Put(buf)
 		}
 	}()
 
-	go func() {
-		defer wg.Done()
-	Loop2:
-		for i := 0; i < len(items); i++ {
-			select {
-			case <-ctx.Done():
-				break Loop2
-			case me[i] = <-meChan:
-			default:
-			}
+	for _, item := range items {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		buf.Reset()
+		buf.Grow(4 + len(item.Value))
+		_ = binary.Write(buf, binary.LittleEndian, item.Flags)
+		_, _ = buf.Write(item.Value)
 
-			if me[i] != nil {
-				// We couldn't queue the command so don't expect it's response
-				hasErr = true
-				continue
+		// Copy bytes since buf is reused across iterations
+		data := append([]byte(nil), buf.Bytes()...)
+		cmd := b.client.B().Set().Key(item.Key).Value(valkey.BinaryString(data)).Nx()
+		if item.Expiration != 0 {
+			cmds = append(cmds, cmd.Px(item.Expiration).Build())
+		} else {
+			cmds = append(cmds, cmd.Build())
+		}
+	}
+
+	resps := b.client.DoMulti(ctx, cmds...)
+	me := make(dsorm.MultiError, len(items))
+	hasErr := false
+	for i, resp := range resps {
+		if err := resp.Error(); err != nil {
+			if valkey.IsValkeyNil(err) {
+				me[i] = dsorm.ErrNotStored
+			} else {
+				me[i] = err
 			}
-			if _, err := redis.String(conn.ReceiveContext(ctx)); err != nil {
-				if nx && err == redis.ErrNil {
-					me[i] = dsorm.ErrNotStored
-				} else {
-					me[i] = err
-				}
-				hasErr = true
-			}
+			hasErr = true
+		}
+	}
+	if hasErr {
+		return me
+	}
+	return nil
+}
+
+func (b *backend) SetMulti(ctx context.Context, items []*dsorm.Item) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	cmds := make(valkey.Commands, 0, len(items))
+	buf := bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		if buf.Cap() <= maxCacheSize {
+			bufPool.Put(buf)
 		}
 	}()
 
-	wg.Wait()
+	for _, item := range items {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		buf.Reset()
+		buf.Grow(4 + len(item.Value))
+		_ = binary.Write(buf, binary.LittleEndian, item.Flags)
+		_, _ = buf.Write(item.Value)
 
-	if ctx.Err() != nil {
-		return ctx.Err()
+		// Copy bytes since buf is reused across iterations
+		data := append([]byte(nil), buf.Bytes()...)
+		if item.Expiration != 0 {
+			cmds = append(cmds, b.client.B().Set().Key(item.Key).Value(valkey.BinaryString(data)).Px(item.Expiration).Build())
+		} else {
+			cmds = append(cmds, b.client.B().Set().Key(item.Key).Value(valkey.BinaryString(data)).Build())
+		}
 	}
 
-	if flushErr != nil {
-		return flushErr
+	resps := b.client.DoMulti(ctx, cmds...)
+	me := make(dsorm.MultiError, len(items))
+	hasErr := false
+	for i, resp := range resps {
+		if err := resp.Error(); err != nil {
+			me[i] = err
+			hasErr = true
+		}
+	}
+	if hasErr {
+		return me
+	}
+	return nil
+}
+
+func (b *backend) CompareAndSwapMulti(ctx context.Context, items []*dsorm.Item) error {
+	if len(items) == 0 {
+		return nil
+	}
+
+	me := make(dsorm.MultiError, len(items))
+	hasErr := false
+
+	buf := bufPool.Get().(*bytes.Buffer)
+	defer func() {
+		if buf.Cap() <= maxCacheSize {
+			bufPool.Put(buf)
+		}
+	}()
+
+	for i, item := range items {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		cas, ok := item.GetCASInfo().([]byte)
+		if !ok || cas == nil {
+			me[i] = dsorm.ErrNotStored
+			hasErr = true
+			continue
+		}
+
+		buf.Reset()
+		buf.Grow(4 + len(item.Value))
+		_ = binary.Write(buf, binary.LittleEndian, item.Flags)
+		_, _ = buf.Write(item.Value)
+
+		// Copy bytes since buf is reused across iterations
+		data := append([]byte(nil), buf.Bytes()...)
+
+		expire := int64(item.Expiration / time.Millisecond)
+		if item.Expiration == 0 {
+			expire = -1
+		}
+
+		resp := b.client.Do(ctx, b.client.B().Eval().Script(casScript).Numkeys(1).Key(item.Key).Arg(
+			valkey.BinaryString(cas),
+			valkey.BinaryString(data),
+			fmt.Sprintf("%d", expire),
+		).Build())
+
+		if err := resp.Error(); err != nil {
+			if valkey.IsValkeyNil(err) {
+				me[i] = dsorm.ErrNotStored
+			} else if err.Error() == "cas conflict" {
+				me[i] = dsorm.ErrCASConflict
+			} else {
+				me[i] = err
+			}
+			hasErr = true
+		}
 	}
 
 	if hasErr {
@@ -210,218 +289,115 @@ func set(ctx context.Context, conn redis.ConnWithContext, nx bool, items []*dsor
 	return nil
 }
 
-func (b *backend) CompareAndSwapMulti(ctx context.Context, items []*dsorm.Item) (err error) {
-	redisConn := b.store.GetWithContext(ctx).(redis.ConnWithContext)
-	defer func() {
-		if cerr := redisConn.CloseContext(ctx); cerr != nil && err == nil {
-			err = cerr
-		}
-	}()
+func (b *backend) DeleteMulti(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
 
-	me := make(dsorm.MultiError, len(items))
-	meChan := make(chan error, len(items))
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 
-	hasErr := false
-	var flushErr error
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		defer close(meChan)
-
-		buf := bufPool.Get().(*bytes.Buffer)
-	Loop:
-		for _, item := range items {
-			select {
-			case <-ctx.Done():
-				break Loop
-			default:
-			}
-			if cas, ok := item.GetCASInfo().([]byte); ok && cas != nil {
-				buf.Reset()
-				buf.Grow(4 + len(item.Value))
-				_ = binary.Write(buf, binary.LittleEndian, item.Flags) // Always returns nil since we're using bytes.Buffer
-				_, _ = buf.Write(item.Value)
-				expire := int64(item.Expiration.Truncate(time.Millisecond) / time.Millisecond)
-				if item.Expiration == 0 {
-					expire = -1
-				}
-				if rerr := redisConn.SendContext(ctx, "EVALSHA", b.casSha, "1", item.Key, cas, buf.Bytes(), expire); rerr != nil {
-					meChan <- rerr
-				}
-			} else {
-				meChan <- dsorm.ErrNotStored
-			}
-		}
-		flushErr = redisConn.FlushContext(ctx)
-		if buf.Cap() <= maxCacheSize {
-			bufPool.Put(buf)
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-	Loop2:
-		for i := 0; i < len(items); i++ {
-			select {
-			case <-ctx.Done():
-				break Loop2
-			case me[i] = <-meChan:
-			default:
-			}
-
-			if me[i] != nil {
-				// We couldn't queue the command so don't expect it's response
-				hasErr = true
-				continue
-			}
-			if _, err := redis.String(redisConn.ReceiveContext(ctx)); err != nil {
-				if err == redis.ErrNil {
-					me[i] = dsorm.ErrNotStored
-				} else if err.Error() == "cas conflict" {
-					me[i] = dsorm.ErrCASConflict
-				} else {
-					me[i] = err
-				}
-				hasErr = true
-			}
-		}
-	}()
-
-	wg.Wait()
-
-	err = ctx.Err()
-
+	resp := b.client.Do(ctx, b.client.B().Del().Key(keys...).Build())
+	num, err := resp.AsInt64()
 	if err != nil {
-		return
-	}
-
-	if err = flushErr; err != nil {
-		return
-	}
-
-	if hasErr {
-		err = me
-		return
-	}
-
-	return
-}
-
-func (b *backend) DeleteMulti(ctx context.Context, keys []string) (err error) {
-	redisConn := b.store.GetWithContext(ctx).(redis.ConnWithContext)
-	defer func() {
-		if cerr := redisConn.CloseContext(ctx); cerr != nil && err == nil {
-			err = cerr
-		}
-	}()
-
-	if len(keys) == 0 {
-		return
-	}
-
-	args := make([]interface{}, len(keys))
-	for i, key := range keys {
-		args[i] = key
-	}
-
-	select {
-	case <-ctx.Done():
-		err = ctx.Err()
-		return
-	default:
-	}
-
-	if num, nerr := redis.Int64(redisConn.DoContext(ctx, "DEL", args...)); nerr != nil {
-		err = nerr
 		return err
-	} else if num != int64(len(keys)) {
-		err = fmt.Errorf("redis: expected to remove %d keys, but only removed %d", len(keys), num)
-		return
 	}
-
-	return
+	if num != int64(len(keys)) {
+		return fmt.Errorf("redis: expected to remove %d keys, but only removed %d", len(keys), num)
+	}
+	return nil
 }
 
-func (b *backend) GetMulti(ctx context.Context, keys []string) (result map[string]*dsorm.Item, err error) {
+func (b *backend) GetMulti(ctx context.Context, keys []string) (map[string]*dsorm.Item, error) {
 	if len(keys) == 0 {
-		return
-	}
-	redisConn := b.store.GetWithContext(ctx).(redis.ConnWithContext)
-	defer func() {
-		if cerr := redisConn.CloseContext(ctx); cerr != nil && err == nil {
-			err = cerr
-		}
-	}()
-
-	args := make([]interface{}, len(keys))
-	for i, key := range keys {
-		args[i] = key
+		return nil, nil
 	}
 
 	select {
 	case <-ctx.Done():
-		err = ctx.Err()
-		return
+		return nil, ctx.Err()
 	default:
 	}
 
-	cachedItems, rerr := redis.ByteSlices(redisConn.DoContext(ctx, "MGET", args...))
-	if rerr != nil {
-		err = rerr
-		return
+	resp := b.client.Do(ctx, b.client.B().Mget().Key(keys...).Build())
+	results, err := resp.ToArray()
+	if err != nil {
+		return nil, err
 	}
 
-	result = make(map[string]*dsorm.Item)
+	if len(results) != len(keys) {
+		return nil, fmt.Errorf("redis: len(results) != len(keys) (%d != %d)", len(results), len(keys))
+	}
+
+	result := make(map[string]*dsorm.Item)
 	me := make(dsorm.MultiError, len(keys))
 	hasErr := false
-	if len(cachedItems) != len(keys) {
-		return nil, fmt.Errorf("redis: len(cachedItems) != len(keys) (%d != %d)", len(cachedItems), len(keys))
-	}
+
 	for i, key := range keys {
-		if cacheItem := cachedItems[i]; cacheItem != nil {
-			if got := len(cacheItem); got < 4 {
-				me[i] = fmt.Errorf("redis: cached item should be atleast 4 bytes, got %d", got)
-				hasErr = true
-				continue
+		cacheItem, err := results[i].AsBytes()
+		if err != nil {
+			if valkey.IsValkeyNil(err) {
+				continue // cache miss, skip
 			}
-			buf := bytes.NewBuffer(cacheItem)
-			var flags uint32
-			if err = binary.Read(buf, binary.LittleEndian, &flags); err != nil {
-				me[i] = err
-				hasErr = true
-				continue
-			}
-			dsoItem := &dsorm.Item{
-				Key:   key,
-				Flags: flags,
-				Value: buf.Bytes(),
-			}
-
-			// Keep a copy of the original value data for any future CAS operations
-			dsoItem.SetCASInfo(append([]byte(nil), cacheItem...))
-			result[key] = dsoItem
+			me[i] = err
+			hasErr = true
+			continue
 		}
-	}
-	if hasErr {
-		err = me
-		return
+
+		if got := len(cacheItem); got < 4 {
+			me[i] = fmt.Errorf("redis: cached item should be atleast 4 bytes, got %d", got)
+			hasErr = true
+			continue
+		}
+
+		buf := bytes.NewBuffer(cacheItem)
+		var flags uint32
+		if err = binary.Read(buf, binary.LittleEndian, &flags); err != nil {
+			me[i] = err
+			hasErr = true
+			continue
+		}
+
+		dsoItem := &dsorm.Item{
+			Key:   key,
+			Flags: flags,
+			Value: buf.Bytes(),
+		}
+
+		// Keep a copy of the original value data for any future CAS operations
+		dsoItem.SetCASInfo(append([]byte(nil), cacheItem...))
+		result[key] = dsoItem
 	}
 
-	return
+	if hasErr {
+		return result, me
+	}
+	return result, nil
 }
 
-func (b *backend) SetMulti(ctx context.Context, items []*dsorm.Item) (err error) {
-	redisConn := b.store.GetWithContext(ctx).(redis.ConnWithContext)
-	defer func() {
-		if cerr := redisConn.CloseContext(ctx); cerr != nil && err == nil {
-			err = cerr
-		}
-	}()
+func (b *backend) Increment(ctx context.Context, key string, delta int64, expiration time.Duration) (int64, error) {
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	default:
+	}
 
-	err = set(ctx, redisConn, false, items)
+	expMs := int64(0)
+	if expiration > 0 {
+		expMs = int64(expiration / time.Millisecond)
+	}
 
-	return
+	resp := b.client.Do(ctx, b.client.B().Eval().Script(incrScript).Numkeys(1).Key(key).Arg(
+		fmt.Sprintf("%d", delta),
+		fmt.Sprintf("%d", expMs),
+	).Build())
+
+	val, err := resp.AsInt64()
+	if err != nil {
+		return 0, err
+	}
+	return val, nil
 }

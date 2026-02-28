@@ -2,6 +2,7 @@ package memcache
 
 import (
 	"context"
+	"time"
 
 	"google.golang.org/appengine/v2"
 	"google.golang.org/appengine/v2/memcache"
@@ -38,6 +39,14 @@ func (m *backend) GetMulti(ctx context.Context, keys []string) (map[string]*dsor
 
 func (m *backend) SetMulti(ctx context.Context, items []*dsorm.Item) error {
 	return memcache.SetMulti(ctx, convertToMemcacheItems(items))
+}
+
+func (m *backend) Increment(ctx context.Context, key string, delta int64, expiration time.Duration) (int64, error) {
+	newVal, err := memcache.Increment(ctx, key, delta, 0)
+	if err != nil {
+		return 0, err
+	}
+	return int64(newVal), nil
 }
 
 func convertToMemcacheItems(items []*dsorm.Item) []*memcache.Item {

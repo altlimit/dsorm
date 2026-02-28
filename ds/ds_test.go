@@ -15,10 +15,10 @@ import (
 	"time"
 
 	"cloud.google.com/go/datastore"
-	ds "github.com/altlimit/dsorm/ds"
 	"github.com/altlimit/dsorm/cache/memory"
 	credis "github.com/altlimit/dsorm/cache/redis"
-	"github.com/opencensus-integrations/redigo/redis"
+	ds "github.com/altlimit/dsorm/ds"
+	"github.com/valkey-io/valkey-go"
 )
 
 var (
@@ -96,6 +96,13 @@ func (m *mockCache) SetMulti(ctx context.Context, items []*ds.Item) error {
 	return errNotDefined
 }
 
+func (m *mockCache) Increment(ctx context.Context, key string, delta int64, expiration time.Duration) (int64, error) {
+	if m.cacher != nil {
+		return m.cacher.Increment(ctx, key, delta, expiration)
+	}
+	return 0, errNotDefined
+}
+
 func initRedis() {
 	if testing.Short() {
 		return
@@ -105,21 +112,18 @@ func initRedis() {
 		redisAddr = "localhost:6379"
 	}
 
-	redisPool := &redis.Pool{
-		Dial: func() (redis.Conn, error) {
-			return redis.Dial("tcp", redisAddr, redis.DialReadTimeout(500*time.Millisecond))
-		},
-	}
-
-	// Flush cache
-	conn := redisPool.Get()
-	if _, err := conn.Do("FLUSHDB"); err != nil {
-		panic(err)
-	}
-
-	cacher, err := credis.NewCache(context.Background(), redisPool)
+	// Flush cache using valkey client
+	vClient, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{redisAddr}})
 	if err != nil {
-		panic(err)
+		return // skip if cannot connect
+	}
+	ctx := context.Background()
+	vClient.Do(ctx, vClient.B().Flushdb().Build())
+	vClient.Close()
+
+	cacher, err := credis.NewCache(redisAddr)
+	if err != nil {
+		return // skip if cannot connect
 	}
 	cachersGuard.Lock()
 	defer cachersGuard.Unlock()
