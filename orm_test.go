@@ -443,6 +443,107 @@ func testPropertyMarshaling(t *testing.T, testDB *dsorm.Client) {
 	}
 }
 
+func TestWithEncryptionKeyContext(t *testing.T) {
+	runAllStores(t, testWithEncryptionKeyContext)
+}
+
+func testWithEncryptionKeyContext(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	// Two distinct 32-byte AES keys (env key is already set in TestMain)
+	clientKey := []byte("client-key-32-bytes-long!!!!!!!!")
+	ctxKey := []byte("ctx-key-is-32-bytes-long!!!!!!!!")
+
+	storeOpts := dsorm.WithStore(testDB.Store())
+
+	// Create a client with clientKey
+	clientDB, err := dsorm.New(ctx, dsorm.WithEncryptionKey(clientKey), storeOpts)
+	if err != nil {
+		t.Fatalf("New with client key failed: %v", err)
+	}
+
+	// 1. Save with context key (should override clientKey)
+	ctxWithKey := dsorm.WithEncryptionKeyContext(ctx, ctxKey)
+	em := &EncryptionModel{
+		ID:        int64(2000),
+		Secret:    "ctx-encrypted-value",
+		AltSecret: "ctx-alt-secret",
+	}
+	if err := clientDB.Put(ctxWithKey, em); err != nil {
+		t.Fatalf("Put with context key failed: %v", err)
+	}
+
+	// 2. Read back with the same context key — should succeed
+	fetched := &EncryptionModel{ID: 2000}
+	if err := clientDB.Get(ctxWithKey, fetched); err != nil {
+		t.Fatalf("Get with context key failed: %v", err)
+	}
+	if fetched.Secret != "ctx-encrypted-value" {
+		t.Errorf("Expected 'ctx-encrypted-value', got '%s'", fetched.Secret)
+	}
+	if fetched.AltSecret != "ctx-alt-secret" {
+		t.Errorf("Expected 'ctx-alt-secret', got '%s'", fetched.AltSecret)
+	}
+
+	// 3. Read with client key only (no context key) — should fail or return wrong data
+	//    because data was encrypted with ctxKey, not clientKey
+	fetchedWrong := &EncryptionModel{ID: 2000}
+	if err := clientDB.Get(ctx, fetchedWrong); err == nil {
+		// Decryption might produce garbage instead of erroring
+		if fetchedWrong.Secret == "ctx-encrypted-value" {
+			t.Error("Decrypted successfully with client key — context key was NOT prioritized")
+		}
+	} else {
+		t.Logf("Expected: reading with wrong (client) key errored: %v", err)
+	}
+
+	// 4. Read with env key only (no context key, no client key) — should also fail
+	envDB, err := dsorm.New(ctx, storeOpts) // no WithEncryptionKey, falls back to env var
+	if err != nil {
+		t.Fatalf("New with env key failed: %v", err)
+	}
+
+	fetchedEnv := &EncryptionModel{ID: 2000}
+	if err := envDB.Get(ctx, fetchedEnv); err == nil {
+		if fetchedEnv.Secret == "ctx-encrypted-value" {
+			t.Error("Decrypted successfully with env key — context key was NOT prioritized")
+		}
+	} else {
+		t.Logf("Expected: reading with wrong (env) key errored: %v", err)
+	}
+
+	// 5. Context key overrides BOTH client key and env key on save
+	//    Save with envDB but provide context key — should use context key
+	ctxOverrideEnv := dsorm.WithEncryptionKeyContext(ctx, ctxKey)
+	em2 := &EncryptionModel{
+		ID:        int64(2001),
+		Secret:    "override-env-value",
+		AltSecret: "override-env-alt",
+	}
+	if err := envDB.Put(ctxOverrideEnv, em2); err != nil {
+		t.Fatalf("Put envDB with context key failed: %v", err)
+	}
+
+	// Should decrypt with context key
+	fetched2 := &EncryptionModel{ID: 2001}
+	if err := envDB.Get(ctxOverrideEnv, fetched2); err != nil {
+		t.Fatalf("Get envDB with context key failed: %v", err)
+	}
+	if fetched2.Secret != "override-env-value" {
+		t.Errorf("Expected 'override-env-value', got '%s'", fetched2.Secret)
+	}
+
+	// Should NOT decrypt with env key alone
+	fetched3 := &EncryptionModel{ID: 2001}
+	if err := envDB.Get(ctx, fetched3); err == nil {
+		if fetched3.Secret == "override-env-value" {
+			t.Error("Decrypted with env key — context key did not override env")
+		}
+	} else {
+		t.Logf("Expected: reading with env key errored: %v", err)
+	}
+}
+
 func TestDatastoreTags(t *testing.T) {
 	runAllStores(t, testDatastoreTags)
 }

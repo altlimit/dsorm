@@ -476,6 +476,7 @@ type options struct {
 	datastoreClient *datastore.Client
 	store           ds.Store
 	encryptionKey   []byte
+	noCache         bool
 }
 
 // Option configures a [Client] created via [New].
@@ -526,9 +527,35 @@ func WithEncryptionKey(key []byte) Option {
 	}
 }
 
+// WithNoCache disables the caching layer entirely. All reads and writes
+// go directly to the datastore with no intermediate cache. This is useful
+// for distributed systems where no shared caching backend (Redis, Memcache)
+// is available and the default in-memory cache would cause stale reads
+// across instances.
+//
+// The same effect can be achieved by setting the DSORM_NO_CACHE environment
+// variable to "1" or "true".
+func WithNoCache() Option {
+	return func(o *options) {
+		o.noCache = true
+	}
+}
+
 type contextKey string
 
 var encryptionKeyKey contextKey = "dsorm_encryption_key"
+
+// WithEncryptionKeyContext returns a copy of ctx carrying the given AES
+// encryption key. This key takes priority over both [WithEncryptionKey]
+// and the DATASTORE_ENCRYPTION_KEY environment variable when loading or
+// saving fields tagged with model:"<name>,encrypt".
+//
+// Use this when the encryption key must be determined at runtime on a
+// per-request basis (e.g. derived from user credentials or a key-management
+// service) rather than fixed at [Client] creation time.
+func WithEncryptionKeyContext(ctx context.Context, key []byte) context.Context {
+	return context.WithValue(ctx, encryptionKeyKey, key)
+}
 
 // New creates a new [Client] with the given options.
 //
@@ -564,7 +591,13 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 		}
 	}
 
-	if o.cache == nil {
+	if !o.noCache {
+		if noCacheEnv := os.Getenv("DSORM_NO_CACHE"); noCacheEnv == "1" || noCacheEnv == "true" {
+			o.noCache = true
+		}
+	}
+
+	if !o.noCache && o.cache == nil {
 		if appengine.IsAppEngine() || appengine.IsDevAppServer() {
 			o.cache = memcache.NewCache()
 		} else if redisAddr := os.Getenv("REDIS_ADDR"); redisAddr != "" {
