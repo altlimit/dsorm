@@ -144,6 +144,25 @@ type DirectEncryptModel struct {
 	Data string `model:"data,encrypt"`
 }
 
+type ByteEncryptModel struct {
+	dsorm.Base
+	ID   int64  `model:"id"`
+	Data []byte `model:"data,encrypt" datastore:"-"`
+}
+
+type Address struct {
+	Street string `json:"street"`
+	City   string `json:"city"`
+	State  string `json:"state"`
+	Zip    string `json:"zip"`
+}
+
+type StructEncryptModel struct {
+	dsorm.Base
+	ID      int64   `model:"id"`
+	Address Address `model:"address,encrypt" datastore:"-"`
+}
+
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------
@@ -440,6 +459,144 @@ func testPropertyMarshaling(t *testing.T, testDB *dsorm.Client) {
 	}
 	if !foundData {
 		t.Error("DirectEncryptModel data property not found")
+	}
+}
+
+func TestByteEncryption(t *testing.T) {
+	runAllStores(t, testByteEncryption)
+}
+
+func testByteEncryption(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+	encKey := []byte("byte-encrypt-key-32-bytes-long!!")
+
+	storeOpts := dsorm.WithStore(testDB.Store())
+	encDB, err := dsorm.New(ctx, dsorm.WithEncryptionKey(encKey), storeOpts)
+	if err != nil {
+		t.Fatalf("New DB with enc key failed: %v", err)
+	}
+
+	original := []byte("hello world in bytes")
+	em := &ByteEncryptModel{
+		ID:   int64(6000),
+		Data: original,
+	}
+
+	if err := encDB.Put(ctx, em); err != nil {
+		t.Fatalf("Put ByteEncryptModel failed: %v", err)
+	}
+
+	// Verify raw storage is encrypted (not the plain base64 of the bytes)
+	store := encDB.Store()
+	key := encDB.Key(em)
+	var rawProps datastore.PropertyList
+	if err := store.Get(ctx, key, &rawProps); err != nil {
+		t.Fatalf("Raw Get failed: %v", err)
+	}
+
+	foundData := false
+	for _, p := range rawProps {
+		if p.Name == "data" {
+			foundData = true
+			// json.Marshal([]byte("hello world in bytes")) => "aGVsbG8gd29ybGQgaW4gYnl0ZXM="
+			if p.Value.(string) == "\"aGVsbG8gd29ybGQgaW4gYnl0ZXM=\"" {
+				t.Error("ByteEncryptModel data stored in plain text (unencrypted base64)")
+			}
+			if !p.NoIndex {
+				t.Error("ByteEncryptModel data should be NoIndex")
+			}
+		}
+	}
+	if !foundData {
+		t.Error("ByteEncryptModel data property not found in raw storage")
+	}
+
+	// Verify decryption on load
+	fetched := &ByteEncryptModel{ID: 6000}
+	if err := encDB.Get(ctx, fetched); err != nil {
+		t.Fatalf("Get ByteEncryptModel failed: %v", err)
+	}
+
+	if string(fetched.Data) != string(original) {
+		t.Errorf("ByteEncryptModel data mismatch. Got '%s', want '%s'", fetched.Data, original)
+	}
+}
+
+func TestStructEncryption(t *testing.T) {
+	runAllStores(t, testStructEncryption)
+}
+
+func testStructEncryption(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+	encKey := []byte("struct-encrypt-key-32-bytes-!!%%")
+
+	storeOpts := dsorm.WithStore(testDB.Store())
+	encDB, err := dsorm.New(ctx, dsorm.WithEncryptionKey(encKey), storeOpts)
+	if err != nil {
+		t.Fatalf("New DB with enc key failed: %v", err)
+	}
+
+	original := Address{
+		Street: "123 Main St",
+		City:   "Springfield",
+		State:  "IL",
+		Zip:    "62701",
+	}
+	em := &StructEncryptModel{
+		ID:      int64(7000),
+		Address: original,
+	}
+
+	if err := encDB.Put(ctx, em); err != nil {
+		t.Fatalf("Put StructEncryptModel failed: %v", err)
+	}
+
+	// Verify raw storage is encrypted
+	store := encDB.Store()
+	key := encDB.Key(em)
+	var rawProps datastore.PropertyList
+	if err := store.Get(ctx, key, &rawProps); err != nil {
+		t.Fatalf("Raw Get failed: %v", err)
+	}
+
+	foundAddr := false
+	for _, p := range rawProps {
+		if p.Name == "address" {
+			foundAddr = true
+			raw, ok := p.Value.(string)
+			if !ok {
+				t.Fatalf("address property is not a string, got %T", p.Value)
+			}
+			// The raw value should NOT contain the plain JSON
+			if strings.Contains(raw, "Springfield") {
+				t.Error("StructEncryptModel address stored in plain text")
+			}
+			if !p.NoIndex {
+				t.Error("StructEncryptModel address should be NoIndex")
+			}
+		}
+	}
+	if !foundAddr {
+		t.Error("StructEncryptModel address property not found in raw storage")
+	}
+
+	// Verify decryption on load
+	fetched := &StructEncryptModel{ID: 7000}
+	if err := encDB.Get(ctx, fetched); err != nil {
+		t.Fatalf("Get StructEncryptModel failed: %v", err)
+	}
+
+	if fetched.Address.Street != original.Street {
+		t.Errorf("Street mismatch. Got '%s', want '%s'", fetched.Address.Street, original.Street)
+	}
+	if fetched.Address.City != original.City {
+		t.Errorf("City mismatch. Got '%s', want '%s'", fetched.Address.City, original.City)
+	}
+	if fetched.Address.State != original.State {
+		t.Errorf("State mismatch. Got '%s', want '%s'", fetched.Address.State, original.State)
+	}
+	if fetched.Address.Zip != original.Zip {
+		t.Errorf("Zip mismatch. Got '%s', want '%s'", fetched.Address.Zip, original.Zip)
 	}
 }
 
