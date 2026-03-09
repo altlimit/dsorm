@@ -1,9 +1,4 @@
----
-name: dsorm
-description: Go ORM for Google Cloud Datastore with caching, lifecycle hooks, encryption, and local SQLite backend
----
-
-# dsorm — AI Usage Guide
+# dsorm — AI Agent Guide
 
 ## Overview
 
