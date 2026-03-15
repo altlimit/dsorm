@@ -1088,6 +1088,7 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 			return &localIterator{doneErr: err}
 		}
 		k := keyFromStrAndKind(col, keyStr)
+		k.Namespace = ns
 		resultKeys = append(resultKeys, k)
 		keyStrs = append(keyStrs, keyStr)
 	}

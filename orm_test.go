@@ -1624,14 +1624,17 @@ func testNamespaceQuery(t *testing.T, testDB *dsorm.Client) {
 		t.Fatalf("Namespace query failed: %v", err)
 	}
 	if len(results) < 1 {
-		t.Errorf("Expected at least 1 result in namespace %q, got %d", ns, len(results))
+		t.Fatalf("Expected at least 1 result in namespace %q, got %d", ns, len(results))
 	}
-	for _, r := range results {
+	for i, r := range results {
 		if r == nil {
-			continue
+			t.Fatalf("Result %d is nil — namespace likely missing from query result keys", i)
 		}
 		if r.Value != "hello" {
 			t.Errorf("Unexpected value %q in namespace query", r.Value)
+		}
+		if r.NS != ns {
+			t.Errorf("Result %d: expected NS=%q, got %q", i, ns, r.NS)
 		}
 	}
 
@@ -1642,7 +1645,15 @@ func testNamespaceQuery(t *testing.T, testDB *dsorm.Client) {
 		t.Fatalf("Namespace all query failed: %v", err)
 	}
 	if len(allResults) != 2 {
-		t.Errorf("Expected 2 results in namespace %q, got %d", ns, len(allResults))
+		t.Fatalf("Expected 2 results in namespace %q, got %d", ns, len(allResults))
+	}
+	for i, r := range allResults {
+		if r == nil {
+			t.Fatalf("All-query result %d is nil — namespace likely missing from query result keys", i)
+		}
+		if r.NS != ns {
+			t.Errorf("All-query result %d: expected NS=%q, got %q", i, ns, r.NS)
+		}
 	}
 }
 
