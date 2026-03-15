@@ -982,7 +982,7 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 		args = append(args, parentKeyStr)
 	}
 
-	queryStr := fmt.Sprintf("SELECT DISTINCT main.key FROM %q main", col)
+	queryStr := fmt.Sprintf("SELECT DISTINCT main.key, main.parent_key FROM %q main", col)
 	if len(joins) > 0 {
 		queryStr += " " + strings.Join(joins, " ")
 	}
@@ -1084,11 +1084,19 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 
 	for rows.Next() {
 		var keyStr string
-		if err := rows.Scan(&keyStr); err != nil {
+		var parentKeyStr sql.NullString
+		if err := rows.Scan(&keyStr, &parentKeyStr); err != nil {
 			return &localIterator{doneErr: err}
 		}
 		k := keyFromStrAndKind(col, keyStr)
 		k.Namespace = ns
+		if parentKeyStr.Valid && parentKeyStr.String != "" {
+			if parts := strings.SplitN(parentKeyStr.String, ":", 2); len(parts) == 2 {
+				pk := keyFromStrAndKind(parts[0], parts[1])
+				pk.Namespace = ns
+				k.Parent = pk
+			}
+		}
 		resultKeys = append(resultKeys, k)
 		keyStrs = append(keyStrs, keyStr)
 	}

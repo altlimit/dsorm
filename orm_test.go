@@ -1657,6 +1657,77 @@ func testNamespaceQuery(t *testing.T, testDB *dsorm.Client) {
 	}
 }
 
+// --- Ancestor Query with Namespace Test ---
+func TestAncestorQueryWithNamespace(t *testing.T) {
+	runAllStores(t, testAncestorQueryWithNamespace)
+}
+
+type NSParentModel struct {
+	dsorm.Base
+	ID string `model:"id"`
+	NS string `model:"ns"`
+}
+
+type NSChildModel struct {
+	dsorm.Base
+	ID     string         `model:"id"`
+	Parent *NSParentModel `model:"parent" datastore:"-"`
+	Value  string         `datastore:"value"`
+}
+
+func testAncestorQueryWithNamespace(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	ns := fmt.Sprintf("anc-ns-%d", time.Now().UnixNano())
+
+	parent := &NSParentModel{ID: "ns-parent-1", NS: ns}
+	child1 := &NSChildModel{ID: "ns-child-1", Parent: parent, Value: "v1"}
+	child2 := &NSChildModel{ID: "ns-child-2", Parent: parent, Value: "v2"}
+
+	// Verify the child key inherits namespace from parent
+	childKey := testDB.Key(child1)
+	if childKey.Namespace != ns {
+		t.Fatalf("Child key should inherit parent namespace %q, got %q", ns, childKey.Namespace)
+	}
+
+	if err := testDB.Put(ctx, child1); err != nil {
+		t.Fatalf("Put child1 failed: %v", err)
+	}
+	if err := testDB.Put(ctx, child2); err != nil {
+		t.Fatalf("Put child2 failed: %v", err)
+	}
+
+	// Query using ancestor key with explicit namespace.
+	// Cloud Datastore requires the query namespace to match the ancestor namespace.
+	parentKey := testDB.Key(parent)
+	if parentKey.Namespace != ns {
+		t.Fatalf("Parent key namespace should be %q, got %q", ns, parentKey.Namespace)
+	}
+
+	q := dsorm.NewQuery("NSChildModel").Namespace(ns).Ancestor(parentKey)
+	results, _, err := dsorm.Query[*NSChildModel](ctx, testDB, q, "")
+	if err != nil {
+		t.Fatalf("Ancestor+namespace query failed: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("Expected 2 children, got %d", len(results))
+	}
+	for i, r := range results {
+		if r == nil {
+			t.Fatalf("Result %d is nil — namespace likely missing from ancestor query result keys", i)
+		}
+		if r.Value != "v1" && r.Value != "v2" {
+			t.Errorf("Result %d: unexpected value %q", i, r.Value)
+		}
+		if r.Parent == nil {
+			t.Errorf("Result %d: parent should not be nil", i)
+		} else if r.Parent.NS != ns {
+			t.Errorf("Result %d: parent NS expected %q, got %q", i, ns, r.Parent.NS)
+		}
+	}
+}
+
 // ------------------------------------------------------------------
 // Data Type Tests
 // ------------------------------------------------------------------
