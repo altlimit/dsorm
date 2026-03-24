@@ -2211,6 +2211,34 @@ func testBeforeSaveValidation(t *testing.T, testDB *dsorm.Client) {
 		}
 	})
 
+	// ── 1.5. BeforeSave error does not delete existing properties ────────
+	t.Run("PreservesExistingProperties", func(t *testing.T) {
+		// 1. Save a valid entity first
+		valid := &ValidatedModel{ID: "validated-update", Name: "InitialName"}
+		if err := testDB.Put(ctx, valid); err != nil {
+			t.Fatalf("setup Put failed: %v", err)
+		}
+
+		// 2. Attempt to update with an invalid state
+		invalid := &ValidatedModel{ID: "validated-update", Name: ""}
+		err := testDB.Put(ctx, invalid)
+		if err == nil {
+			t.Fatal("expected Put update to fail when Name is empty, but it succeeded")
+		}
+		if !strings.Contains(err.Error(), "Name must not be empty") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+
+		// 3. Verify the entity's original properties were preserved (not deleted)
+		fetched := &ValidatedModel{ID: "validated-update"}
+		if err := testDB.Get(ctx, fetched); err != nil {
+			t.Fatalf("Get after failed update failed: %v", err)
+		}
+		if fetched.Name != "InitialName" {
+			t.Errorf("expected properties to be preserved (Name='InitialName'), got %q", fetched.Name)
+		}
+	})
+
 	// ── 2. Normal save succeeds ──────────────────────────────────────────
 	t.Run("ValidSave", func(t *testing.T) {
 		valid := &ValidatedModel{ID: "validated-ok", Name: "Alice"}

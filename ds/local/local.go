@@ -80,7 +80,8 @@ func (c *Store) getDB(namespace string) (*sql.DB, error) {
 	}
 	dbPath := filepath.Join(c.basePath, dbName)
 
-	db, err := sql.Open("sqlite", dbPath)
+	dbURI := "file:" + filepath.ToSlash(dbPath) + "?_txlock=immediate"
+	db, err := sql.Open("sqlite", dbURI)
 	if err != nil {
 		return nil, err
 	}
@@ -652,9 +653,6 @@ func (c *Store) PutMulti(ctx context.Context, keys []*datastore.Key, src interfa
 			_, id := keyToColAndID(k)
 			parentKey := getParentKeyStr(k)
 
-			delPlaceholders = append(delPlaceholders, "?")
-			delArgs = append(delArgs, id)
-
 			elem := v.Index(i)
 
 			var pl datastore.PropertyList
@@ -712,6 +710,9 @@ func (c *Store) PutMulti(ctx context.Context, keys []*datastore.Key, src interfa
 					propsArgs = append(propsArgs, id, p.Name, ord, valStr, noIndex, dataType)
 				}
 			}
+
+			delPlaceholders = append(delPlaceholders, "?")
+			delArgs = append(delArgs, id)
 
 			mainPlaceholders = append(mainPlaceholders, "(?, ?)")
 			mainArgs = append(mainArgs, id, parentKey)
@@ -778,6 +779,9 @@ func (c *Store) Delete(ctx context.Context, key *datastore.Key) error {
 	if err != nil {
 		return err
 	}
+	if err := c.ensureKind(key.Namespace, col, db); err != nil {
+		return err
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -817,6 +821,11 @@ func (c *Store) DeleteMulti(ctx context.Context, keys []*datastore.Key) error {
 		ns, col := bk.ns, bk.col
 		db, err := c.getDB(ns)
 		if err != nil {
+			setBatchError(me, batchIdxs[bk], err)
+			hasErr = true
+			continue
+		}
+		if err := c.ensureKind(ns, col, db); err != nil {
 			setBatchError(me, batchIdxs[bk], err)
 			hasErr = true
 			continue
@@ -1333,6 +1342,31 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 		}
 	}()
 
+	// Pre-ensure kinds for all puts to avoid deadlocks in putMultiTx
+	for kStr := range c.puts {
+		k := c.putKeys[kStr]
+		col, _ := keyToColAndID(k)
+		db, err := c.Store.getDB(k.Namespace)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.Store.ensureKind(k.Namespace, col, db); err != nil {
+			return nil, err
+		}
+	}
+
+	// Pre-ensure kinds for deletes as well
+	for _, k := range c.dels {
+		col, _ := keyToColAndID(k)
+		db, err := c.Store.getDB(k.Namespace)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.Store.ensureKind(k.Namespace, col, db); err != nil {
+			return nil, err
+		}
+	}
+
 	for ns := range nsSet {
 		db, err := c.Store.getDB(ns)
 		if err != nil {
@@ -1349,7 +1383,7 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 	if len(c.puts) > 0 {
 		// Group by namespace.
 		type nsBatch struct {
-			keys []  *datastore.Key
+			keys []*datastore.Key
 			srcs []interface{}
 		}
 		nsBatches := make(map[string]*nsBatch)
@@ -1439,15 +1473,7 @@ func putMultiTx(s *Store, tx *sql.Tx, keys []*datastore.Key, srcs []interface{})
 			pl = props
 		}
 
-		// Ensure kind table exists. DDL (CREATE TABLE IF NOT EXISTS) is
-		// idempotent and safe to run on the backing *sql.DB outside the tx.
-		db, err := s.getDB(k.Namespace)
-		if err != nil {
-			return err
-		}
-		if err := s.ensureKind(k.Namespace, col, db); err != nil {
-			return err
-		}
+		// Kinds are ensured before the transaction starts in Commit().
 
 		// Delete old props.
 		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, propsTable), id); err != nil {
@@ -1498,4 +1524,3 @@ func deleteMultiTx(tx *sql.Tx, keys []*datastore.Key) error {
 	}
 	return nil
 }
-
