@@ -84,10 +84,17 @@ func (c *Store) getDB(namespace string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// One writer at a time: the sql driver opens multiple connections by
+	// default; more than one writer on the same WAL file causes SQLITE_BUSY.
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
 		return nil, err
 	}
 	if _, err := db.Exec("PRAGMA synchronous=NORMAL;"); err != nil {
+		return nil, err
+	}
+	// Wait up to 5 s before returning SQLITE_BUSY.
+	if _, err := db.Exec("PRAGMA busy_timeout=5000;"); err != nil {
 		return nil, err
 	}
 
@@ -710,33 +717,52 @@ func (c *Store) PutMulti(ctx context.Context, keys []*datastore.Key, src interfa
 			mainArgs = append(mainArgs, id, parentKey)
 		}
 
-		// Delete old property rows first
-		if len(delPlaceholders) > 0 {
-			delQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, propsTable, strings.Join(delPlaceholders, ","))
-			if _, err := db.Exec(delQuery, delArgs...); err != nil {
-				setBatchError(me, batchIdxs[bk], err)
-				hasErr = true
-				continue
-			}
+		// All three steps (delete props, upsert main, insert props) must be
+		// atomic. BEGIN IMMEDIATE acquires the write lock upfront, preventing
+		// concurrent goroutines from racing and getting SQLITE_BUSY.
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			setBatchError(me, batchIdxs[bk], err)
+			hasErr = true
+			continue
 		}
 
-		// Insert/replace main rows (key + parent_key only)
-		if len(mainPlaceholders) > 0 {
-			query := fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, parent_key) VALUES %s`, col, strings.Join(mainPlaceholders, ", "))
-			if _, err := db.Exec(query, mainArgs...); err != nil {
-				setBatchError(me, batchIdxs[bk], err)
-				hasErr = true
-				continue
+		batchErr := func() error {
+			// Delete old property rows first
+			if len(delPlaceholders) > 0 {
+				delQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, propsTable, strings.Join(delPlaceholders, ","))
+				if _, err := tx.Exec(delQuery, delArgs...); err != nil {
+					return err
+				}
 			}
-		}
 
-		// Insert property rows
-		if len(propsPlaceholders) > 0 {
-			propsQuery := fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, name, ord, value, no_index, data_type) VALUES %s`, propsTable, strings.Join(propsPlaceholders, ", "))
-			if _, err := db.Exec(propsQuery, propsArgs...); err != nil {
-				setBatchError(me, batchIdxs[bk], err)
-				hasErr = true
+			// Insert/replace main rows (key + parent_key only)
+			if len(mainPlaceholders) > 0 {
+				query := fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, parent_key) VALUES %s`, col, strings.Join(mainPlaceholders, ", "))
+				if _, err := tx.Exec(query, mainArgs...); err != nil {
+					return err
+				}
 			}
+
+			// Insert property rows
+			if len(propsPlaceholders) > 0 {
+				propsQuery := fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, name, ord, value, no_index, data_type) VALUES %s`, propsTable, strings.Join(propsPlaceholders, ", "))
+				if _, err := tx.Exec(propsQuery, propsArgs...); err != nil {
+					return err
+				}
+			}
+			return nil
+		}()
+
+		if batchErr != nil {
+			tx.Rollback()
+			setBatchError(me, batchIdxs[bk], batchErr)
+			hasErr = true
+			continue
+		}
+		if err := tx.Commit(); err != nil {
+			setBatchError(me, batchIdxs[bk], err)
+			hasErr = true
 		}
 	}
 
@@ -752,16 +778,19 @@ func (c *Store) Delete(ctx context.Context, key *datastore.Key) error {
 	if err != nil {
 		return err
 	}
-	// Delete property rows
-	delPropsQuery := fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col+"_props")
-	if _, err := db.Exec(delPropsQuery, id); err != nil {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-
-	// Delete main row
-	query := fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col)
-	_, err = db.Exec(query, id)
-	return err
+	if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col+"_props"), id); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col), id); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 func (c *Store) DeleteMulti(ctx context.Context, keys []*datastore.Key) error {
@@ -803,17 +832,34 @@ func (c *Store) DeleteMulti(ctx context.Context, keys []*datastore.Key) error {
 
 		inClause := strings.Join(placeholders, ",")
 
-		// Delete property rows
-		delPropsQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, col+"_props", inClause)
-		if _, err := db.Exec(delPropsQuery, args...); err != nil {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
 			setBatchError(me, batchIdxs[bk], err)
 			hasErr = true
 			continue
 		}
 
-		// Delete main rows
-		delQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, col, inClause)
-		if _, err := db.Exec(delQuery, args...); err != nil {
+		batchErr := func() error {
+			// Delete property rows first
+			delPropsQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, col+"_props", inClause)
+			if _, err := tx.Exec(delPropsQuery, args...); err != nil {
+				return err
+			}
+			// Delete main rows
+			delQuery := fmt.Sprintf(`DELETE FROM %q WHERE key IN (%s)`, col, inClause)
+			if _, err := tx.Exec(delQuery, args...); err != nil {
+				return err
+			}
+			return nil
+		}()
+
+		if batchErr != nil {
+			tx.Rollback()
+			setBatchError(me, batchIdxs[bk], batchErr)
+			hasErr = true
+			continue
+		}
+		if err := tx.Commit(); err != nil {
 			setBatchError(me, batchIdxs[bk], err)
 			hasErr = true
 		}
@@ -1127,6 +1173,7 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 func (c *Store) RunInTransaction(ctx context.Context, f func(tx ds.TransactionStore) error, opts ...datastore.TransactionOption) (*datastore.Commit, error) {
 	txStore := &localTxStore{
 		Store:   c,
+		ctx:     ctx,
 		puts:    make(map[string]interface{}),
 		putKeys: make(map[string]*datastore.Key),
 		dels:    make(map[string]*datastore.Key),
@@ -1140,6 +1187,7 @@ func (c *Store) RunInTransaction(ctx context.Context, f func(tx ds.TransactionSt
 func (c *Store) NewTransaction(ctx context.Context, opts ...datastore.TransactionOption) (ds.TransactionStore, error) {
 	return &localTxStore{
 		Store:   c,
+		ctx:     ctx,
 		puts:    make(map[string]interface{}),
 		putKeys: make(map[string]*datastore.Key),
 		dels:    make(map[string]*datastore.Key),
@@ -1148,6 +1196,7 @@ func (c *Store) NewTransaction(ctx context.Context, opts ...datastore.Transactio
 
 type localTxStore struct {
 	*Store
+	ctx     context.Context
 	mu      sync.Mutex
 	puts    map[string]interface{}
 	putKeys map[string]*datastore.Key
@@ -1164,7 +1213,7 @@ func (c *localTxStore) Get(key *datastore.Key, dst interface{}) error {
 		return datastore.ErrNoSuchEntity
 	}
 
-	return c.Store.Get(context.Background(), key, dst)
+	return c.Store.Get(c.ctx, key, dst)
 }
 
 func (c *localTxStore) GetMulti(keys []*datastore.Key, dst interface{}) error {
@@ -1188,7 +1237,7 @@ func (c *localTxStore) GetMulti(keys []*datastore.Key, dst interface{}) error {
 			continue
 		}
 
-		if err := c.Store.Get(context.Background(), k, v.Index(i).Interface()); err != nil {
+		if err := c.Store.Get(c.ctx, k, v.Index(i).Interface()); err != nil {
 			me[i] = err
 			hasErr = true
 		}
@@ -1260,7 +1309,7 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Collect all namespaces used in this transaction
+	// Collect all namespaces used in this transaction.
 	nsSet := make(map[string]bool)
 	for _, k := range c.putKeys {
 		nsSet[k.Namespace] = true
@@ -1269,9 +1318,8 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 		nsSet[k.Namespace] = true
 	}
 
-	// Use a real SQLite transaction for atomicity.
-	// For simplicity, if all ops are in the same namespace (common case),
-	// we use a single SQL transaction. Otherwise, fall back to best-effort.
+	// Open one SQL transaction per namespace. All puts and deletes for that
+	// namespace run inside it, giving us true atomicity across the whole Commit.
 	type dbTx struct {
 		db *sql.DB
 		tx *sql.Tx
@@ -1290,43 +1338,70 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 		if err != nil {
 			return nil, err
 		}
-		tx, err := db.Begin()
+		tx, err := db.BeginTx(c.ctx, nil)
 		if err != nil {
 			return nil, err
 		}
 		txMap[ns] = &dbTx{db: db, tx: tx}
 	}
 
-	// Execute puts
+	// Execute puts inside their namespace transactions.
 	if len(c.puts) > 0 {
-		var putKeys []*datastore.Key
-		var putSrcs []interface{}
-		for k, v := range c.puts {
-			putKeys = append(putKeys, c.putKeys[k])
-			putSrcs = append(putSrcs, v)
+		// Group by namespace.
+		type nsBatch struct {
+			keys []  *datastore.Key
+			srcs []interface{}
 		}
-		if _, err := c.Store.PutMulti(context.Background(), putKeys, putSrcs); err != nil {
-			return nil, err
+		nsBatches := make(map[string]*nsBatch)
+		for kStr, src := range c.puts {
+			k := c.putKeys[kStr]
+			nb := nsBatches[k.Namespace]
+			if nb == nil {
+				nb = &nsBatch{}
+				nsBatches[k.Namespace] = nb
+			}
+			if k.Name == "" && k.ID == 0 {
+				k.ID = generateID()
+			}
+			nb.keys = append(nb.keys, k)
+			nb.srcs = append(nb.srcs, src)
+		}
+		for ns, nb := range nsBatches {
+			tx := txMap[ns].tx
+			if err := putMultiTx(c.Store, tx, nb.keys, nb.srcs); err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	// Execute deletes
+	// Execute deletes inside their namespace transactions.
 	if len(c.dels) > 0 {
-		var delKeys []*datastore.Key
-		for _, k := range c.dels {
-			delKeys = append(delKeys, k)
+		type nsBatch struct {
+			keys []*datastore.Key
 		}
-		if err := c.Store.DeleteMulti(context.Background(), delKeys); err != nil {
-			return nil, err
+		nsBatches := make(map[string]*nsBatch)
+		for _, k := range c.dels {
+			nb := nsBatches[k.Namespace]
+			if nb == nil {
+				nb = &nsBatch{}
+				nsBatches[k.Namespace] = nb
+			}
+			nb.keys = append(nb.keys, k)
+		}
+		for ns, nb := range nsBatches {
+			tx := txMap[ns].tx
+			if err := deleteMultiTx(tx, nb.keys); err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	// Commit all SQL transactions
+	// Commit all SQL transactions.
 	for _, dt := range txMap {
 		if err := dt.tx.Commit(); err != nil {
 			return nil, err
 		}
-		dt.tx = nil // Mark as committed so defer doesn't rollback
+		dt.tx = nil // prevent deferred Rollback
 	}
 
 	c.puts = nil
@@ -1334,3 +1409,93 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 	c.dels = nil
 	return &datastore.Commit{}, nil
 }
+
+// putMultiTx executes the put logic for a slice of keys/srcs inside an
+// existing SQL transaction. It mirrors PutMulti but without opening a new tx.
+func putMultiTx(s *Store, tx *sql.Tx, keys []*datastore.Key, srcs []interface{}) error {
+	for i, k := range keys {
+		col, id := keyToColAndID(k)
+		propsTable := col + "_props"
+		parentKey := getParentKeyStr(k)
+
+		src := srcs[i]
+		var pl datastore.PropertyList
+		rv := reflect.ValueOf(src)
+		if pls, ok := src.(datastore.PropertyLoadSaver); ok {
+			props, err := pls.Save()
+			if err != nil {
+				return err
+			}
+			pl = props
+		} else if plv, ok := rv.Interface().(datastore.PropertyList); ok {
+			pl = plv
+		} else if plvPtr, ok := rv.Interface().(*datastore.PropertyList); ok {
+			pl = *plvPtr
+		} else {
+			props, err := datastore.SaveStruct(src)
+			if err != nil {
+				return err
+			}
+			pl = props
+		}
+
+		// Ensure kind table exists. DDL (CREATE TABLE IF NOT EXISTS) is
+		// idempotent and safe to run on the backing *sql.DB outside the tx.
+		db, err := s.getDB(k.Namespace)
+		if err != nil {
+			return err
+		}
+		if err := s.ensureKind(k.Namespace, col, db); err != nil {
+			return err
+		}
+
+		// Delete old props.
+		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, propsTable), id); err != nil {
+			return err
+		}
+		// Upsert main row.
+		if _, err := tx.Exec(fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, parent_key) VALUES (?, ?)`, col), id, parentKey); err != nil {
+			return err
+		}
+		// Insert property rows.
+		for _, p := range pl {
+			noIndex := 0
+			if p.NoIndex {
+				noIndex = 1
+			}
+			var vals []interface{}
+			if sl, ok := p.Value.([]interface{}); ok {
+				vals = sl
+			} else {
+				vals = []interface{}{p.Value}
+			}
+			for ord, elemVal := range vals {
+				singleProp := datastore.Property{Name: p.Name, Value: elemVal, NoIndex: p.NoIndex}
+				valStr, dataType := propertyToRow(singleProp)
+				if _, err := tx.Exec(
+					fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, name, ord, value, no_index, data_type) VALUES (?, ?, ?, ?, ?, ?)`, propsTable),
+					id, p.Name, ord, valStr, noIndex, dataType,
+				); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// deleteMultiTx executes the delete logic for a slice of keys inside an
+// existing SQL transaction.
+func deleteMultiTx(tx *sql.Tx, keys []*datastore.Key) error {
+	for _, k := range keys {
+		col, id := keyToColAndID(k)
+		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col+"_props"), id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %q WHERE key = ?`, col), id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+

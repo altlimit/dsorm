@@ -2167,3 +2167,113 @@ func TestCrossTypeFilter(t *testing.T) {
 		}
 	})
 }
+
+// ------------------------------------------------------------------
+// TestBeforeSaveValidation
+// ------------------------------------------------------------------
+
+// ValidatedModel enforces that Name must not be empty in BeforeSave.
+type ValidatedModel struct {
+	dsorm.Base
+	ID   string `model:"id"`
+	Name string `datastore:"name"`
+}
+
+func (m *ValidatedModel) BeforeSave(ctx context.Context, old dsorm.Model) error {
+	if m.Name == "" {
+		return fmt.Errorf("ValidatedModel: Name must not be empty")
+	}
+	return nil
+}
+
+func TestBeforeSaveValidation(t *testing.T) {
+	runAllStores(t, testBeforeSaveValidation)
+}
+
+func testBeforeSaveValidation(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	// ── 1. BeforeSave error blocks the save ─────────────────────────────
+	t.Run("RequiredFieldBlocked", func(t *testing.T) {
+		empty := &ValidatedModel{ID: "validated-empty"}
+		err := testDB.Put(ctx, empty)
+		if err == nil {
+			t.Fatal("expected Put to fail when Name is empty, but it succeeded")
+		}
+		if !strings.Contains(err.Error(), "Name must not be empty") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+
+		// Confirm the entity was NOT saved.
+		check := &ValidatedModel{ID: "validated-empty"}
+		if err := testDB.Get(ctx, check); err == nil {
+			t.Error("entity should not exist after a blocked save, but Get succeeded")
+		}
+	})
+
+	// ── 2. Normal save succeeds ──────────────────────────────────────────
+	t.Run("ValidSave", func(t *testing.T) {
+		valid := &ValidatedModel{ID: "validated-ok", Name: "Alice"}
+		if err := testDB.Put(ctx, valid); err != nil {
+			t.Fatalf("Put with valid Name failed: %v", err)
+		}
+		fetched := &ValidatedModel{ID: "validated-ok"}
+		if err := testDB.Get(ctx, fetched); err != nil {
+			t.Fatalf("Get after valid Put failed: %v", err)
+		}
+		if fetched.Name != "Alice" {
+			t.Errorf("expected Name='Alice', got %q", fetched.Name)
+		}
+	})
+
+	// ── 3. Bypass BeforeSave via raw store.Put with a PropertyList ───────
+	// BeforeSave lives inside Base.Save() (PropertyLoadSaver). Writing a
+	// raw PropertyList directly to the underlying store skips that path
+	// entirely, so no hook is invoked.
+	t.Run("BypassViaRawStore", func(t *testing.T) {
+		store := testDB.Store()
+
+		rawKey := testDB.Key(&ValidatedModel{ID: "validated-bypass"})
+		rawProps := datastore.PropertyList{
+			{Name: "name", Value: "", NoIndex: false},
+		}
+		// Must succeed even though Name is empty — BeforeSave is bypassed.
+		if _, err := store.Put(ctx, rawKey, &rawProps); err != nil {
+			t.Fatalf("raw store.Put failed: %v", err)
+		}
+
+		// The ORM's Get will load it (no BeforeSave on read).
+		fetched := &ValidatedModel{ID: "validated-bypass"}
+		if err := testDB.Get(ctx, fetched); err != nil {
+			t.Fatalf("Get after bypass Put failed: %v", err)
+		}
+		if fetched.Name != "" {
+			t.Errorf("expected empty Name from bypassed write, got %q", fetched.Name)
+		}
+	})
+
+	// ── 4. Concurrent saves — race condition probe ────────────────────────
+	// Run many goroutines saving independent records simultaneously.
+	// Use -race to surface any data races inside the ORM / store path.
+	t.Run("ConcurrentSaves", func(t *testing.T) {
+		const workers = 20
+		errs := make(chan error, workers)
+
+		for i := 0; i < workers; i++ {
+			i := i
+			go func() {
+				m := &ValidatedModel{
+					ID:   fmt.Sprintf("concurrent-%d-%d", time.Now().UnixNano(), i),
+					Name: fmt.Sprintf("Worker %d", i),
+				}
+				errs <- testDB.Put(ctx, m)
+			}()
+		}
+
+		for i := 0; i < workers; i++ {
+			if err := <-errs; err != nil {
+				t.Errorf("concurrent Put failed: %v", err)
+			}
+		}
+	})
+}
