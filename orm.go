@@ -2,6 +2,7 @@ package dsorm
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"cloud.google.com/go/datastore"
 	"github.com/altlimit/dsorm/cache"
@@ -456,9 +459,12 @@ func appendMarshaledProp(ctx context.Context, props []datastore.Property, tag st
 
 // Client wraps datastore and cache operations.
 type Client struct {
-	client   *ds.Client
-	encKey   []byte
-	appCache cache.Cache
+	client        *ds.Client
+	encKey        []byte
+	appCache      cache.Cache
+	queryCache    bool
+	queryCacheTTL time.Duration
+	localVersions sync.Map // prevents stale cache on kind_v eviction
 }
 
 // Cache returns an application-level cache.Cache for general-purpose
@@ -477,6 +483,8 @@ type options struct {
 	store           ds.Store
 	encryptionKey   []byte
 	noCache         bool
+	queryCache      bool
+	queryCacheTTL   time.Duration
 }
 
 // Option configures a [Client] created via [New].
@@ -538,6 +546,19 @@ func WithEncryptionKey(key []byte) Option {
 func WithNoCache() Option {
 	return func(o *options) {
 		o.noCache = true
+	}
+}
+
+// WithQueryCache enables query caching. If a TTL is provided, it sets the expiration time.
+// If no TTL is provided, it defaults to 1 hour.
+func WithQueryCache(ttl ...time.Duration) Option {
+	return func(o *options) {
+		o.queryCache = true
+		if len(ttl) > 0 {
+			o.queryCacheTTL = ttl[0]
+		} else {
+			o.queryCacheTTL = time.Hour
+		}
 	}
 }
 
@@ -628,8 +649,10 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 	}
 
 	return &Client{
-		client: dsoClient,
-		encKey: o.encryptionKey,
+		client:        dsoClient,
+		encKey:        o.encryptionKey,
+		queryCache:    o.queryCache,
+		queryCacheTTL: o.queryCacheTTL,
 	}, nil
 }
 
@@ -794,8 +817,11 @@ func (c *Client) Put(ctx context.Context, val interface{}) error {
 		if err != nil {
 			return err
 		}
-		return as.AfterSave(ctx, old)
+		if err := as.AfterSave(ctx, old); err != nil {
+			return err
+		}
 	}
+	_ = invalidateKinds(ctx, c, []string{k.Kind})
 	return nil
 }
 
@@ -840,11 +866,14 @@ func (c *Client) PutMulti(ctx context.Context, vals interface{}) error {
 	}
 
 	if len(as) > 0 {
-		return util.Task(20, as, func(f func() error) error {
+		if err := util.Task(20, as, func(f func() error) error {
 			return f()
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
+	_ = invalidateKinds(ctx, c, getKindsFromKeys(keys))
 	return nil
 }
 
@@ -863,8 +892,11 @@ func (c *Client) Delete(ctx context.Context, val interface{}) error {
 		return err
 	}
 	if ad, ok := val.(AfterDelete); ok {
-		return ad.AfterDelete(ctx)
+		if err := ad.AfterDelete(ctx); err != nil {
+			return err
+		}
 	}
+	_ = invalidateKinds(ctx, c, []string{c.Key(val).Kind})
 	return nil
 }
 
@@ -909,11 +941,19 @@ func (c *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
 		}
 	}
 	if len(ads) > 0 {
-		return util.Task(20, ads, func(f func() error) error {
+		if err := util.Task(20, ads, func(f func() error) error {
 			return f()
-		})
+		}); err != nil {
+			return err
+		}
 	}
+	_ = invalidateKinds(ctx, c, getKindsFromKeys(keys))
 	return nil
+}
+
+type queryCacheData struct {
+	Keys []*datastore.Key `json:"keys"`
+	Next string           `json:"next"`
 }
 
 // Query executes a query using a keys-only strategy: it first fetches all
@@ -939,6 +979,69 @@ func (c *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals
 		q = q.Start(cursor)
 	}
 	q = q.KeysOnly()
+
+	var cacheKey string
+	if c.queryCache {
+		hash := q.Hash()
+		versionItem, err := c.Cache().Get(ctx, "kind_v:"+q.Kind())
+		version := int64(0)
+		if err == nil && versionItem != nil {
+			v, errP := strconv.ParseInt(string(versionItem.Value), 10, 64)
+			if errP == nil {
+				version = v
+			} else if len(versionItem.Value) == 8 {
+				version = int64(binary.LittleEndian.Uint64(versionItem.Value))
+			}
+			if version > 0 {
+				c.localVersions.Store(q.Kind(), version)
+			}
+		} else {
+			// Cache miss or eviction. We must not start from 0 to avoid serving stale cache.
+			v, ok := c.localVersions.Load(q.Kind())
+			if ok {
+				version = v.(int64)
+			} else {
+				// Initialize with UnixMilli to ensure uniqueness across app restarts
+				version = time.Now().UnixMilli()
+			}
+			// Restore it in the cache atomically
+			newV, errI := c.Cache().Increment(ctx, "kind_v:"+q.Kind(), version, 0)
+			if errI == nil {
+				version = newV
+				c.localVersions.Store(q.Kind(), version)
+			}
+		}
+		cacheKey = fmt.Sprintf("qcache:%s:v%d:%s", q.Kind(), version, hash)
+
+		cached, err := cache.Load[queryCacheData](ctx, c.Cache(), cacheKey)
+		if err == nil {
+			keys = cached.Keys
+			next := cached.Next
+			if vals != nil {
+				v.Elem().Set(reflect.MakeSlice(v.Elem().Type(), len(keys), len(keys)))
+				if len(keys) > 0 {
+					vSlice := v.Elem()
+					for i := 0; i < vSlice.Len(); i++ {
+						if vSlice.Index(i).Kind() == reflect.Ptr && vSlice.Index(i).IsNil() {
+							newElem := reflect.New(vSlice.Index(i).Type().Elem())
+							vSlice.Index(i).Set(newElem)
+							if err := initModel(ctx, newElem.Interface()); err != nil {
+								return nil, "", err
+							}
+						}
+					}
+					if err := loadKeys(vSlice, keys); err != nil {
+						return nil, "", err
+					}
+					if err := c.GetMulti(ctx, vSlice.Interface()); err != nil {
+						return nil, "", err
+					}
+				}
+			}
+			return keys, next, nil
+		}
+	}
+
 	it := c.client.Run(ctx, q)
 	for {
 		k, err := it.Next(nil)
@@ -953,6 +1056,14 @@ func (c *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals
 	if err != nil {
 		return nil, "", err
 	}
+
+	if c.queryCache {
+		_ = cache.Save(ctx, c.Cache(), cacheKey, queryCacheData{
+			Keys: keys,
+			Next: next,
+		}, c.queryCacheTTL)
+	}
+
 	if vals != nil {
 		v.Elem().Set(reflect.MakeSlice(v.Elem().Type(), len(keys), len(keys)))
 		if len(keys) > 0 {
@@ -986,6 +1097,7 @@ type Transaction struct {
 	client  *Client
 	ctx     context.Context
 	pending []pendingItem
+	modKeys []*datastore.Key
 }
 
 type pendingItem struct {
@@ -1065,6 +1177,7 @@ func (t *Transaction) Put(val interface{}) error {
 	if pk != nil {
 		t.pending = append(t.pending, pendingItem{pk, val})
 	}
+	t.modKeys = append(t.modKeys, k)
 	if v, ok := val.(datastore.KeyLoader); ok {
 		if err := v.LoadKey(k); err != nil {
 			return err
@@ -1118,6 +1231,7 @@ func (t *Transaction) PutMulti(vals interface{}) error {
 			}
 		}
 	}
+	t.modKeys = append(t.modKeys, keys...)
 	if err := loadKeys(v, keys); err != nil {
 		return err
 	}
@@ -1137,10 +1251,11 @@ func (t *Transaction) Delete(val interface{}) error {
 			return err
 		}
 	}
-	err := t.tx.Delete(t.client.Key(val))
-	if err != nil {
+	k := t.client.Key(val)
+	if err := t.tx.Delete(k); err != nil {
 		return err
 	}
+	t.modKeys = append(t.modKeys, k)
 	if ad, ok := val.(AfterDelete); ok {
 		return ad.AfterDelete(t.ctx)
 	}
@@ -1162,6 +1277,7 @@ func (t *Transaction) DeleteMulti(vals interface{}) error {
 	if err := t.tx.DeleteMulti(keys); err != nil {
 		return err
 	}
+	t.modKeys = append(t.modKeys, keys...)
 	// AfterDelete Hooks ? DeleteMulti in Tx with hooks is tricky if passing keys directly.
 	// t.DeleteMulti accepts vals interface{}.
 	for i := 0; i < v.Len(); i++ {
@@ -1181,6 +1297,7 @@ func (t *Transaction) DeleteMulti(vals interface{}) error {
 // an error, the transaction is rolled back.
 func (c *Client) Transact(ctx context.Context, f func(tx *Transaction) error) (*datastore.Commit, error) {
 	var pending []pendingItem
+	var modKeys []*datastore.Key
 
 	cmt, err := c.client.RunInTransaction(ctx, func(tx *ds.Transaction) error {
 		dsormTx := &Transaction{
@@ -1192,6 +1309,7 @@ func (c *Client) Transact(ctx context.Context, f func(tx *Transaction) error) (*
 			return err
 		}
 		pending = dsormTx.pending
+		modKeys = dsormTx.modKeys
 		return nil
 	})
 	if err != nil {
@@ -1212,6 +1330,9 @@ func (c *Client) Transact(ctx context.Context, f func(tx *Transaction) error) (*
 				}
 			}
 		}
+	}
+	if cmt != nil {
+		_ = invalidateKinds(ctx, c, getKindsFromKeys(modKeys))
 	}
 	return cmt, nil
 
@@ -1436,4 +1557,41 @@ func getTypeInfo(t reflect.Type) *typeInfo {
 
 	typeCache.Store(t, info)
 	return info
+}
+
+// invalidateKinds increments the cache version for the given kinds,
+// effectively invalidating any cached queries for them.
+func invalidateKinds(ctx context.Context, c *Client, kinds []string) error {
+	if !c.queryCache || len(kinds) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool)
+	g, gCtx := errgroup.WithContext(ctx)
+
+	for _, k := range kinds {
+		if !seen[k] {
+			seen[k] = true
+			g.Go(func() error {
+				newV, err := c.Cache().Increment(gCtx, "kind_v:"+k, 1, 0)
+				if err != nil {
+					return err
+				}
+				c.localVersions.Store(k, newV)
+				return nil
+			})
+		}
+	}
+	return g.Wait()
+}
+
+func getKindsFromKeys(keys []*datastore.Key) []string {
+	var kinds []string
+	seen := make(map[string]bool)
+	for _, k := range keys {
+		if k != nil && !seen[k.Kind] {
+			seen[k.Kind] = true
+			kinds = append(kinds, k.Kind)
+		}
+	}
+	return kinds
 }

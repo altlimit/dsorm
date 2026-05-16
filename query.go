@@ -1,6 +1,10 @@
 package dsorm
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+
 	"cloud.google.com/go/datastore"
 	"github.com/altlimit/dsorm/ds"
 )
@@ -93,3 +97,25 @@ func (q *QueryBuilder) IsKeysOnly() bool            { return q.keysOnly }
 func (q *QueryBuilder) GetAncestor() *datastore.Key { return q.ancestor }
 func (q *QueryBuilder) GetCursor() string           { return q.cursorStr }
 func (q *QueryBuilder) GetNamespace() string        { return q.namespace }
+
+// Hash generates a deterministic hash of the query builder state.
+func (q *QueryBuilder) Hash() string {
+	h := sha256.New()
+
+	// Write basic properties
+	h.Write([]byte(fmt.Sprintf("kind:%s|ns:%s|limit:%d|offset:%d|keysOnly:%t|cursor:%s|", q.kind, q.namespace, q.limit, q.offset, q.keysOnly, q.cursorStr)))
+
+	if q.ancestor != nil {
+		h.Write([]byte(fmt.Sprintf("ancestor:%s,%s,%d|", q.ancestor.Kind, q.ancestor.Name, q.ancestor.ID)))
+	}
+
+	for _, f := range q.filters {
+		h.Write([]byte(fmt.Sprintf("filter:%s,%s,%v|", f.Field, f.Op, f.Value)))
+	}
+
+	for _, o := range q.orders {
+		h.Write([]byte(fmt.Sprintf("order:%s,%s|", o.Field, o.Direction)))
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
+}

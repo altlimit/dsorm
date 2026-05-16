@@ -7,6 +7,7 @@
 ## Features
 
 - **Auto-Caching**: Transparently caches keys/entities in Memory, Redis, or Memcache.
+- **Query Caching**: Generation-based query cache layer with auto-invalidation on Puts/Deletes.
 - **Model Hooks**: `BeforeSave`, `AfterSave`, `OnLoad`, `BeforeDelete`, `AfterDelete` lifecycle methods.
 - **Key Mapping**: Use struct tags (e.g., `model:"id"`) to map keys to struct fields.
 - **Field Encryption**: Built-in encryption for sensitive string fields via `model:"name,encrypt"` tag.
@@ -40,6 +41,7 @@ client, err := dsorm.New(ctx)
 client, err = dsorm.New(ctx,
     dsorm.WithProjectID("my-project"),
     dsorm.WithEncryptionKey([]byte("my-32-byte-secret-key-here......")),
+    dsorm.WithQueryCache(time.Hour), // Enable query cache with 1-hour TTL
 )
 
 // With Local SQLite Store (same API, no cloud dependency)
@@ -226,6 +228,26 @@ if !result.Allowed {
 
 // Access the underlying ds.Cache for batch operations
 raw := c.Unwrap()
+```
+
+### 8. Query Caching
+
+Enable query caching at initialization using `dsorm.WithQueryCache(ttl)`. The ORM hashes query parameters to create a deterministic cache key. Cache invalidation is atomic and automatic: saving (`Put`, `PutMulti`, `Transact`) or deleting entities bumps a generation counter for the affected `Kind`, instantly invalidating related query caches across the cluster without needing expensive sweep operations.
+
+```go
+// Initialize with query cache enabled (default TTL is 1 hour if duration is omitted)
+client, _ := dsorm.New(ctx, dsorm.WithQueryCache(time.Hour))
+
+// First run (Miss: runs on datastore, saves results to cache)
+q := dsorm.NewQuery("User").FilterField("status", "=", "active")
+users, _, _ := dsorm.Query[*User](ctx, client, q, "")
+
+// Second run (Hit: hydrates from cached keys, avoiding expensive query costs)
+users2, _, _ := dsorm.Query[*User](ctx, client, q, "")
+
+// Modify an entity. This atomically bumps the "User" version,
+// invalidating ALL cached queries for the "User" Kind instantly.
+client.Put(ctx, &User{ID: "new-user"})
 ```
 
 ## Configuration

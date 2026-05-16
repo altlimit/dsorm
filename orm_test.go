@@ -781,7 +781,7 @@ func testDatastoreTags(t *testing.T, testDB *dsorm.Client) {
 
 	// Querying on indexed field should find it
 	q2 := dsorm.NewQuery("DatastoreTagModel").FilterField("Indexed", "=", "visible")
-	results2, _, err := dsorm.Query[*DatastoreTagModel](ctx, testDB, q2, "")
+	fmt.Printf("DEBUG Query2 start\n"); results2, _, err := dsorm.Query[*DatastoreTagModel](ctx, testDB, q2, "")
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -1912,7 +1912,7 @@ func testDataTypes(t *testing.T, testDB *dsorm.Client) {
 
 		// LT
 		q2 := newQ().FilterField("int64_val", "<", 50)
-		results2, _, err := dsorm.Query[*DataTypeModel](ctx, testDB, q2, "")
+		fmt.Printf("DEBUG Query2 start\n"); results2, _, err := dsorm.Query[*DataTypeModel](ctx, testDB, q2, "")
 		if err != nil {
 			t.Fatalf("int < 50 query failed: %v", err)
 		}
@@ -2304,4 +2304,87 @@ func testBeforeSaveValidation(t *testing.T, testDB *dsorm.Client) {
 			}
 		}
 	})
+}
+
+// ------------------------------------------------------------------
+// TestQueryCache
+// ------------------------------------------------------------------
+
+type QueryCacheModel struct {
+	dsorm.Base
+	ID    string `model:"id"`
+	Value string `datastore:"value"`
+}
+
+func TestQueryCache(t *testing.T) {
+	ctx := context.Background()
+
+	tempDir, err := os.MkdirTemp("", "dsorm_qcache_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	store := local.NewStore(tempDir)
+	defer store.Close()
+
+	// Initialize with query cache enabled
+	testDB, err := dsorm.New(ctx, dsorm.WithStore(store), dsorm.WithQueryCache(time.Minute))
+	if err != nil {
+		t.Fatalf("Failed to init client: %v", err)
+	}
+
+	// 1. Put some initial data
+	m1 := &QueryCacheModel{ID: "m1", Value: "val1"}
+	m2 := &QueryCacheModel{ID: "m2", Value: "val2"}
+	if err := testDB.PutMulti(ctx, []*QueryCacheModel{m1, m2}); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// 2. Query data (should fetch from datastore and populate cache)
+	q := dsorm.NewQuery("QueryCacheModel").Order("value")
+	results, _, err := dsorm.Query[*QueryCacheModel](ctx, testDB, q, "")
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("Expected 2 results, got %d", len(results))
+	}
+
+	// 3. Modifying raw data bypassing dsorm so the cache doesn't invalidate
+	store2 := local.NewStore(tempDir)
+	dbNoCache, _ := dsorm.New(ctx, dsorm.WithStore(store2), dsorm.WithNoCache())
+	
+	// Delete from datastore directly without invalidating testDB cache
+	if err := dbNoCache.Delete(ctx, m2); err != nil {
+		t.Fatalf("dbNoCache delete failed: %v", err)
+	}
+	dbNoCache.Close()
+
+	// 4. Query again on cached testDB, it should STILL return 2 results because of the cache!
+	results2, _, err := dsorm.Query[*QueryCacheModel](ctx, testDB, q, "")
+	if err != nil {
+		t.Fatalf("Query2 failed: %v", err)
+	}
+	if len(results2) != 2 {
+		t.Fatalf("Expected 2 cached results, got %d. Next: %q", len(results2), "")
+	}
+
+	// 5. Now Put using testDB, which should invalidate the query cache
+	m3 := &QueryCacheModel{ID: "m3", Value: "val3"}
+	if err := testDB.Put(ctx, m3); err != nil {
+		t.Fatalf("Put m3 failed: %v", err)
+	}
+
+	// 6. Query again on cached testDB. It should miss cache and fetch from datastore, finding m1 and m3, but NOT m2!
+	results3, _, err := dsorm.Query[*QueryCacheModel](ctx, testDB, q, "")
+	if err != nil {
+		t.Fatalf("Query3 failed: %v", err)
+	}
+	if len(results3) != 2 {
+		t.Fatalf("Expected 2 results after invalidation (m1, m3), got %d", len(results3))
+	}
+	if results3[0].ID != "m1" || results3[1].ID != "m3" {
+		t.Errorf("Expected [m1, m3], got [%s, %s]", results3[0].ID, results3[1].ID)
+	}
 }
