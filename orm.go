@@ -1584,6 +1584,15 @@ func invalidateKinds(ctx context.Context, c *Client, kinds []string) error {
 	return g.Wait()
 }
 
+// InvalidateKinds manually invalidates the query cache for the given kinds.
+// This is useful if you bypass the dsorm.Client and interact directly with the
+// underlying Store() to modify entities, as those operations won't automatically
+// trigger query cache invalidation.
+func (c *Client) InvalidateKinds(ctx context.Context, kinds ...string) error {
+	return invalidateKinds(ctx, c, kinds)
+}
+
+
 func getKindsFromKeys(keys []*datastore.Key) []string {
 	var kinds []string
 	seen := make(map[string]bool)
