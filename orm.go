@@ -911,12 +911,20 @@ func (c *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
 	}
 
 	// BeforeDelete Hooks
+	var bds []func() error
 	for i := 0; i < v.Len(); i++ {
 		e := v.Index(i).Interface()
 		if bd, ok := e.(BeforeDelete); ok {
-			if err := bd.BeforeDelete(ctx); err != nil {
-				return err
-			}
+			bds = append(bds, func() error {
+				return bd.BeforeDelete(ctx)
+			})
+		}
+	}
+	if len(bds) > 0 {
+		if err := util.Task(20, bds, func(f func() error) error {
+			return f()
+		}); err != nil {
+			return err
 		}
 	}
 
@@ -1268,6 +1276,25 @@ func (t *Transaction) DeleteMulti(vals interface{}) error {
 	if v.Kind() != reflect.Slice {
 		return fmt.Errorf("dsorm.Transaction.DeleteMulti: must be slice type not '%v'", v.Kind())
 	}
+
+	// BeforeDelete Hooks
+	var bds []func() error
+	for i := 0; i < v.Len(); i++ {
+		e := v.Index(i).Interface()
+		if bd, ok := e.(BeforeDelete); ok {
+			bds = append(bds, func() error {
+				return bd.BeforeDelete(t.ctx)
+			})
+		}
+	}
+	if len(bds) > 0 {
+		if err := util.Task(20, bds, func(f func() error) error {
+			return f()
+		}); err != nil {
+			return err
+		}
+	}
+
 	var keys []*datastore.Key
 	if vKeys, ok := vals.([]*datastore.Key); ok {
 		keys = vKeys
@@ -1278,14 +1305,21 @@ func (t *Transaction) DeleteMulti(vals interface{}) error {
 		return err
 	}
 	t.modKeys = append(t.modKeys, keys...)
-	// AfterDelete Hooks ? DeleteMulti in Tx with hooks is tricky if passing keys directly.
-	// t.DeleteMulti accepts vals interface{}.
+	// AfterDelete Hooks
+	var ads []func() error
 	for i := 0; i < v.Len(); i++ {
 		e := v.Index(i).Interface()
 		if ad, ok := e.(AfterDelete); ok {
-			if err := ad.AfterDelete(t.ctx); err != nil {
-				return err
-			}
+			ads = append(ads, func() error {
+				return ad.AfterDelete(t.ctx)
+			})
+		}
+	}
+	if len(ads) > 0 {
+		if err := util.Task(20, ads, func(f func() error) error {
+			return f()
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
