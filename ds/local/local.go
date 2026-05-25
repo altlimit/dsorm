@@ -882,6 +882,12 @@ func (c *Store) DeleteMulti(ctx context.Context, keys []*datastore.Key) error {
 
 // loadPropertyList loads a PropertyList into a destination value.
 func loadPropertyList(pl datastore.PropertyList, dst reflect.Value) error {
+	// When dst comes from a slice of pointers (e.g. []*CustomRecord),
+	// Addr() produces **T. Dereference to get *T for interface checks.
+	if dst.Kind() == reflect.Ptr && dst.Elem().Kind() == reflect.Ptr {
+		dst = dst.Elem()
+	}
+
 	if pls, ok := dst.Interface().(datastore.PropertyLoadSaver); ok {
 		return pls.Load(pl)
 	}
