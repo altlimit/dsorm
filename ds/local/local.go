@@ -138,7 +138,8 @@ func (c *Store) ensureKind(namespace, kind string, db *sql.DB) error {
 			ord INTEGER NOT NULL DEFAULT 0,
 			value TEXT,
 			no_index INTEGER NOT NULL DEFAULT 0,
-			data_type TEXT NOT NULL DEFAULT 'string'
+			data_type TEXT NOT NULL DEFAULT 'string',
+			synthetic INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE UNIQUE INDEX IF NOT EXISTS %q ON %q(key, name, ord);
 		CREATE INDEX IF NOT EXISTS %q ON %q(name, value) WHERE no_index = 0 AND data_type IN ('string','key','time','bytes');
@@ -154,6 +155,11 @@ func (c *Store) ensureKind(namespace, kind string, db *sql.DB) error {
 	if _, err := db.Exec(query); err != nil {
 		return err
 	}
+
+	// Migrate databases created before embedded-entity subfield indexing: they
+	// lack the synthetic column. Best-effort; ignored if the column already
+	// exists (newly created tables include it above).
+	db.Exec(fmt.Sprintf(`ALTER TABLE %q ADD COLUMN synthetic INTEGER NOT NULL DEFAULT 0`, propsTable))
 
 	c.kindCache[namespace][kind] = true
 	return nil
@@ -235,6 +241,90 @@ func propertyToRow(p datastore.Property) (string, string) {
 		data, _ := json.Marshal(v)
 		return string(data), "string"
 	}
+}
+
+// propRow is a single row to be written to a kind_props table.
+type propRow struct {
+	name      string
+	ord       int
+	value     string
+	noIndex   int
+	dataType  string
+	synthetic int
+}
+
+// buildPropRows converts a PropertyList into the rows to store in kind_props.
+//
+// In addition to a row per (multi-valued) property, embedded entity values
+// (the default representation of a nested struct) also produce "synthetic"
+// flattened index rows with dotted names (e.g. "customer.id"). This mirrors
+// real Datastore, which indexes an embedded entity's subfields server-side and
+// exposes them as queryable dotted paths. The original entity row is kept too
+// (synthetic = 0) so loads can reconstruct the nested struct; synthetic rows
+// are query-only and excluded from loads.
+func buildPropRows(pl datastore.PropertyList) []propRow {
+	var rows []propRow
+	synthOrd := make(map[string]int)
+	for _, p := range pl {
+		noIndex := 0
+		if p.NoIndex {
+			noIndex = 1
+		}
+
+		// Handle multi-valued properties (slices).
+		var vals []interface{}
+		if sl, ok := p.Value.([]interface{}); ok {
+			vals = sl
+		} else {
+			vals = []interface{}{p.Value}
+		}
+
+		for ord, elemVal := range vals {
+			singleProp := datastore.Property{Name: p.Name, Value: elemVal, NoIndex: p.NoIndex}
+			valStr, dataType := propertyToRow(singleProp)
+			rows = append(rows, propRow{name: p.Name, ord: ord, value: valStr, noIndex: noIndex, dataType: dataType})
+
+			// Emit synthetic flattened rows for embedded entity subfields.
+			if ent, ok := elemVal.(*datastore.Entity); ok {
+				rows = appendEntityIndexRows(rows, p.Name, ent, synthOrd)
+			}
+		}
+	}
+	return rows
+}
+
+// appendEntityIndexRows recursively emits synthetic flattened index rows for an
+// embedded entity's subfields. Each subfield keeps its own NoIndex setting, so a
+// noindex subfield stays non-queryable — matching Datastore. The ord for
+// synthetic rows is a per-name counter purely to keep (key, name, ord) unique;
+// synthetic rows are never loaded, so the exact ord value is immaterial.
+func appendEntityIndexRows(rows []propRow, prefix string, ent *datastore.Entity, synthOrd map[string]int) []propRow {
+	for _, sp := range ent.Properties {
+		name := prefix + "." + sp.Name
+		noIndex := 0
+		if sp.NoIndex {
+			noIndex = 1
+		}
+
+		var vals []interface{}
+		if sl, ok := sp.Value.([]interface{}); ok {
+			vals = sl
+		} else {
+			vals = []interface{}{sp.Value}
+		}
+
+		for _, elemVal := range vals {
+			if subEnt, ok := elemVal.(*datastore.Entity); ok {
+				rows = appendEntityIndexRows(rows, name, subEnt, synthOrd)
+				continue
+			}
+			singleProp := datastore.Property{Name: name, Value: elemVal, NoIndex: sp.NoIndex}
+			valStr, dataType := propertyToRow(singleProp)
+			rows = append(rows, propRow{name: name, ord: synthOrd[name], value: valStr, noIndex: noIndex, dataType: dataType, synthetic: 1})
+			synthOrd[name]++
+		}
+	}
+	return rows
 }
 
 // rowToProperty reconstructs a datastore.Property from kind_props row data.
@@ -335,7 +425,7 @@ func loadPropsForKeys(db *sql.DB, col string, keyStrs []string) (map[string]data
 		placeholders = append(placeholders, "?")
 		args = append(args, k)
 	}
-	query := fmt.Sprintf(`SELECT key, name, ord, value, no_index, data_type FROM %q WHERE key IN (%s) ORDER BY key, name, ord`,
+	query := fmt.Sprintf(`SELECT key, name, ord, value, no_index, data_type FROM %q WHERE key IN (%s) AND synthetic = 0 ORDER BY key, name, ord`,
 		propsTable, strings.Join(placeholders, ","))
 	rows, err := db.Query(query, args...)
 	if err != nil {
@@ -688,27 +778,11 @@ func (c *Store) PutMulti(ctx context.Context, keys []*datastore.Key, src interfa
 				}
 			}
 
-			// Build property rows for kind_props
-			for _, p := range pl {
-				noIndex := 0
-				if p.NoIndex {
-					noIndex = 1
-				}
-
-				// Handle multi-valued properties (slices)
-				var vals []interface{}
-				if sl, ok := p.Value.([]interface{}); ok {
-					vals = sl
-				} else {
-					vals = []interface{}{p.Value}
-				}
-
-				for ord, elemVal := range vals {
-					singleProp := datastore.Property{Name: p.Name, Value: elemVal, NoIndex: p.NoIndex}
-					valStr, dataType := propertyToRow(singleProp)
-					propsPlaceholders = append(propsPlaceholders, "(?, ?, ?, ?, ?, ?)")
-					propsArgs = append(propsArgs, id, p.Name, ord, valStr, noIndex, dataType)
-				}
+			// Build property rows for kind_props (including synthetic flattened
+			// index rows for embedded entity subfields).
+			for _, r := range buildPropRows(pl) {
+				propsPlaceholders = append(propsPlaceholders, "(?, ?, ?, ?, ?, ?, ?)")
+				propsArgs = append(propsArgs, id, r.name, r.ord, r.value, r.noIndex, r.dataType, r.synthetic)
 			}
 
 			delPlaceholders = append(delPlaceholders, "?")
@@ -747,7 +821,7 @@ func (c *Store) PutMulti(ctx context.Context, keys []*datastore.Key, src interfa
 
 			// Insert property rows
 			if len(propsPlaceholders) > 0 {
-				propsQuery := fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, name, ord, value, no_index, data_type) VALUES %s`, propsTable, strings.Join(propsPlaceholders, ", "))
+				propsQuery := fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, name, ord, value, no_index, data_type, synthetic) VALUES %s`, propsTable, strings.Join(propsPlaceholders, ", "))
 				if _, err := tx.Exec(propsQuery, propsArgs...); err != nil {
 					return err
 				}
@@ -1489,27 +1563,14 @@ func putMultiTx(s *Store, tx *sql.Tx, keys []*datastore.Key, srcs []interface{})
 		if _, err := tx.Exec(fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, parent_key) VALUES (?, ?)`, col), id, parentKey); err != nil {
 			return err
 		}
-		// Insert property rows.
-		for _, p := range pl {
-			noIndex := 0
-			if p.NoIndex {
-				noIndex = 1
-			}
-			var vals []interface{}
-			if sl, ok := p.Value.([]interface{}); ok {
-				vals = sl
-			} else {
-				vals = []interface{}{p.Value}
-			}
-			for ord, elemVal := range vals {
-				singleProp := datastore.Property{Name: p.Name, Value: elemVal, NoIndex: p.NoIndex}
-				valStr, dataType := propertyToRow(singleProp)
-				if _, err := tx.Exec(
-					fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, name, ord, value, no_index, data_type) VALUES (?, ?, ?, ?, ?, ?)`, propsTable),
-					id, p.Name, ord, valStr, noIndex, dataType,
-				); err != nil {
-					return err
-				}
+		// Insert property rows (including synthetic flattened index rows for
+		// embedded entity subfields).
+		for _, r := range buildPropRows(pl) {
+			if _, err := tx.Exec(
+				fmt.Sprintf(`INSERT OR REPLACE INTO %q (key, name, ord, value, no_index, data_type, synthetic) VALUES (?, ?, ?, ?, ?, ?, ?)`, propsTable),
+				id, r.name, r.ord, r.value, r.noIndex, r.dataType, r.synthetic,
+			); err != nil {
+				return err
 			}
 		}
 	}

@@ -2388,3 +2388,91 @@ func TestQueryCache(t *testing.T) {
 		t.Errorf("Expected [m1, m3], got [%s, %s]", results3[0].ID, results3[1].ID)
 	}
 }
+
+// NestedCustomer is an embedded struct stored as a Datastore Entity value (the
+// default representation of a nested struct — no "flatten" tag). Datastore
+// indexes the indexed sub-fields server-side and exposes them as queryable
+// dotted paths (e.g. "customer.id"); noindex sub-fields are not queryable. The
+// local store replicates this exactly.
+type NestedCustomer struct {
+	CID   int64  `datastore:"id"`
+	Name  string `datastore:"name,noindex"`
+	Email string `datastore:"email"`
+}
+
+type NestedOrder struct {
+	dsorm.Base
+	ID       int64          `model:"id"`
+	Group    string         `datastore:"group"` // scoping field to isolate test runs
+	Total    int64          `datastore:"total"`
+	Customer NestedCustomer `datastore:"customer"` // no flatten — embedded entity
+}
+
+// TestNestedStructFilter verifies that filtering on an embedded-entity sub-field
+// (e.g. "customer.id") works without the "flatten" tag, and behaves identically
+// on the local store and the real datastore — including that noindex sub-fields
+// are not queryable.
+func TestNestedStructFilter(t *testing.T) {
+	runAllStores(t, testNestedStructFilter)
+}
+
+func testNestedStructFilter(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	group := fmt.Sprintf("grp-%d", time.Now().UnixNano())
+	baseID := time.Now().UnixNano()
+
+	seeds := []NestedCustomer{
+		{CID: 1234, Name: "Alice", Email: "alice@example.com"},
+		{CID: 5678, Name: "Bob", Email: "bob@example.com"},
+	}
+	for i, c := range seeds {
+		o := &NestedOrder{ID: baseID + int64(i), Group: group, Total: int64(100 + i), Customer: c}
+		if err := testDB.Put(ctx, o); err != nil {
+			t.Fatalf("Seed Put %d failed: %v", i, err)
+		}
+	}
+
+	// Filter on the nested indexed int sub-field "customer.id".
+	q := dsorm.NewQuery("NestedOrder").
+		FilterField("group", "=", group).
+		FilterField("customer.id", "=", int64(1234))
+	results, _, err := dsorm.Query[*NestedOrder](ctx, testDB, q, "")
+	if err != nil {
+		t.Fatalf("Nested filter query failed: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("Expected 1 result for customer.id=1234, got %d", len(results))
+	}
+	if results[0].Customer.CID != 1234 || results[0].Customer.Email != "alice@example.com" {
+		t.Errorf("Unexpected customer loaded: %+v", results[0].Customer)
+	}
+
+	// Filter on the nested indexed string sub-field "customer.email".
+	q2 := dsorm.NewQuery("NestedOrder").
+		FilterField("group", "=", group).
+		FilterField("customer.email", "=", "bob@example.com")
+	results2, _, err := dsorm.Query[*NestedOrder](ctx, testDB, q2, "")
+	if err != nil {
+		t.Fatalf("Nested email filter query failed: %v", err)
+	}
+	if len(results2) != 1 {
+		t.Fatalf("Expected 1 result for customer.email=bob, got %d", len(results2))
+	}
+	if results2[0].Customer.CID != 5678 {
+		t.Errorf("Expected customer 5678, got %d", results2[0].Customer.CID)
+	}
+
+	// A noindex sub-field ("customer.name") is not indexed, so it must not match
+	// — matching real Datastore behavior.
+	q3 := dsorm.NewQuery("NestedOrder").
+		FilterField("group", "=", group).
+		FilterField("customer.name", "=", "Alice")
+	results3, _, err := dsorm.Query[*NestedOrder](ctx, testDB, q3, "")
+	if err != nil {
+		t.Fatalf("Nested noindex filter query failed: %v", err)
+	}
+	if len(results3) != 0 {
+		t.Errorf("Expected 0 results for noindex customer.name, got %d", len(results3))
+	}
+}
