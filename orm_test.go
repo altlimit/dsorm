@@ -1436,6 +1436,90 @@ func testQueryFeatures(t *testing.T, testDB *dsorm.Client) {
 		}
 	})
 
+	// --- Paging (default): empty cursor signals the last page ---
+	t.Run("Paging", func(t *testing.T) {
+		// 5 seeds, Limit(2): pages of 2, 2, 1. Default mode (no Stream).
+		q := newQ().Order("score").Limit(2)
+
+		// Page 1: full page (== limit) -> non-empty cursor (more to come).
+		page1, cursor, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Page 1 failed: %v", err)
+		}
+		if len(page1) != 2 {
+			t.Fatalf("Page 1: expected 2 results, got %d", len(page1))
+		}
+		if cursor == "" {
+			t.Fatal("Page 1: expected non-empty cursor (full page)")
+		}
+
+		// Page 2: full page (== limit) -> still non-empty cursor.
+		page2, cursor, err := dsorm.Query[*QueryModel](ctx, testDB, q, cursor)
+		if err != nil {
+			t.Fatalf("Page 2 failed: %v", err)
+		}
+		if len(page2) != 2 {
+			t.Fatalf("Page 2: expected 2 results, got %d", len(page2))
+		}
+		if cursor == "" {
+			t.Fatal("Page 2: expected non-empty cursor (full page)")
+		}
+
+		// Page 3: partial page (< limit) -> empty cursor signals the end.
+		page3, cursor, err := dsorm.Query[*QueryModel](ctx, testDB, q, cursor)
+		if err != nil {
+			t.Fatalf("Page 3 failed: %v", err)
+		}
+		if len(page3) != 1 {
+			t.Fatalf("Page 3: expected 1 result, got %d", len(page3))
+		}
+		if cursor != "" {
+			t.Errorf("Page 3: expected empty cursor on last page, got %q", cursor)
+		}
+	})
+
+	// --- Paging (default): partial single page yields no cursor ---
+	t.Run("PagingSinglePartialPage", func(t *testing.T) {
+		// Limit greater than the result count -> one partial page -> empty cursor.
+		q := newQ().Order("score").Limit(10)
+		results, cursor, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Query failed: %v", err)
+		}
+		if len(results) != 5 {
+			t.Fatalf("Expected 5 results, got %d", len(results))
+		}
+		if cursor != "" {
+			t.Errorf("Expected empty cursor on a partial last page, got %q", cursor)
+		}
+	})
+
+	// --- Stream: keeps the trailing cursor on the last page ---
+	t.Run("Stream", func(t *testing.T) {
+		// Stream() preserves the datastore cursor instead of emptying it, so a
+		// full page (== limit) still hands back a resumable bookmark.
+		q := newQ().Order("score").Limit(2).Stream()
+		page1, cursor, err := dsorm.Query[*QueryModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("Stream query failed: %v", err)
+		}
+		if len(page1) != 2 {
+			t.Fatalf("Expected 2 results, got %d", len(page1))
+		}
+		if cursor == "" {
+			t.Fatal("Stream: expected non-empty cursor to resume from")
+		}
+
+		// Resuming from the stream cursor continues where we left off.
+		page2, _, err := dsorm.Query[*QueryModel](ctx, testDB, q, cursor)
+		if err != nil {
+			t.Fatalf("Stream resume failed: %v", err)
+		}
+		if len(page2) == 0 {
+			t.Error("Stream: expected to resume with more results from the cursor")
+		}
+	})
+
 	// --- Inequality: Greater Than ---
 	t.Run("InequalityGT", func(t *testing.T) {
 		q := newQ().FilterField("score", ">", 30)

@@ -20,6 +20,8 @@ type QueryBuilder struct {
 	ancestor  *datastore.Key
 	cursorStr string
 	namespace string
+
+	stream bool
 }
 
 // NewQuery creates a new query for a specific kind.
@@ -87,6 +89,24 @@ func (q *QueryBuilder) Start(cursor string) *QueryBuilder {
 	return q
 }
 
+// Stream switches the query to streaming (cursor-continuation) mode: it makes
+// [Client.Query] always return the trailing datastore cursor, even on the last
+// page, so the query can be resumed or tailed later to pick up new entities.
+//
+// By default (Stream not set), Query is page-based: it returns an empty cursor
+// once the last page is reached, i.e. when fewer results than the configured
+// [QueryBuilder.Limit] are returned (or no Limit is set). This makes
+// "empty cursor == no more pages" a reliable end-of-results signal, which suits
+// most pagination. Use Stream when you need a resumable bookmark instead.
+//
+// Note: in the default page-based mode, a page that returns exactly Limit
+// results still yields a non-empty cursor; the following Query then returns no
+// results and an empty cursor.
+func (q *QueryBuilder) Stream() *QueryBuilder {
+	q.stream = true
+	return q
+}
+
 // Data Getters for drivers
 func (q *QueryBuilder) Kind() string                { return q.kind }
 func (q *QueryBuilder) Filters() []ds.Filter        { return q.filters }
@@ -97,6 +117,17 @@ func (q *QueryBuilder) IsKeysOnly() bool            { return q.keysOnly }
 func (q *QueryBuilder) GetAncestor() *datastore.Key { return q.ancestor }
 func (q *QueryBuilder) GetCursor() string           { return q.cursorStr }
 func (q *QueryBuilder) GetNamespace() string        { return q.namespace }
+
+// endCursor applies the page-based cursor rule. In the default (non-Stream)
+// mode, if the number of returned results is below the limit (or no limit is
+// set), the cursor is emptied to signal there are no more pages. In Stream mode
+// the original cursor is always returned unchanged.
+func (q *QueryBuilder) endCursor(resultCount int, next string) string {
+	if !q.stream && (q.limit <= 0 || resultCount < q.limit) {
+		return ""
+	}
+	return next
+}
 
 // Hash generates a deterministic hash of the query builder state.
 func (q *QueryBuilder) Hash() string {

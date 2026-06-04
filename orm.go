@@ -1046,7 +1046,7 @@ func (c *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals
 					}
 				}
 			}
-			return keys, next, nil
+			return keys, q.endCursor(len(keys), next), nil
 		}
 	}
 
@@ -1094,7 +1094,7 @@ func (c *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals
 			}
 		}
 	}
-	return keys, next, nil
+	return keys, q.endCursor(len(keys), next), nil
 }
 
 // Transaction wraps a datastore transaction with dsorm functionality
