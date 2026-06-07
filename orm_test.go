@@ -1304,6 +1304,15 @@ type QueryModel struct {
 	Score int    `datastore:"score"`
 }
 
+// scores extracts the Score field for readable test failure messages.
+func scores(ms []*QueryModel) []int {
+	out := make([]int, len(ms))
+	for i, m := range ms {
+		out[i] = m.Score
+	}
+	return out
+}
+
 func TestQueryFeatures(t *testing.T) {
 	runAllStores(t, testQueryFeatures)
 }
@@ -1397,6 +1406,53 @@ func testQueryFeatures(t *testing.T, testDB *dsorm.Client) {
 			if results[i].Score > results[i-1].Score {
 				t.Errorf("Results not sorted descending: score[%d]=%d > score[%d]=%d",
 					i, results[i].Score, i-1, results[i-1].Score)
+			}
+		}
+	})
+
+	// --- Numeric ordering across digit-count boundaries ---
+	// Regression: scores spanning single and double digits (1..10) sort
+	// differently under text vs numeric ordering (text gives 1,10,2,...). The
+	// order field has no numeric filter on it here, so this guards against the
+	// local store deciding sort type from filters instead of the stored type.
+	t.Run("OrderNumericAcrossDigits", func(t *testing.T) {
+		numGroup := fmt.Sprintf("numgrp-%d", time.Now().UnixNano())
+		numBase := time.Now().UnixNano()
+		for i := 1; i <= 10; i++ {
+			m := &QueryModel{ID: numBase + int64(i), Group: numGroup, Label: fmt.Sprintf("n%d", i), Score: i}
+			if err := testDB.Put(ctx, m); err != nil {
+				t.Fatalf("Seed Put %d failed: %v", i, err)
+			}
+		}
+		numQ := func() *dsorm.QueryBuilder {
+			return dsorm.NewQuery("QueryModel").FilterField("group", "=", numGroup)
+		}
+
+		asc, _, err := dsorm.Query[*QueryModel](ctx, testDB, numQ().Order("score"), "")
+		if err != nil {
+			t.Fatalf("Asc query failed: %v", err)
+		}
+		wantAsc := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+		if len(asc) != len(wantAsc) {
+			t.Fatalf("Asc: expected %d results, got %d", len(wantAsc), len(asc))
+		}
+		for i, r := range asc {
+			if r.Score != wantAsc[i] {
+				t.Errorf("Asc[%d]: expected score %d, got %d (full: %v)", i, wantAsc[i], r.Score, scores(asc))
+			}
+		}
+
+		desc, _, err := dsorm.Query[*QueryModel](ctx, testDB, numQ().Order("-score"), "")
+		if err != nil {
+			t.Fatalf("Desc query failed: %v", err)
+		}
+		wantDesc := []int{10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
+		if len(desc) != len(wantDesc) {
+			t.Fatalf("Desc: expected %d results, got %d", len(wantDesc), len(desc))
+		}
+		for i, r := range desc {
+			if r.Score != wantDesc[i] {
+				t.Errorf("Desc[%d]: expected score %d, got %d (full: %v)", i, wantDesc[i], r.Score, scores(desc))
 			}
 		}
 	})

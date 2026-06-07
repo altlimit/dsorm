@@ -1138,23 +1138,14 @@ func (c *Store) Run(ctx context.Context, q ds.Query) ds.Iterator {
 			queryStr += fmt.Sprintf(" LEFT JOIN %q %s ON main.key = %s.key AND %s.name = ? AND %s.no_index = 0", propsTable, alias, alias, alias, alias)
 			orderJoinArgs = append(orderJoinArgs, o.Field)
 
-			// Determine if the order field is numeric by checking filters
-			orderIsNumeric := false
-			for _, f := range q.Filters() {
-				if f.Field == o.Field {
-					dt := filterDataType(f.Value)
-					if dt == "int" || dt == "float" {
-						orderIsNumeric = true
-					}
-					break
-				}
-			}
-
-			if orderIsNumeric {
-				orderStrs = append(orderStrs, fmt.Sprintf("CAST(%s.value AS REAL) %s", alias, dir))
-			} else {
-				orderStrs = append(orderStrs, fmt.Sprintf("%s.value %s", alias, dir))
-			}
+			// Sort behavior is a property of the stored value's type, not of
+			// whether a filter happens to reference the field. Drive it off the
+			// joined row's data_type: numeric props (int/float) sort by their
+			// REAL value, everything else falls back to text. The text key also
+			// breaks ties between equal numeric values.
+			orderStrs = append(orderStrs, fmt.Sprintf(
+				"CASE WHEN %s.data_type IN ('int','float') THEN CAST(%s.value AS REAL) END %s, %s.value %s",
+				alias, alias, dir, alias, dir))
 		}
 	}
 
