@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -259,6 +260,81 @@ func testModelLifecycle(t *testing.T, testDB *dsorm.Client) {
 		}
 		if fetched.Events[1] != "AfterDelete" {
 			t.Errorf("Expected AfterDelete, got %s", fetched.Events[1])
+		}
+	}
+}
+
+// TestRePutCountsAsUpdate guards against the AfterSave "old" reconstruction
+// misclassifying an in-request re-Put of a never-loaded struct as a create.
+// Building a struct in memory, Put-ing it (create), then mutating and Put-ing
+// the SAME struct again must diff as an update (old != nil) on the second save.
+func TestRePutCountsAsUpdate(t *testing.T) {
+	runAllStores(t, testRePutCountsAsUpdate)
+}
+
+func testRePutCountsAsUpdate(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	// --- Client.Put: in-memory create, then mutate + re-Put same struct ---
+	m := &LifecycleModel{ID: 7001, Value: "created"}
+	if err := testDB.Put(ctx, m); err != nil {
+		t.Fatalf("first Put failed: %v", err)
+	}
+	if m.IsNew() {
+		t.Error("IsNew() should be false after Put")
+	}
+	if !slices.Contains(m.Events, "OldIsNil") {
+		t.Errorf("first Put should be a create (OldIsNil), got %v", m.Events)
+	}
+
+	m.Events = nil
+	m.Value = "updated"
+	if err := testDB.Put(ctx, m); err != nil {
+		t.Fatalf("second Put failed: %v", err)
+	}
+	if slices.Contains(m.Events, "OldIsNil") {
+		t.Errorf("second Put of same struct should be an update, not a create; got %v", m.Events)
+	}
+	if !slices.Contains(m.Events, "OldValue=created") {
+		t.Errorf("second Put should diff against prior saved value; got %v", m.Events)
+	}
+
+	// --- Transaction.Put: create then re-Put same struct in one tx ---
+	tm := &LifecycleModel{ID: 7002, Value: "tx-created"}
+	if _, err := testDB.Transact(ctx, func(tx *dsorm.Transaction) error {
+		if err := tx.Put(tm); err != nil {
+			return err
+		}
+		tm.Events = nil
+		tm.Value = "tx-updated"
+		return tx.Put(tm)
+	}); err != nil {
+		t.Fatalf("Transact failed: %v", err)
+	}
+	if slices.Contains(tm.Events, "OldIsNil") {
+		t.Errorf("second tx.Put of same struct should be an update; got %v", tm.Events)
+	}
+	if !slices.Contains(tm.Events, "OldValue=tx-created") {
+		t.Errorf("second tx.Put should diff against prior saved value; got %v", tm.Events)
+	}
+
+	// --- PutMulti: create then re-Put same structs ---
+	a := &LifecycleModel{ID: 7003, Value: "multi-a"}
+	b := &LifecycleModel{ID: 7004, Value: "multi-b"}
+	if err := testDB.PutMulti(ctx, []*LifecycleModel{a, b}); err != nil {
+		t.Fatalf("PutMulti failed: %v", err)
+	}
+	if a.IsNew() || b.IsNew() {
+		t.Error("IsNew() should be false after PutMulti")
+	}
+	a.Events, b.Events = nil, nil
+	a.Value, b.Value = "multi-a2", "multi-b2"
+	if err := testDB.PutMulti(ctx, []*LifecycleModel{a, b}); err != nil {
+		t.Fatalf("second PutMulti failed: %v", err)
+	}
+	for _, mm := range []*LifecycleModel{a, b} {
+		if slices.Contains(mm.Events, "OldIsNil") {
+			t.Errorf("second PutMulti of same struct should be an update; got %v", mm.Events)
 		}
 	}
 }

@@ -382,6 +382,22 @@ func saveModel(ctx context.Context, e any) ([]datastore.Property, error) {
 		}
 	}
 
+	return snapshotProps(ctx, e)
+}
+
+// snapshotProps serializes e into datastore properties WITHOUT mutating the
+// created/modified timestamp fields. saveModel uses it after stamping
+// timestamps; markPersisted uses it to capture post-Put state into initProps
+// (where re-stamping created/modified on the live struct would be incorrect).
+func snapshotProps(ctx context.Context, e any) ([]datastore.Property, error) {
+	t := reflect.TypeOf(e)
+	v := reflect.ValueOf(e)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+		v = v.Elem()
+	}
+	info := getTypeInfo(t)
+
 	props, err := datastore.SaveStruct(e)
 	if err != nil {
 		return nil, err
@@ -413,6 +429,24 @@ func saveModel(ctx context.Context, e any) ([]datastore.Property, error) {
 		}
 	}
 	return props, nil
+}
+
+// markPersisted snapshots the just-saved entity into its initProps so that a
+// subsequent Put of the same in-memory struct is diffed as an update rather
+// than re-counted as a create (IsNew reports false afterwards). It must be
+// called AFTER any AfterSave hook so a genuine first create still observes
+// old == nil. A no-op for values that do not implement modeler.
+func markPersisted(ctx context.Context, val any) error {
+	m, ok := val.(modeler)
+	if !ok {
+		return nil
+	}
+	props, err := snapshotProps(ctx, val)
+	if err != nil {
+		return err
+	}
+	m.setInitProps(props)
+	return nil
 }
 
 func appendMarshaledProp(ctx context.Context, props []datastore.Property, tag string, vv reflect.Value, shouldEncrypt bool) ([]datastore.Property, error) {
@@ -821,6 +855,9 @@ func (c *Client) Put(ctx context.Context, val interface{}) error {
 			return err
 		}
 	}
+	if err := markPersisted(ctx, val); err != nil {
+		return err
+	}
 	_ = invalidateKinds(ctx, c, []string{k.Kind})
 	return nil
 }
@@ -869,6 +906,12 @@ func (c *Client) PutMulti(ctx context.Context, vals interface{}) error {
 		if err := util.Task(20, as, func(f func() error) error {
 			return f()
 		}); err != nil {
+			return err
+		}
+	}
+
+	for i := 0; i < v.Len(); i++ {
+		if err := markPersisted(ctx, v.Index(i).Interface()); err != nil {
 			return err
 		}
 	}
@@ -1196,9 +1239,11 @@ func (t *Transaction) Put(val interface{}) error {
 		if err != nil {
 			return err
 		}
-		return as.AfterSave(t.ctx, old)
+		if err := as.AfterSave(t.ctx, old); err != nil {
+			return err
+		}
 	}
-	return nil
+	return markPersisted(t.ctx, val)
 }
 
 // PutMulti saves multiple entities within the transaction. Auto-generated
@@ -1245,9 +1290,17 @@ func (t *Transaction) PutMulti(vals interface{}) error {
 	}
 
 	if len(as) > 0 {
-		return util.Task(20, as, func(f func() error) error {
+		if err := util.Task(20, as, func(f func() error) error {
 			return f()
-		})
+		}); err != nil {
+			return err
+		}
+	}
+
+	for i := 0; i < v.Len(); i++ {
+		if err := markPersisted(t.ctx, v.Index(i).Interface()); err != nil {
+			return err
+		}
 	}
 	return nil
 }
