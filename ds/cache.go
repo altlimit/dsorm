@@ -38,6 +38,30 @@ var (
 	ErrNotStored   = errors.New("dsorm: not stored")
 )
 
+type contextKey string
+
+const tenantContextKey contextKey = "dsorm_cache_tenant"
+
+// WithTenant returns a copy of ctx carrying the given cache tenant
+// identifier. Cache backends that support multi-tenancy (e.g. the Cloudflare
+// Durable Object backend, where each tenant maps to its own object) route all
+// operations performed with this context to that tenant's isolated namespace.
+// Backends that do not support tenancy ignore it.
+//
+// When no tenant is set, such backends fall back to a single shared default
+// tenant.
+func WithTenant(ctx context.Context, tenant string) context.Context {
+	return context.WithValue(ctx, tenantContextKey, tenant)
+}
+
+// TenantFromContext returns the cache tenant carried by ctx, or "" if none.
+func TenantFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(tenantContextKey).(string); ok {
+		return v
+	}
+	return ""
+}
+
 // Cache interface for backend storage.
 type Cache interface {
 	// AddMulti adds items if keys are not in use. Returns ErrNotStored on conflict.

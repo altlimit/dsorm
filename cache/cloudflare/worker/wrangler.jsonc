@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dsorm-cache",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-03-26",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CACHE",
+        "class_name": "CacheDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["CacheDO"]
+    }
+  ]
+}

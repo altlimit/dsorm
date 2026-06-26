@@ -16,6 +16,7 @@ import (
 
 	"cloud.google.com/go/datastore"
 	"github.com/altlimit/dsorm/cache"
+	"github.com/altlimit/dsorm/cache/cloudflare"
 	"github.com/altlimit/dsorm/cache/memcache"
 	"github.com/altlimit/dsorm/cache/memory"
 	"github.com/altlimit/dsorm/cache/redis"
@@ -612,13 +613,26 @@ func WithEncryptionKeyContext(ctx context.Context, key []byte) context.Context {
 	return context.WithValue(ctx, encryptionKeyKey, key)
 }
 
+// WithTenantContext returns a copy of ctx carrying the given cache tenant
+// identifier. Multi-tenant cache backends (currently the Cloudflare Durable
+// Object backend) isolate all cache operations performed with this context
+// into that tenant's namespace; other backends ignore it.
+//
+// Use this to derive the tenant per-request (e.g. from the authenticated
+// account) rather than fixing it at [Client] creation. When unset, the backend
+// falls back to its configured default tenant.
+func WithTenantContext(ctx context.Context, tenant string) context.Context {
+	return ds.WithTenant(ctx, tenant)
+}
+
 // New creates a new [Client] with the given options.
 //
 // Caching backend is auto-detected in the following order unless overridden
 // with [WithCache]:
 //  1. App Engine Memcache (when running on App Engine)
 //  2. Redis (when REDIS_ADDR environment variable is set)
-//  3. In-memory cache (fallback)
+//  3. Cloudflare Durable Object (when DSORM_CF_CACHE_URL environment variable is set)
+//  4. In-memory cache (fallback)
 func New(ctx context.Context, opts ...Option) (*Client, error) {
 	o := &options{}
 	for _, opt := range opts {
@@ -657,6 +671,11 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 			o.cache = memcache.NewCache()
 		} else if redisAddr := os.Getenv("REDIS_ADDR"); redisAddr != "" {
 			o.cache, err = redis.NewCache(redisAddr)
+			if err != nil {
+				return nil, err
+			}
+		} else if cfURL := os.Getenv("DSORM_CF_CACHE_URL"); cfURL != "" {
+			o.cache, err = cloudflare.NewCache(cfURL)
 			if err != nil {
 				return nil, err
 			}
@@ -1678,7 +1697,6 @@ func invalidateKinds(ctx context.Context, c *Client, kinds []string) error {
 func (c *Client) InvalidateKinds(ctx context.Context, kinds ...string) error {
 	return invalidateKinds(ctx, c, kinds)
 }
-
 
 func getKindsFromKeys(keys []*datastore.Key) []string {
 	var kinds []string

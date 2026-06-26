@@ -14,7 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"net/http/httptest"
+
 	"cloud.google.com/go/datastore"
+	"github.com/altlimit/dsorm/cache/cloudflare"
 	"github.com/altlimit/dsorm/cache/memory"
 	credis "github.com/altlimit/dsorm/cache/redis"
 	ds "github.com/altlimit/dsorm/ds"
@@ -130,6 +133,21 @@ func initRedis() {
 	cachers = append(cachers, cacherTestItem{ctx: context.Background(), cacher: cacher})
 }
 
+// cloudflareMockServer is kept alive for the duration of the test binary.
+var cloudflareMockServer *httptest.Server
+
+func initCloudflare() {
+	cloudflareMockServer = httptest.NewServer(cloudflare.NewMockHandler())
+	cacher, err := cloudflare.NewCache(cloudflareMockServer.URL)
+	if err != nil {
+		cloudflareMockServer.Close()
+		return
+	}
+	cachersGuard.Lock()
+	defer cachersGuard.Unlock()
+	cachers = append(cachers, cacherTestItem{ctx: context.Background(), cacher: cacher})
+}
+
 func TestMain(m *testing.M) {
 	flag.Parse()
 
@@ -137,6 +155,7 @@ func TestMain(m *testing.M) {
 	os.Setenv("DATASTORE_PROJECT_ID", "app-test")
 
 	initRedis()
+	initCloudflare()
 
 	retCode := m.Run()
 
