@@ -15,10 +15,12 @@ import { DurableObject } from "cloudflare:workers";
  * the value as an 8-byte little-endian int64. Blobs travel as base64 strings
  * because the Go client encodes []byte as base64 JSON.
  */
-export class CacheDO extends DurableObject {
+type CacheEnv = Record<string, unknown>;
+
+export class CacheDO extends DurableObject<CacheEnv> {
   private sql: SqlStorage;
 
-  constructor(ctx: DurableObjectState, env: unknown) {
+  constructor(ctx: DurableObjectState, env: CacheEnv) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec(
@@ -36,33 +38,44 @@ export class CacheDO extends DurableObject {
     const body = (await request.json()) as BatchRequest;
     const now = Date.now();
 
-    switch (op) {
-      case "get":
-        return json(this.get(body.keys ?? [], now));
-      case "set":
-        return json(this.write(body.items ?? [], now, false));
-      case "add":
-        return json(this.write(body.items ?? [], now, true));
-      case "cas":
-        return json(this.cas(body.items ?? [], now));
-      case "delete":
-        return json(this.delete(body.keys ?? [], now));
-      case "incr":
-        return json(this.increment(body, now));
-      default:
-        return new Response("unknown op", { status: 404 });
+    const handle = (): BatchResponse | null => {
+      switch (op) {
+        case "get":
+          return this.get(body.keys ?? [], now);
+        case "set":
+          return this.write(body.items ?? [], now, false);
+        case "add":
+          return this.write(body.items ?? [], now, true);
+        case "cas":
+          return this.cas(body.items ?? [], now);
+        case "delete":
+          return this.delete(body.keys ?? [], now);
+        case "incr":
+          return this.increment(body, now);
+        default:
+          return null;
+      }
+    };
+
+    // Run the whole op inside one synchronous transaction. The DO is
+    // single-threaded and exec() is synchronous, so the read-modify-write
+    // sequences in add/cas/incr are already indivisible; transactionSync makes
+    // that boundary explicit, rolls the batch back if any statement throws, and
+    // (by requiring a synchronous callback) prevents a stray `await` from later
+    // being introduced mid-handler and silently breaking atomicity.
+    const resp = this.ctx.storage.transactionSync(handle);
+    if (resp === null) {
+      return new Response("unknown op", { status: 404 });
     }
+    return json(resp);
   }
 
   private get(keys: string[], now: number): BatchResponse {
     const items: WireItem[] = [];
     for (const key of keys) {
       const row = this.sql
-        .exec(
-          "SELECT blob, expires_at FROM cache WHERE key = ?",
-          key,
-        )
-        .toArray()[0] as Row | undefined;
+        .exec<Row>("SELECT blob, expires_at FROM cache WHERE key = ?", key)
+        .toArray()[0];
       if (!row) continue;
       if (isExpired(row.expires_at, now)) {
         this.sql.exec("DELETE FROM cache WHERE key = ?", key);
@@ -78,8 +91,8 @@ export class CacheDO extends DurableObject {
     for (const it of items) {
       if (addOnly) {
         const row = this.sql
-          .exec("SELECT expires_at FROM cache WHERE key = ?", it.k)
-          .toArray()[0] as Pick<Row, "expires_at"> | undefined;
+          .exec<Row>("SELECT blob, expires_at FROM cache WHERE key = ?", it.k)
+          .toArray()[0];
         if (row && !isExpired(row.expires_at, now)) {
           codes.push("notstored");
           continue;
@@ -101,8 +114,8 @@ export class CacheDO extends DurableObject {
     const codes: string[] = [];
     for (const it of items) {
       const row = this.sql
-        .exec("SELECT blob, expires_at FROM cache WHERE key = ?", it.k)
-        .toArray()[0] as Row | undefined;
+        .exec<Row>("SELECT blob, expires_at FROM cache WHERE key = ?", it.k)
+        .toArray()[0];
       if (!row || isExpired(row.expires_at, now)) {
         this.sql.exec("DELETE FROM cache WHERE key = ?", it.k);
         codes.push("notstored");
@@ -127,8 +140,8 @@ export class CacheDO extends DurableObject {
     let count = 0;
     for (const key of keys) {
       const row = this.sql
-        .exec("SELECT expires_at FROM cache WHERE key = ?", key)
-        .toArray()[0] as Pick<Row, "expires_at"> | undefined;
+        .exec<Row>("SELECT blob, expires_at FROM cache WHERE key = ?", key)
+        .toArray()[0];
       if (!row) continue;
       this.sql.exec("DELETE FROM cache WHERE key = ?", key);
       if (!isExpired(row.expires_at, now)) count++;
@@ -139,8 +152,8 @@ export class CacheDO extends DurableObject {
   private increment(body: BatchRequest, now: number): BatchResponse {
     const key = body.key ?? "";
     const row = this.sql
-      .exec("SELECT blob, expires_at FROM cache WHERE key = ?", key)
-      .toArray()[0] as Row | undefined;
+      .exec<Row>("SELECT blob, expires_at FROM cache WHERE key = ?", key)
+      .toArray()[0];
 
     let n = 0n;
     let expiresAt: number | null = null;
@@ -186,6 +199,8 @@ interface BatchResponse {
 interface Row {
   blob: string;
   expires_at: number | null;
+  // Index signature so Row satisfies SqlStorage.exec's Record constraint.
+  [column: string]: SqlStorageValue;
 }
 
 // ---- helpers ----

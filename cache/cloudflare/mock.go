@@ -14,6 +14,10 @@ import (
 // semantics (per-tenant isolation, lazy TTL expiry, atomic add/cas/increment)
 // intended for tests and local development without Cloudflare. It is not a
 // production cache: state lives only in process memory.
+//
+// Each request's dispatch runs while holding a single mutex (see ServeHTTP),
+// which mirrors the DO's per-op transactionSync: the read-modify-write in
+// add/cas/increment cannot interleave with another request.
 func NewMockHandler() http.Handler {
 	return &mockStore{tenants: make(map[string]map[string]mockEntry)}
 }
