@@ -535,8 +535,9 @@ func WithProjectID(id string) Option {
 }
 
 // WithCache overrides the auto-detected caching backend with the provided
-// implementation. By default, [New] selects App Engine Memcache, Redis
-// (via REDIS_ADDR env), or in-memory cache, in that order.
+// implementation. By default, [New] selects Redis (via REDIS_URL env), App
+// Engine Memcache, Redis (via REDIS_ADDR env), Cloudflare Durable Object, or
+// in-memory cache, in that order.
 func WithCache(c ds.Cache) Option {
 	return func(o *options) {
 		o.cache = c
@@ -629,10 +630,11 @@ func WithTenantContext(ctx context.Context, tenant string) context.Context {
 //
 // Caching backend is auto-detected in the following order unless overridden
 // with [WithCache]:
-//  1. App Engine Memcache (when running on App Engine)
-//  2. Redis (when REDIS_ADDR environment variable is set)
-//  3. Cloudflare Durable Object (when DSORM_CF_CACHE_URL environment variable is set)
-//  4. In-memory cache (fallback)
+//  1. Redis (when REDIS_URL environment variable is set, e.g. redis://host:6379/0)
+//  2. App Engine Memcache (when running on App Engine)
+//  3. Redis (when REDIS_ADDR environment variable is set)
+//  4. Cloudflare Durable Object (when DSORM_CF_CACHE_URL environment variable is set)
+//  5. In-memory cache (fallback)
 func New(ctx context.Context, opts ...Option) (*Client, error) {
 	o := &options{}
 	for _, opt := range opts {
@@ -667,7 +669,12 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 	}
 
 	if !o.noCache && o.cache == nil {
-		if appengine.IsAppEngine() || appengine.IsDevAppServer() {
+		if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
+			o.cache, err = redis.NewCacheFromURL(redisURL)
+			if err != nil {
+				return nil, err
+			}
+		} else if appengine.IsAppEngine() || appengine.IsDevAppServer() {
 			o.cache = memcache.NewCache()
 		} else if redisAddr := os.Getenv("REDIS_ADDR"); redisAddr != "" {
 			o.cache, err = redis.NewCache(redisAddr)

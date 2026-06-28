@@ -96,6 +96,46 @@ func NewCache(addr string, opts ...Option) (dsorm.Cache, error) {
 	return b, nil
 }
 
+// NewCacheFromURL creates a new dsorm.Cache from a Redis/Valkey connection URL
+// (e.g. "redis://user:pass@localhost:6379/0" or "rediss://host:6379" for TLS).
+// Connection settings parsed from the URL (password, database, TLS) may be
+// overridden by the provided options.
+func NewCacheFromURL(url string, opts ...Option) (dsorm.Cache, error) {
+	clientOpts, err := valkey.ParseURL(url)
+	if err != nil {
+		return nil, fmt.Errorf("redis: invalid URL: %w", err)
+	}
+
+	b := &backend{}
+	for _, opt := range opts {
+		opt(b)
+	}
+	if b.password != "" {
+		clientOpts.Password = b.password
+	}
+	if b.db != 0 {
+		clientOpts.SelectDB = b.db
+	}
+
+	client, err := valkey.NewClient(clientOpts)
+	if err != nil {
+		return nil, fmt.Errorf("redis: failed to create client: %w", err)
+	}
+
+	b.client = client
+	b.ownsClient = true
+
+	// Validate connectivity
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Do(ctx, client.B().Ping().Build()).Error(); err != nil {
+		client.Close()
+		return nil, fmt.Errorf("redis: ping failed: %w", err)
+	}
+
+	return b, nil
+}
+
 // NewCacheFromClient creates a dsorm.Cache from an existing valkey.Client.
 // This is useful for advanced configurations (cluster, sentinel, etc).
 // The caller retains ownership of the client and must close it themselves.
