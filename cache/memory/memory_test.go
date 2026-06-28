@@ -63,6 +63,31 @@ func TestMemoryCache(t *testing.T) {
 	}
 }
 
+func TestMemoryFlush(t *testing.T) {
+	cacher := NewCache()
+	ctx := context.Background()
+
+	items := []*dsorm.Item{
+		{Key: "a", Value: []byte("1")},
+		{Key: "b", Value: []byte("2")},
+	}
+	if err := cacher.SetMulti(ctx, items); err != nil {
+		t.Fatalf("SetMulti failed: %v", err)
+	}
+
+	if err := cacher.Flush(ctx); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+
+	got, err := cacher.GetMulti(ctx, []string{"a", "b"})
+	if err != nil {
+		t.Fatalf("GetMulti failed: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty cache after flush, got %d items", len(got))
+	}
+}
+
 func TestMemoryCAS(t *testing.T) {
 	cacher := NewCache()
 	ctx := context.Background()

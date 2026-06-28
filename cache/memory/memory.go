@@ -249,6 +249,18 @@ func (m *memory) Increment(ctx context.Context, key string, delta int64, expirat
 	return newVal, nil
 }
 
+func (m *memory) Flush(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store.Purge()
+	return nil
+}
+
 // getValid returns the object for key if it exists and is not expired.
 // Expired entries are cleaned up on access.
 func (m *memory) getValid(key string) (*object, bool) {

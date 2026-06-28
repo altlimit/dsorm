@@ -61,6 +61,10 @@ func (m *backend) Increment(ctx context.Context, key string, delta int64, expira
 	return int64(newVal), nil
 }
 
+func (m *backend) Flush(ctx context.Context) error {
+	return memcache.Flush(ctx)
+}
+
 func convertToMemcacheItems(items []*ds.Item) []*memcache.Item {
 	newItems := make([]*memcache.Item, len(items))
 	for i, item := range items {

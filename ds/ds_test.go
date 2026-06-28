@@ -106,6 +106,13 @@ func (m *mockCache) Increment(ctx context.Context, key string, delta int64, expi
 	return 0, errNotDefined
 }
 
+func (m *mockCache) Flush(ctx context.Context) error {
+	if m.cacher != nil {
+		return m.cacher.Flush(ctx)
+	}
+	return errNotDefined
+}
+
 func initRedis() {
 	if testing.Short() {
 		return

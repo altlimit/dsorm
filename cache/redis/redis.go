@@ -441,3 +441,12 @@ func (b *backend) Increment(ctx context.Context, key string, delta int64, expira
 	}
 	return val, nil
 }
+
+func (b *backend) Flush(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	return b.client.Do(ctx, b.client.B().Flushdb().Build()).Error()
+}

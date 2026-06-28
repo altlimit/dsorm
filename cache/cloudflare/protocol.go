@@ -23,6 +23,7 @@ const (
 	opCAS       = "cas"
 	opDelete    = "delete"
 	opIncrement = "incr"
+	opFlush     = "flush"
 )
 
 // Per-item result codes returned by add/set/cas.

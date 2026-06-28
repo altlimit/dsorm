@@ -167,6 +167,10 @@ func (m *mockStore) dispatch(tenant, op string, req *batchRequest) (*batchRespon
 		bucket[req.Key] = entry
 		resp.Value = n
 
+	case opFlush:
+		// Drop the whole tenant bucket; a fresh one is created lazily on next use.
+		delete(m.tenants, tenant)
+
 	default:
 		return nil, false
 	}

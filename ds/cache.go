@@ -83,6 +83,10 @@ type Cache interface {
 	// Returns the new value after incrementing. Creates the key with
 	// value=delta and the given expiration if the key does not exist.
 	Increment(ctx context.Context, key string, delta int64, expiration time.Duration) (int64, error)
+
+	// Flush removes all keys from the cache. Backends that support
+	// multi-tenancy flush only the tenant carried by ctx (see WithTenant).
+	Flush(ctx context.Context) error
 }
 
 // Item cache entry.

@@ -113,6 +113,42 @@ func TestTenantIsolation(t *testing.T) {
 	}
 }
 
+func TestFlush(t *testing.T) {
+	c := newTestCache(t)
+	base := context.Background()
+	ctxA := ds.WithTenant(base, "tenant-a")
+	ctxB := ds.WithTenant(base, "tenant-b")
+
+	if err := c.SetMulti(ctxA, []*ds.Item{{Key: "k", Value: []byte("a")}}); err != nil {
+		t.Fatalf("set A: %v", err)
+	}
+	if err := c.SetMulti(ctxB, []*ds.Item{{Key: "k", Value: []byte("b")}}); err != nil {
+		t.Fatalf("set B: %v", err)
+	}
+
+	if err := c.Flush(ctxA); err != nil {
+		t.Fatalf("flush A: %v", err)
+	}
+
+	// Tenant A is emptied.
+	got, err := c.GetMulti(ctxA, []string{"k"})
+	if err != nil {
+		t.Fatalf("get A: %v", err)
+	}
+	if _, ok := got["k"]; ok {
+		t.Errorf("tenant A still has key after flush")
+	}
+
+	// Tenant B is untouched.
+	got, err = c.GetMulti(ctxB, []string{"k"})
+	if err != nil {
+		t.Fatalf("get B: %v", err)
+	}
+	if item, ok := got["k"]; !ok || string(item.Value) != "b" {
+		t.Errorf("tenant B saw %q (ok=%v); want \"b\"", valOf(item), ok)
+	}
+}
+
 func valOf(i *ds.Item) string {
 	if i == nil {
 		return ""

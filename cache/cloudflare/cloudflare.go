@@ -330,3 +330,13 @@ func (b *backend) Increment(ctx context.Context, key string, delta int64, expira
 	}
 	return resp.Value, nil
 }
+
+// Flush removes every key for the context tenant (one Durable Object). Other
+// tenants are unaffected.
+func (b *backend) Flush(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_, err := b.do(ctx, b.tenant(ctx), opFlush, &batchRequest{})
+	return err
+}

@@ -8,7 +8,7 @@ import { DurableObject } from "cloudflare:workers";
  *
  * It implements the dsorm Cloudflare cache HTTP contract:
  *
- *   POST /v1/{tenant}/{op}   op in: get | set | add | cas | delete | incr
+ *   POST /v1/{tenant}/{op}   op in: get | set | add | cas | delete | incr | flush
  *
  * Stored values ("blobs") are opaque to the DO (a 4-byte LE flags header plus
  * the value bytes, produced by the Go client) except for `incr`, which treats
@@ -52,6 +52,8 @@ export class CacheDO extends DurableObject<CacheEnv> {
           return this.delete(body.keys ?? [], now);
         case "incr":
           return this.increment(body, now);
+        case "flush":
+          return this.flush();
         default:
           return null;
       }
@@ -173,6 +175,11 @@ export class CacheDO extends DurableObject<CacheEnv> {
       expiresAt,
     );
     return { value: Number(n) };
+  }
+
+  private flush(): BatchResponse {
+    this.sql.exec("DELETE FROM cache");
+    return {};
   }
 }
 

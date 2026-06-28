@@ -71,4 +71,14 @@ describe("CacheDO contract", () => {
     expect((await op("ta", "get", { keys: ["shared"] })).items[0].b).toBe(b64("a"));
     expect((await op("tb", "get", { keys: ["shared"] })).items[0].b).toBe(b64("b"));
   });
+
+  it("flush clears only the requested tenant", async () => {
+    await op("tf1", "set", { items: [{ k: "k", b: b64("1") }] });
+    await op("tf2", "set", { items: [{ k: "k", b: b64("2") }] });
+
+    await op("tf1", "flush", {});
+
+    expect((await op("tf1", "get", { keys: ["k"] })).items ?? []).toEqual([]);
+    expect((await op("tf2", "get", { keys: ["k"] })).items[0].b).toBe(b64("2"));
+  });
 });

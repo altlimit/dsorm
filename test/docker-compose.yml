@@ -33,8 +33,15 @@ services:
     environment:
       GOOGLE_CLOUD_PROJECT: 'app-test'
       DATASTORE_EMULATOR_HOST: "datastore:8081"
+      # The container has no outbound network, so build from the mounted host
+      # module cache instead of fetching from proxy.golang.org.
+      GOMODCACHE: /go/pkg/mod
+      GOPROXY: "off"
+      GOSUMDB: "off"
     volumes:
       - ../:/app
+      # Host Go module cache (run `go mod download` in this dir first), read-only.
+      - ${GOMODCACHE:-${HOME}/go/pkg/mod}:/go/pkg/mod:ro
     depends_on:
       - datastore
     ports:

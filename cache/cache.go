@@ -37,6 +37,10 @@ type Cache interface {
 	// limit is the max number of requests per window.
 	RateLimit(ctx context.Context, key string, limit int, window time.Duration) (*RateLimitResult, error)
 
+	// Flush removes all keys from the cache. Backends that support
+	// multi-tenancy flush only the tenant carried by ctx (see ds.WithTenant).
+	Flush(ctx context.Context) error
+
 	// Unwrap returns the underlying ds.Cache interface for advanced use.
 	Unwrap() ds.Cache
 }
@@ -112,6 +116,10 @@ func (w *wrapper) RateLimit(ctx context.Context, key string, limit int, window t
 		Remaining: remaining,
 		ResetAt:   resetAt,
 	}, nil
+}
+
+func (w *wrapper) Flush(ctx context.Context) error {
+	return w.c.Flush(ctx)
 }
 
 func (w *wrapper) Unwrap() ds.Cache {
