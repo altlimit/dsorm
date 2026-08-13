@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"reflect"
 	"strconv"
@@ -499,7 +501,22 @@ type Client struct {
 	appCache      cache.Cache
 	queryCache    bool
 	queryCacheTTL time.Duration
+	onErrorFn     OnErrorFunc
 	localVersions sync.Map // prevents stale cache on kind_v eviction
+}
+
+// onError reports an internal non-fatal error (e.g. a failed query cache
+// invalidation) to the handler set with [WithOnErrorFunc], falling back to
+// log.Println.
+func (c *Client) onError(ctx context.Context, err error) {
+	if err == nil {
+		return
+	}
+	if c.onErrorFn != nil {
+		c.onErrorFn(ctx, err)
+		return
+	}
+	log.Println(err)
 }
 
 // Cache returns an application-level cache.Cache for general-purpose
@@ -520,7 +537,12 @@ type options struct {
 	noCache         bool
 	queryCache      bool
 	queryCacheTTL   time.Duration
+	onErrorFn       OnErrorFunc
 }
+
+// OnErrorFunc handles internal non-fatal errors, i.e. errors that do not fail
+// the operation that produced them.
+type OnErrorFunc = ds.OnErrorFunc
 
 // Option configures a [Client] created via [New].
 type Option func(*options)
@@ -595,6 +617,16 @@ func WithQueryCache(ttl ...time.Duration) Option {
 		} else {
 			o.queryCacheTTL = time.Hour
 		}
+	}
+}
+
+// WithOnErrorFunc sets a handler for internal non-fatal errors, such as a
+// failed query cache invalidation or a failed entity cache write. The
+// operation that produced the error still succeeds; the error is reported so
+// it can be logged or traced. When unset, such errors go to log.Println.
+func WithOnErrorFunc(f OnErrorFunc) Option {
+	return func(o *options) {
+		o.onErrorFn = f
 	}
 }
 
@@ -702,6 +734,9 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 		dsOpts = append(dsOpts, ds.WithDatastoreClient(dsClient))
 	}
 	dsOpts = append(dsOpts, ds.WithCachePrefix(o.projectID+":"))
+	if o.onErrorFn != nil {
+		dsOpts = append(dsOpts, ds.WithOnErrorFunc(o.onErrorFn))
+	}
 
 	dsoClient, err := ds.NewClient(ctx, o.cache, dsOpts...)
 	if err != nil {
@@ -713,6 +748,7 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 		encKey:        o.encryptionKey,
 		queryCache:    o.queryCache,
 		queryCacheTTL: o.queryCacheTTL,
+		onErrorFn:     o.onErrorFn,
 	}, nil
 }
 
@@ -884,7 +920,9 @@ func (c *Client) Put(ctx context.Context, val interface{}) error {
 	if err := markPersisted(ctx, val); err != nil {
 		return err
 	}
-	_ = invalidateKinds(ctx, c, []string{k.Kind})
+	if err := invalidateKinds(ctx, c, []kindNS{{ns: k.Namespace, kind: k.Kind}}); err != nil {
+		c.onError(ctx, err)
+	}
 	return nil
 }
 
@@ -942,7 +980,9 @@ func (c *Client) PutMulti(ctx context.Context, vals interface{}) error {
 		}
 	}
 
-	_ = invalidateKinds(ctx, c, getKindsFromKeys(keys))
+	if err := invalidateKinds(ctx, c, getKindsFromKeys(keys)); err != nil {
+		c.onError(ctx, err)
+	}
 	return nil
 }
 
@@ -956,7 +996,8 @@ func (c *Client) Delete(ctx context.Context, val interface{}) error {
 			return err
 		}
 	}
-	err := c.client.Delete(ctx, c.Key(val))
+	k := c.Key(val)
+	err := c.client.Delete(ctx, k)
 	if err != nil {
 		return err
 	}
@@ -965,7 +1006,9 @@ func (c *Client) Delete(ctx context.Context, val interface{}) error {
 			return err
 		}
 	}
-	_ = invalidateKinds(ctx, c, []string{c.Key(val).Kind})
+	if err := invalidateKinds(ctx, c, []kindNS{{ns: k.Namespace, kind: k.Kind}}); err != nil {
+		c.onError(ctx, err)
+	}
 	return nil
 }
 
@@ -1024,7 +1067,9 @@ func (c *Client) DeleteMulti(ctx context.Context, vals interface{}) error {
 			return err
 		}
 	}
-	_ = invalidateKinds(ctx, c, getKindsFromKeys(keys))
+	if err := invalidateKinds(ctx, c, getKindsFromKeys(keys)); err != nil {
+		c.onError(ctx, err)
+	}
 	return nil
 }
 
@@ -1060,7 +1105,11 @@ func (c *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals
 	var cacheKey string
 	if c.queryCache {
 		hash := q.Hash()
-		versionItem, err := c.Cache().Get(ctx, "kind_v:"+q.Kind())
+		// Generations are tracked per namespace so a write in one namespace
+		// only invalidates that namespace's cached queries.
+		ns := q.effectiveNamespace()
+		vKey := kindVersionKey(ns, q.Kind())
+		versionItem, err := c.Cache().Get(ctx, vKey)
 		version := int64(0)
 		if err == nil && versionItem != nil {
 			v, errP := strconv.ParseInt(string(versionItem.Value), 10, 64)
@@ -1070,11 +1119,14 @@ func (c *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals
 				version = int64(binary.LittleEndian.Uint64(versionItem.Value))
 			}
 			if version > 0 {
-				c.localVersions.Store(q.Kind(), version)
+				c.localVersions.Store(vKey, version)
 			}
 		} else {
+			if err != nil && !errors.Is(err, ds.ErrCacheMiss) {
+				c.onError(ctx, fmt.Errorf("dsorm: read query cache version %q: %w", vKey, err))
+			}
 			// Cache miss or eviction. We must not start from 0 to avoid serving stale cache.
-			v, ok := c.localVersions.Load(q.Kind())
+			v, ok := c.localVersions.Load(vKey)
 			if ok {
 				version = v.(int64)
 			} else {
@@ -1082,13 +1134,15 @@ func (c *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals
 				version = time.Now().UnixMilli()
 			}
 			// Restore it in the cache atomically
-			newV, errI := c.Cache().Increment(ctx, "kind_v:"+q.Kind(), version, 0)
+			newV, errI := c.Cache().Increment(ctx, vKey, version, 0)
 			if errI == nil {
 				version = newV
-				c.localVersions.Store(q.Kind(), version)
+				c.localVersions.Store(vKey, version)
+			} else {
+				c.onError(ctx, fmt.Errorf("dsorm: restore query cache version %q: %w", vKey, errI))
 			}
 		}
-		cacheKey = fmt.Sprintf("qcache:%s:v%d:%s", q.Kind(), version, hash)
+		cacheKey = fmt.Sprintf("qcache:%s:%s:v%d:%s", ns, q.Kind(), version, hash)
 
 		cached, err := cache.Load[queryCacheData](ctx, c.Cache(), cacheKey)
 		if err == nil {
@@ -1135,10 +1189,12 @@ func (c *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals
 	}
 
 	if c.queryCache {
-		_ = cache.Save(ctx, c.Cache(), cacheKey, queryCacheData{
+		if err := cache.Save(ctx, c.Cache(), cacheKey, queryCacheData{
 			Keys: keys,
 			Next: next,
-		}, c.queryCacheTTL)
+		}, c.queryCacheTTL); err != nil {
+			c.onError(ctx, fmt.Errorf("dsorm: save query cache %q: %w", cacheKey, err))
+		}
 	}
 
 	if vals != nil {
@@ -1445,7 +1501,9 @@ func (c *Client) Transact(ctx context.Context, f func(tx *Transaction) error) (*
 		}
 	}
 	if cmt != nil {
-		_ = invalidateKinds(ctx, c, getKindsFromKeys(modKeys))
+		if err := invalidateKinds(ctx, c, getKindsFromKeys(modKeys)); err != nil {
+			c.onError(ctx, err)
+		}
 	}
 	return cmt, nil
 
@@ -1672,24 +1730,41 @@ func getTypeInfo(t reflect.Type) *typeInfo {
 	return info
 }
 
-// invalidateKinds increments the cache version for the given kinds,
-// effectively invalidating any cached queries for them.
-func invalidateKinds(ctx context.Context, c *Client, kinds []string) error {
+// kindNS identifies a kind within a datastore namespace. Query cache
+// generations are tracked per (namespace, kind) pair so that writing an entity
+// in one namespace does not invalidate the cached queries of every other
+// namespace.
+type kindNS struct {
+	ns   string
+	kind string
+}
+
+// kindVersionKey returns the cache key holding the query cache generation
+// counter for a kind within a namespace. Datastore namespace ids cannot
+// contain ':', so the encoding is unambiguous.
+func kindVersionKey(ns, kind string) string {
+	return "kind_v:" + ns + ":" + kind
+}
+
+// invalidateKinds increments the cache version for the given kinds within
+// their namespaces, effectively invalidating any cached queries for them.
+func invalidateKinds(ctx context.Context, c *Client, kinds []kindNS) error {
 	if !c.queryCache || len(kinds) == 0 {
 		return nil
 	}
-	seen := make(map[string]bool)
+	seen := make(map[kindNS]bool)
 	g, gCtx := errgroup.WithContext(ctx)
 
 	for _, k := range kinds {
 		if !seen[k] {
 			seen[k] = true
+			vKey := kindVersionKey(k.ns, k.kind)
 			g.Go(func() error {
-				newV, err := c.Cache().Increment(gCtx, "kind_v:"+k, 1, 0)
+				newV, err := c.Cache().Increment(gCtx, vKey, 1, 0)
 				if err != nil {
-					return err
+					return fmt.Errorf("dsorm: invalidate query cache for kind %q in namespace %q: %w", k.kind, k.ns, err)
 				}
-				c.localVersions.Store(k, newV)
+				c.localVersions.Store(vKey, newV)
 				return nil
 			})
 		}
@@ -1697,21 +1772,38 @@ func invalidateKinds(ctx context.Context, c *Client, kinds []string) error {
 	return g.Wait()
 }
 
-// InvalidateKinds manually invalidates the query cache for the given kinds.
-// This is useful if you bypass the dsorm.Client and interact directly with the
-// underlying Store() to modify entities, as those operations won't automatically
-// trigger query cache invalidation.
+// InvalidateKinds manually invalidates the query cache for the given kinds in
+// the default (empty) namespace. This is useful if you bypass the dsorm.Client
+// and interact directly with the underlying Store() to modify entities, as
+// those operations won't automatically trigger query cache invalidation.
+//
+// Use [Client.InvalidateKindsNS] for entities stored in a namespace.
 func (c *Client) InvalidateKinds(ctx context.Context, kinds ...string) error {
-	return invalidateKinds(ctx, c, kinds)
+	return c.InvalidateKindsNS(ctx, "", kinds...)
 }
 
-func getKindsFromKeys(keys []*datastore.Key) []string {
-	var kinds []string
-	seen := make(map[string]bool)
+// InvalidateKindsNS manually invalidates the query cache for the given kinds
+// within a single datastore namespace. Generations are tracked per namespace,
+// so cached queries of other namespaces are left intact.
+func (c *Client) InvalidateKindsNS(ctx context.Context, ns string, kinds ...string) error {
+	kns := make([]kindNS, 0, len(kinds))
+	for _, k := range kinds {
+		kns = append(kns, kindNS{ns: ns, kind: k})
+	}
+	return invalidateKinds(ctx, c, kns)
+}
+
+func getKindsFromKeys(keys []*datastore.Key) []kindNS {
+	var kinds []kindNS
+	seen := make(map[kindNS]bool)
 	for _, k := range keys {
-		if k != nil && !seen[k.Kind] {
-			seen[k.Kind] = true
-			kinds = append(kinds, k.Kind)
+		if k == nil {
+			continue
+		}
+		kn := kindNS{ns: k.Namespace, kind: k.Kind}
+		if !seen[kn] {
+			seen[kn] = true
+			kinds = append(kinds, kn)
 		}
 	}
 	return kinds

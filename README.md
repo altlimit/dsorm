@@ -234,6 +234,8 @@ raw := c.Unwrap()
 
 Enable query caching at initialization using `dsorm.WithQueryCache(ttl)`. The ORM hashes query parameters to create a deterministic cache key. Cache invalidation is atomic and automatic: saving (`Put`, `PutMulti`, `Transact`) or deleting entities bumps a generation counter for the affected `Kind`, instantly invalidating related query caches across the cluster without needing expensive sweep operations.
 
+Generation counters are scoped per namespace, so in multi-tenant setups (one namespace per tenant) a write for one tenant only invalidates that tenant's cached queries.
+
 ```go
 // Initialize with query cache enabled (default TTL is 1 hour if duration is omitted)
 client, _ := dsorm.New(ctx, dsorm.WithQueryCache(time.Hour))
@@ -245,9 +247,30 @@ users, _, _ := dsorm.Query[*User](ctx, client, q, "")
 // Second run (Hit: hydrates from cached keys, avoiding expensive query costs)
 users2, _, _ := dsorm.Query[*User](ctx, client, q, "")
 
-// Modify an entity. This atomically bumps the "User" version,
-// invalidating ALL cached queries for the "User" Kind instantly.
+// Modify an entity. This atomically bumps the "User" version for that
+// entity's namespace, invalidating all cached "User" queries in it instantly.
+// Other namespaces keep their cached queries.
 client.Put(ctx, &User{ID: "new-user"})
+
+// If you bypass the client (e.g. writing through Store() directly), invalidate
+// manually — InvalidateKinds targets the default namespace, InvalidateKindsNS
+// a specific one.
+client.InvalidateKinds(ctx, "User")
+client.InvalidateKindsNS(ctx, "tenant-a", "User")
+```
+
+Invalidation is best-effort: if the cache backend is unreachable the write still
+succeeds and the failure is reported to the handler set with
+`dsorm.WithOnErrorFunc(fn)`, defaulting to `log.Println`. The same handler
+receives non-fatal errors from the entity cache layer.
+
+```go
+client, _ := dsorm.New(ctx,
+    dsorm.WithQueryCache(time.Hour),
+    dsorm.WithOnErrorFunc(func(ctx context.Context, err error) {
+        slog.ErrorContext(ctx, "dsorm cache", "err", err)
+    }),
+)
 ```
 
 ## Configuration

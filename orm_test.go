@@ -2605,6 +2605,112 @@ func TestQueryCache(t *testing.T) {
 	}
 }
 
+type QCNSModel struct {
+	dsorm.Base
+	ID    string `model:"id"`
+	NS    string `model:"ns"`
+	Value string `datastore:"value"`
+}
+
+// TestQueryCacheNamespaceIsolation verifies that query cache generations are
+// tracked per namespace: writing an entity in one namespace must not
+// invalidate the cached queries of another namespace.
+func TestQueryCacheNamespaceIsolation(t *testing.T) {
+	ctx := context.Background()
+
+	tempDir, err := os.MkdirTemp("", "dsorm_qcache_ns_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	store := local.NewStore(tempDir)
+	defer store.Close()
+
+	testDB, err := dsorm.New(ctx, dsorm.WithStore(store), dsorm.WithQueryCache(time.Minute))
+	if err != nil {
+		t.Fatalf("Failed to init client: %v", err)
+	}
+
+	const nsA, nsB = "tenant-a", "tenant-b"
+
+	items := []*QCNSModel{
+		{ID: "a1", NS: nsA, Value: "a1"},
+		{ID: "a2", NS: nsA, Value: "a2"},
+		{ID: "b1", NS: nsB, Value: "b1"},
+		{ID: "b2", NS: nsB, Value: "b2"},
+	}
+	if err := testDB.PutMulti(ctx, items); err != nil {
+		t.Fatalf("PutMulti failed: %v", err)
+	}
+
+	queryNS := func(t *testing.T, ns string) []*QCNSModel {
+		t.Helper()
+		q := dsorm.NewQuery("QCNSModel").Namespace(ns).Order("value")
+		res, _, err := dsorm.Query[*QCNSModel](ctx, testDB, q, "")
+		if err != nil {
+			t.Fatalf("query namespace %q failed: %v", ns, err)
+		}
+		return res
+	}
+
+	// Populate the query cache for both namespaces.
+	if got := queryNS(t, nsA); len(got) != 2 {
+		t.Fatalf("Expected 2 results in %q, got %d", nsA, len(got))
+	}
+	if got := queryNS(t, nsB); len(got) != 2 {
+		t.Fatalf("Expected 2 results in %q, got %d", nsB, len(got))
+	}
+
+	// Modify both namespaces behind testDB's back so a stale cache is
+	// distinguishable from a fresh read.
+	store2 := local.NewStore(tempDir)
+	dbNoCache, err := dsorm.New(ctx, dsorm.WithStore(store2), dsorm.WithNoCache())
+	if err != nil {
+		t.Fatalf("Failed to init no-cache client: %v", err)
+	}
+	if err := dbNoCache.DeleteMulti(ctx, []*QCNSModel{items[1], items[3]}); err != nil {
+		t.Fatalf("dbNoCache delete failed: %v", err)
+	}
+	dbNoCache.Close()
+
+	// A write in namespace A must invalidate only namespace A.
+	if err := testDB.Put(ctx, &QCNSModel{ID: "a3", NS: nsA, Value: "a3"}); err != nil {
+		t.Fatalf("Put a3 failed: %v", err)
+	}
+
+	gotA := queryNS(t, nsA)
+	if len(gotA) != 2 || gotA[0].ID != "a1" || gotA[1].ID != "a3" {
+		t.Errorf("Namespace %q should have been invalidated, expected [a1 a3], got %v", nsA, idsOf(gotA))
+	}
+
+	gotB := queryNS(t, nsB)
+	if len(gotB) != 2 {
+		t.Errorf("Namespace %q cache should be untouched by a write in %q, expected 2 cached results, got %d (%v)",
+			nsB, nsA, len(gotB), idsOf(gotB))
+	}
+
+	// Invalidating namespace B explicitly must then take effect.
+	if err := testDB.InvalidateKindsNS(ctx, nsB, "QCNSModel"); err != nil {
+		t.Fatalf("InvalidateKindsNS failed: %v", err)
+	}
+	if got := queryNS(t, nsB); len(got) != 1 || got[0].ID != "b1" {
+		t.Errorf("Expected [b1] in %q after explicit invalidation, got %v", nsB, idsOf(got))
+	}
+}
+
+func idsOf(items []*QCNSModel) []string {
+	ids := make([]string, 0, len(items))
+	for _, m := range items {
+		if m == nil {
+			ids = append(ids, "<nil>")
+			continue
+		}
+		ids = append(ids, m.ID)
+	}
+	return ids
+}
+
 // NestedCustomer is an embedded struct stored as a Datastore Entity value (the
 // default representation of a nested struct — no "flatten" tag). Datastore
 // indexes the indexed sub-fields server-side and exposes them as queryable

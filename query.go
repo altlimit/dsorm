@@ -118,6 +118,16 @@ func (q *QueryBuilder) GetAncestor() *datastore.Key { return q.ancestor }
 func (q *QueryBuilder) GetCursor() string           { return q.cursorStr }
 func (q *QueryBuilder) GetNamespace() string        { return q.namespace }
 
+// effectiveNamespace returns the namespace the query actually runs in: the one
+// set with [QueryBuilder.Namespace], or the ancestor key's namespace when no
+// explicit namespace was given. This mirrors how the stores resolve it.
+func (q *QueryBuilder) effectiveNamespace() string {
+	if q.namespace == "" && q.ancestor != nil {
+		return q.ancestor.Namespace
+	}
+	return q.namespace
+}
+
 // endCursor applies the page-based cursor rule. In the default (non-Stream)
 // mode, if the number of returned results is below the limit (or no limit is
 // set), the cursor is emptied to signal there are no more pages. In Stream mode
@@ -137,7 +147,7 @@ func (q *QueryBuilder) Hash() string {
 	h.Write([]byte(fmt.Sprintf("kind:%s|ns:%s|limit:%d|offset:%d|keysOnly:%t|cursor:%s|", q.kind, q.namespace, q.limit, q.offset, q.keysOnly, q.cursorStr)))
 
 	if q.ancestor != nil {
-		h.Write([]byte(fmt.Sprintf("ancestor:%s,%s,%d|", q.ancestor.Kind, q.ancestor.Name, q.ancestor.ID)))
+		h.Write([]byte(fmt.Sprintf("ancestor:%s,%s,%d,%s|", q.ancestor.Kind, q.ancestor.Name, q.ancestor.ID, q.ancestor.Namespace)))
 	}
 
 	for _, f := range q.filters {
