@@ -9,12 +9,11 @@ import (
 	"log"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 
 	"cloud.google.com/go/datastore"
 	"github.com/altlimit/dsorm/cache"
@@ -502,6 +501,7 @@ type Client struct {
 	queryCache    bool
 	queryCacheTTL time.Duration
 	onErrorFn     OnErrorFunc
+	cacheOnce     sync.Once
 	localVersions sync.Map // prevents stale cache on kind_v eviction
 }
 
@@ -521,11 +521,24 @@ func (c *Client) onError(ctx context.Context, err error) {
 
 // Cache returns an application-level cache.Cache for general-purpose
 // caching operations (Get, Set, Delete, Load, Save, RateLimit, etc).
+//
+// The wrapper is built once and is safe for concurrent use. When the client
+// was created with [WithNoCache] there is no backend, and the returned Cache's
+// operations act on a nil backend — check [Client.HasCache] first if the
+// caching backend is optional in your deployment.
 func (c *Client) Cache() cache.Cache {
-	if c.appCache == nil {
-		c.appCache = cache.New(c.client.Cacher())
-	}
+	c.cacheOnce.Do(func() {
+		if c.appCache == nil {
+			c.appCache = cache.New(c.client.Cacher())
+		}
+	})
 	return c.appCache
+}
+
+// HasCache reports whether a caching backend is configured, i.e. whether the
+// client was created without [WithNoCache] (or DSORM_NO_CACHE).
+func (c *Client) HasCache() bool {
+	return c.client.Cacher() != nil
 }
 
 type options struct {
@@ -624,6 +637,10 @@ func WithQueryCache(ttl ...time.Duration) Option {
 // failed query cache invalidation or a failed entity cache write. The
 // operation that produced the error still succeeds; the error is reported so
 // it can be logged or traced. When unset, such errors go to log.Println.
+//
+// Query cache invalidation failures arrive as [*InvalidateError], which carries
+// the namespace and kinds that still need invalidating, so the handler can
+// retry them via [Client.InvalidateKindsNS] instead of parsing the message.
 func WithOnErrorFunc(f OnErrorFunc) Option {
 	return func(o *options) {
 		o.onErrorFn = f
@@ -743,13 +760,24 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{
+	c := &Client{
 		client:        dsoClient,
 		encKey:        o.encryptionKey,
 		queryCache:    o.queryCache,
 		queryCacheTTL: o.queryCacheTTL,
 		onErrorFn:     o.onErrorFn,
-	}, nil
+	}
+
+	// The query cache stores its generation counters and cached key sets in the
+	// caching backend, so it cannot run without one. Disabling caching wins over
+	// enabling the query cache — DSORM_NO_CACHE must stay safe to set on a
+	// deployment whose code calls WithQueryCache.
+	if c.queryCache && !c.HasCache() {
+		c.queryCache = false
+		c.onError(ctx, errors.New("dsorm: query cache disabled — no caching backend (WithNoCache or DSORM_NO_CACHE is set)"))
+	}
+
+	return c, nil
 }
 
 func (c *Client) context(ctx context.Context) context.Context {
@@ -1746,30 +1774,132 @@ func kindVersionKey(ns, kind string) string {
 	return "kind_v:" + ns + ":" + kind
 }
 
+// InvalidateError reports that the query cache generation counter could not be
+// bumped for one or more kinds within a single namespace. The write that
+// triggered the invalidation still succeeded; the cached queries for these
+// kinds are stale until a later invalidation lands or their TTL expires.
+//
+// It carries the namespace and kinds so a handler installed with
+// [WithOnErrorFunc] can retry the exact invalidation that failed:
+//
+//	func onErr(ctx context.Context, err error) {
+//	    var ie *dsorm.InvalidateError
+//	    if errors.As(err, &ie) {
+//	        // retry with backoff; args match InvalidateKindsNS
+//	        client.InvalidateKindsNS(ctx, ie.NS, ie.Kinds...)
+//	    }
+//	}
+//
+// A single invalidation spanning several namespaces (e.g. a [Client.PutMulti]
+// with keys in more than one) reports one InvalidateError per namespace, joined
+// with [errors.Join]. Use [InvalidateErrors] to recover all of them; errors.As
+// only yields the first.
+type InvalidateError struct {
+	// NS is the datastore namespace, "" for the default namespace.
+	NS string
+	// Kinds are the kinds whose generation counter could not be bumped,
+	// sorted. Pass them straight to [Client.InvalidateKindsNS] to retry.
+	Kinds []string
+	// Err is the underlying cache backend error.
+	Err error
+}
+
+func (e *InvalidateError) Error() string {
+	return fmt.Sprintf("dsorm: invalidate query cache for kind(s) %s in namespace %q: %v",
+		strings.Join(e.Kinds, ", "), e.NS, e.Err)
+}
+
+func (e *InvalidateError) Unwrap() error { return e.Err }
+
+// InvalidateErrors returns every [InvalidateError] contained in err, walking
+// wrapped and joined errors. It returns nil if there are none, so a handler can
+// range over the result unconditionally.
+func InvalidateErrors(err error) []*InvalidateError {
+	var out []*InvalidateError
+	var walk func(error)
+	walk = func(e error) {
+		for e != nil {
+			if ie, ok := e.(*InvalidateError); ok {
+				out = append(out, ie)
+			}
+			switch u := e.(type) {
+			case interface{ Unwrap() error }:
+				e = u.Unwrap()
+			case interface{ Unwrap() []error }:
+				for _, sub := range u.Unwrap() {
+					walk(sub)
+				}
+				return
+			default:
+				return
+			}
+		}
+	}
+	walk(err)
+	return out
+}
+
 // invalidateKinds increments the cache version for the given kinds within
 // their namespaces, effectively invalidating any cached queries for them.
+//
+// Every kind is attempted independently: one failing kind does not abandon the
+// rest, so the returned [InvalidateError] values name exactly the kinds that
+// still need invalidating.
 func invalidateKinds(ctx context.Context, c *Client, kinds []kindNS) error {
 	if !c.queryCache || len(kinds) == 0 {
 		return nil
 	}
-	seen := make(map[kindNS]bool)
-	g, gCtx := errgroup.WithContext(ctx)
 
+	var (
+		mu     sync.Mutex
+		failed = make(map[string][]string) // namespace -> failed kinds
+		causes = make(map[string]error)    // namespace -> first underlying error
+		wg     sync.WaitGroup
+	)
+
+	seen := make(map[kindNS]bool)
 	for _, k := range kinds {
-		if !seen[k] {
-			seen[k] = true
-			vKey := kindVersionKey(k.ns, k.kind)
-			g.Go(func() error {
-				newV, err := c.Cache().Increment(gCtx, vKey, 1, 0)
-				if err != nil {
-					return fmt.Errorf("dsorm: invalidate query cache for kind %q in namespace %q: %w", k.kind, k.ns, err)
-				}
-				c.localVersions.Store(vKey, newV)
-				return nil
-			})
+		if seen[k] {
+			continue
 		}
+		seen[k] = true
+		wg.Add(1)
+		go func(k kindNS) {
+			defer wg.Done()
+			vKey := kindVersionKey(k.ns, k.kind)
+			newV, err := c.Cache().Increment(ctx, vKey, 1, 0)
+			if err != nil {
+				mu.Lock()
+				if _, ok := causes[k.ns]; !ok {
+					causes[k.ns] = err
+				}
+				failed[k.ns] = append(failed[k.ns], k.kind)
+				mu.Unlock()
+				return
+			}
+			c.localVersions.Store(vKey, newV)
+		}(k)
 	}
-	return g.Wait()
+	wg.Wait()
+
+	if len(failed) == 0 {
+		return nil
+	}
+	nss := make([]string, 0, len(failed))
+	for ns := range failed {
+		nss = append(nss, ns)
+	}
+	slices.Sort(nss)
+	errs := make([]error, 0, len(nss))
+	for _, ns := range nss {
+		ks := failed[ns]
+		slices.Sort(ks)
+		errs = append(errs, &InvalidateError{NS: ns, Kinds: ks, Err: causes[ns]})
+	}
+	if len(errs) == 1 {
+		return errs[0]
+	}
+	return errors.Join(errs...)
 }
 
 // InvalidateKinds manually invalidates the query cache for the given kinds in

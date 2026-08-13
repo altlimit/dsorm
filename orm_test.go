@@ -2,16 +2,21 @@ package dsorm_test
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"cloud.google.com/go/datastore"
 	"github.com/altlimit/dsorm"
+	"github.com/altlimit/dsorm/cache/memory"
+	"github.com/altlimit/dsorm/ds"
 	"github.com/altlimit/dsorm/ds/local"
 )
 
@@ -857,7 +862,8 @@ func testDatastoreTags(t *testing.T, testDB *dsorm.Client) {
 
 	// Querying on indexed field should find it
 	q2 := dsorm.NewQuery("DatastoreTagModel").FilterField("Indexed", "=", "visible")
-	fmt.Printf("DEBUG Query2 start\n"); results2, _, err := dsorm.Query[*DatastoreTagModel](ctx, testDB, q2, "")
+	fmt.Printf("DEBUG Query2 start\n")
+	results2, _, err := dsorm.Query[*DatastoreTagModel](ctx, testDB, q2, "")
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -2128,7 +2134,8 @@ func testDataTypes(t *testing.T, testDB *dsorm.Client) {
 
 		// LT
 		q2 := newQ().FilterField("int64_val", "<", 50)
-		fmt.Printf("DEBUG Query2 start\n"); results2, _, err := dsorm.Query[*DataTypeModel](ctx, testDB, q2, "")
+		fmt.Printf("DEBUG Query2 start\n")
+		results2, _, err := dsorm.Query[*DataTypeModel](ctx, testDB, q2, "")
 		if err != nil {
 			t.Fatalf("int < 50 query failed: %v", err)
 		}
@@ -2570,7 +2577,7 @@ func TestQueryCache(t *testing.T) {
 	// 3. Modifying raw data bypassing dsorm so the cache doesn't invalidate
 	store2 := local.NewStore(tempDir)
 	dbNoCache, _ := dsorm.New(ctx, dsorm.WithStore(store2), dsorm.WithNoCache())
-	
+
 	// Delete from datastore directly without invalidating testDB cache
 	if err := dbNoCache.Delete(ctx, m2); err != nil {
 		t.Fatalf("dbNoCache delete failed: %v", err)
@@ -2696,6 +2703,131 @@ func TestQueryCacheNamespaceIsolation(t *testing.T) {
 	}
 	if got := queryNS(t, nsB); len(got) != 1 || got[0].ID != "b1" {
 		t.Errorf("Expected [b1] in %q after explicit invalidation, got %v", nsB, idsOf(got))
+	}
+}
+
+type QCErrModel struct {
+	dsorm.Base
+	ID    string `model:"id"`
+	NS    string `model:"ns"`
+	Value string `datastore:"value"`
+}
+
+var errIncrementDown = errors.New("cache backend unavailable")
+
+// flakyIncrementCache fails every Increment while fail is set, simulating a
+// cache backend that is briefly unreachable during invalidation.
+type flakyIncrementCache struct {
+	ds.Cache
+	fail atomic.Bool
+}
+
+func (c *flakyIncrementCache) Increment(ctx context.Context, key string, delta int64, expiration time.Duration) (int64, error) {
+	if c.fail.Load() {
+		return 0, errIncrementDown
+	}
+	return c.Cache.Increment(ctx, key, delta, expiration)
+}
+
+// TestInvalidateErrorReporting verifies that a failed query cache invalidation
+// reaches the WithOnErrorFunc handler as a typed *dsorm.InvalidateError naming
+// the namespace and kinds, so the handler can retry exactly what failed
+// without parsing the error message.
+func TestInvalidateErrorReporting(t *testing.T) {
+	ctx := context.Background()
+
+	tempDir, err := os.MkdirTemp("", "dsorm_qcache_err_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	store := local.NewStore(tempDir)
+	defer store.Close()
+
+	flaky := &flakyIncrementCache{Cache: memory.NewCache()}
+
+	var (
+		mu     sync.Mutex
+		caught []error
+	)
+	testDB, err := dsorm.New(ctx,
+		dsorm.WithStore(store),
+		dsorm.WithCache(flaky),
+		dsorm.WithQueryCache(time.Minute),
+		dsorm.WithOnErrorFunc(func(_ context.Context, err error) {
+			mu.Lock()
+			defer mu.Unlock()
+			caught = append(caught, err)
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to init client: %v", err)
+	}
+
+	takeInvalidateErrors := func() []*dsorm.InvalidateError {
+		mu.Lock()
+		defer mu.Unlock()
+		var out []*dsorm.InvalidateError
+		for _, e := range caught {
+			out = append(out, dsorm.InvalidateErrors(e)...)
+		}
+		caught = nil
+		return out
+	}
+
+	flaky.fail.Store(true)
+
+	// Single namespace: the write succeeds, the invalidation failure is
+	// reported with the namespace and kind that still need invalidating.
+	if err := testDB.Put(ctx, &QCErrModel{ID: "e1", NS: "tenant-a", Value: "v1"}); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+	got := takeInvalidateErrors()
+	if len(got) != 1 {
+		t.Fatalf("Expected 1 InvalidateError, got %d", len(got))
+	}
+	if got[0].NS != "tenant-a" {
+		t.Errorf("Expected NS %q, got %q", "tenant-a", got[0].NS)
+	}
+	if !slices.Equal(got[0].Kinds, []string{"QCErrModel"}) {
+		t.Errorf("Expected Kinds [QCErrModel], got %v", got[0].Kinds)
+	}
+	if !errors.Is(got[0], errIncrementDown) {
+		t.Errorf("Expected the underlying cache error to unwrap, got %v", got[0].Err)
+	}
+
+	// errors.As must find it too — the single-namespace case needs no helper.
+	var viaAs *dsorm.InvalidateError
+	if !errors.As(error(got[0]), &viaAs) {
+		t.Error("errors.As failed to match *InvalidateError")
+	}
+
+	// A write spanning two namespaces reports one error per namespace.
+	if err := testDB.PutMulti(ctx, []*QCErrModel{
+		{ID: "e2", NS: "tenant-a", Value: "v2"},
+		{ID: "e3", NS: "tenant-b", Value: "v3"},
+	}); err != nil {
+		t.Fatalf("PutMulti failed: %v", err)
+	}
+	got = takeInvalidateErrors()
+	if len(got) != 2 {
+		t.Fatalf("Expected 2 InvalidateErrors across namespaces, got %d (%v)", len(got), got)
+	}
+	if got[0].NS != "tenant-a" || got[1].NS != "tenant-b" {
+		t.Errorf("Expected namespaces [tenant-a tenant-b], got [%s %s]", got[0].NS, got[1].NS)
+	}
+
+	// The reported values are exactly what a retry backstop needs: once the
+	// backend recovers, replaying them invalidates cleanly.
+	flaky.fail.Store(false)
+	for _, ie := range got {
+		if err := testDB.InvalidateKindsNS(ctx, ie.NS, ie.Kinds...); err != nil {
+			t.Errorf("Retry of %v failed: %v", ie, err)
+		}
+	}
+	if left := takeInvalidateErrors(); len(left) != 0 {
+		t.Errorf("Expected no further invalidation errors, got %v", left)
 	}
 }
 

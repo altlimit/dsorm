@@ -264,14 +264,38 @@ succeeds and the failure is reported to the handler set with
 `dsorm.WithOnErrorFunc(fn)`, defaulting to `log.Println`. The same handler
 receives non-fatal errors from the entity cache layer.
 
+Invalidation failures arrive as `*dsorm.InvalidateError`, which carries the
+namespace and the kinds that still need invalidating — the exact arguments to
+`InvalidateKindsNS` — so a handler can retry rather than parse the message:
+
 ```go
-client, _ := dsorm.New(ctx,
+var client *dsorm.Client
+
+client, _ = dsorm.New(ctx,
     dsorm.WithQueryCache(time.Hour),
     dsorm.WithOnErrorFunc(func(ctx context.Context, err error) {
         slog.ErrorContext(ctx, "dsorm cache", "err", err)
+
+        // Retry backstop: repair only what actually failed.
+        for _, ie := range dsorm.InvalidateErrors(err) {
+            go retryWithBackoff(func() error {
+                return client.InvalidateKindsNS(ctx, ie.NS, ie.Kinds...)
+            })
+        }
     }),
 )
 ```
+
+Each kind is invalidated independently, so `Kinds` names exactly the ones that
+failed — a working kind is never retried because a sibling failed. When a single
+write spans several namespaces the failures are joined, one `InvalidateError`
+per namespace; `dsorm.InvalidateErrors(err)` returns all of them (`errors.As`
+returns only the first). Retrying is idempotent: generations are opaque
+monotonic counters, so an extra bump costs at most one extra cache miss and
+never serves stale results.
+
+Note that `WithNoCache` (or `DSORM_NO_CACHE`) turns the query cache off — it has
+nowhere to store generations — and reports that through the same handler.
 
 ## Configuration
 
