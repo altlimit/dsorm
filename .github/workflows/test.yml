@@ -9,12 +9,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v7
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v7
       with:
-        go-version: 1.24
+        go-version-file: go.mod
+
+    # Must run before docker compose. The backend service bind-mounts the host
+    # module cache, and Docker creates a missing bind-mount source directory as
+    # root — leaving $GOMODCACHE unwritable for the later `go test` step
+    # ("mkdir /home/runner/go/pkg/mod/cache: permission denied"). Downloading
+    # first creates it as the runner user, and also populates the cache the
+    # backend container needs, since it builds with GOPROXY=off.
+    - name: Download modules
+      run: go mod download
 
     - name: Start Services
       run: |
