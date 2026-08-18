@@ -1348,6 +1348,15 @@ func (c *localTxStore) PutMulti(keys []*datastore.Key, src interface{}) ([]*data
 
 	ret := make([]*datastore.PendingKey, len(keys))
 	for i, k := range keys {
+		// Allocate auto-IDs up front, like the non-transactional PutMulti.
+		// The buffer below is keyed by kind+ID, so incomplete keys would all
+		// collapse onto the same entry and overwrite each other. Mutating the
+		// key in place also lets callers read the ID back immediately, since
+		// datastore.PendingKey cannot be resolved by a non-cloud store.
+		if k.Name == "" && k.ID == 0 {
+			k.ID = generateID()
+		}
+
 		col, id := keyToColAndID(k)
 		kStr := col + ":" + id
 
@@ -1464,9 +1473,6 @@ func (c *localTxStore) Commit() (*datastore.Commit, error) {
 			if nb == nil {
 				nb = &nsBatch{}
 				nsBatches[k.Namespace] = nb
-			}
-			if k.Name == "" && k.ID == 0 {
-				k.ID = generateID()
 			}
 			nb.keys = append(nb.keys, k)
 			nb.srcs = append(nb.srcs, src)

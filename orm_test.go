@@ -1106,6 +1106,88 @@ func testTransactionCRUD(t *testing.T, testDB *dsorm.Client) {
 	})
 }
 
+type TxAutoIDModel struct {
+	dsorm.Base
+	ID    int64 `model:"id"`
+	Value string
+}
+
+func TestTransactionAutoID(t *testing.T) {
+	runAllStores(t, testTransactionAutoID)
+}
+
+// testTransactionAutoID guards against the local store collapsing every
+// incomplete key of a kind onto a single buffered entry, which silently
+// dropped all but the last entity, and against auto-generated IDs never
+// making it back onto the structs after commit.
+func testTransactionAutoID(t *testing.T, testDB *dsorm.Client) {
+	ctx := context.Background()
+
+	t.Run("Put", func(t *testing.T) {
+		models := []*TxAutoIDModel{
+			{Value: "auto-put-1"},
+			{Value: "auto-put-2"},
+			{Value: "auto-put-3"},
+		}
+
+		if _, err := testDB.Transact(ctx, func(tx *dsorm.Transaction) error {
+			for _, m := range models {
+				if err := tx.Put(m); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("Transact Put failed: %v", err)
+		}
+
+		assertAutoIDs(t, ctx, testDB, models)
+	})
+
+	t.Run("PutMulti", func(t *testing.T) {
+		models := []*TxAutoIDModel{
+			{Value: "auto-multi-1"},
+			{Value: "auto-multi-2"},
+			{Value: "auto-multi-3"},
+		}
+
+		if _, err := testDB.Transact(ctx, func(tx *dsorm.Transaction) error {
+			return tx.PutMulti(models)
+		}); err != nil {
+			t.Fatalf("Transact PutMulti failed: %v", err)
+		}
+
+		assertAutoIDs(t, ctx, testDB, models)
+	})
+}
+
+// assertAutoIDs checks every model got a distinct non-zero ID and that each
+// one is individually readable back with its own value.
+func assertAutoIDs(t *testing.T, ctx context.Context, testDB *dsorm.Client, models []*TxAutoIDModel) {
+	t.Helper()
+
+	seen := make(map[int64]bool, len(models))
+	for i, m := range models {
+		if m.ID == 0 {
+			t.Fatalf("models[%d] (%s) has no ID after commit", i, m.Value)
+		}
+		if seen[m.ID] {
+			t.Fatalf("models[%d] (%s) reused ID %d", i, m.Value, m.ID)
+		}
+		seen[m.ID] = true
+	}
+
+	for i, m := range models {
+		got := &TxAutoIDModel{ID: m.ID}
+		if err := testDB.Get(ctx, got); err != nil {
+			t.Fatalf("Get models[%d] (ID %d) failed: %v", i, m.ID, err)
+		}
+		if got.Value != m.Value {
+			t.Errorf("models[%d] (ID %d): expected %q, got %q", i, m.ID, m.Value, got.Value)
+		}
+	}
+}
+
 type ParentModel struct {
 	dsorm.Base
 	ID string `model:"id"`
