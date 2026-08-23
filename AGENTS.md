@@ -16,6 +16,8 @@
 dsorm/
 ├── orm.go          # Core client, CRUD, transactions, generic helpers
 ├── query.go        # QueryBuilder API
+├── localcache.go   # In-process (L1) query result cache
+├── version.go      # Query cache generation counters, request scope, prefetch
 ├── orm_test.go     # All tests
 ├── ds/
 │   ├── store.go      # Store/TransactionStore/Iterator interfaces

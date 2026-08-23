@@ -2,7 +2,6 @@ package dsorm
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -503,6 +502,7 @@ type Client struct {
 	onErrorFn     OnErrorFunc
 	cacheOnce     sync.Once
 	localVersions sync.Map // prevents stale cache on kind_v eviction
+	localCache    *localCache
 }
 
 // onError reports an internal non-fatal error (e.g. a failed query cache
@@ -531,6 +531,9 @@ func (c *Client) Cache() cache.Cache {
 		if c.appCache == nil {
 			c.appCache = cache.New(c.client.Cacher())
 		}
+		if c.localCache != nil {
+			c.appCache = &localFlushCache{Cache: c.appCache, lc: c.localCache}
+		}
 	})
 	return c.appCache
 }
@@ -550,6 +553,7 @@ type options struct {
 	noCache         bool
 	queryCache      bool
 	queryCacheTTL   time.Duration
+	localCache      *LocalCacheConfig
 	onErrorFn       OnErrorFunc
 }
 
@@ -775,6 +779,18 @@ func New(ctx context.Context, opts ...Option) (*Client, error) {
 	if c.queryCache && !c.HasCache() {
 		c.queryCache = false
 		c.onError(ctx, errors.New("dsorm: query cache disabled — no caching backend (WithNoCache or DSORM_NO_CACHE is set)"))
+	}
+
+	// The local query cache keys its entries by the query cache's generation
+	// counters, so it cannot invalidate anything without them.
+	if o.localCache != nil {
+		if !c.queryCache {
+			c.onError(ctx, errors.New("dsorm: local query cache disabled — it requires WithQueryCache"))
+		} else if lc, err := newLocalCache(*o.localCache, o.queryCacheTTL); err != nil {
+			c.onError(ctx, fmt.Errorf("dsorm: local query cache disabled: %w", err))
+		} else {
+			c.localCache = lc
+		}
 	}
 
 	return c, nil
@@ -1111,9 +1127,12 @@ type queryCacheData struct {
 // is non-nil, it must be a pointer to a slice (e.g. *[]*MyModel) and will
 // be populated with the loaded entities. The returned string is the cursor
 // for pagination; pass it back as the cursor argument to resume.
+//
+// q is not modified, so a single builder can be shared across requests and
+// goroutines. With [WithLocalQueryCache] the result may be served from an
+// in-process cache, in which case the entities are rebuilt for this call.
 func (c *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals interface{}) ([]*datastore.Key, string, error) {
 	ctx = c.context(ctx)
-	var keys []*datastore.Key
 	var v reflect.Value
 	if vals != nil {
 		v = reflect.ValueOf(vals)
@@ -1125,82 +1144,106 @@ func (c *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals
 		}
 	}
 
+	q = q.clone()
 	if cursor != "" {
 		q = q.Start(cursor)
 	}
 	q = q.KeysOnly()
 
-	var cacheKey string
+	var (
+		cacheKey string
+		l1Key    string
+		lc       *localCache
+	)
 	if c.queryCache {
 		hash := q.Hash()
 		// Generations are tracked per namespace so a write in one namespace
 		// only invalidates that namespace's cached queries.
 		ns := q.effectiveNamespace()
-		vKey := kindVersionKey(ns, q.Kind())
-		versionItem, err := c.Cache().Get(ctx, vKey)
-		version := int64(0)
-		if err == nil && versionItem != nil {
-			v, errP := strconv.ParseInt(string(versionItem.Value), 10, 64)
-			if errP == nil {
-				version = v
-			} else if len(versionItem.Value) == 8 {
-				version = int64(binary.LittleEndian.Uint64(versionItem.Value))
-			}
-			if version > 0 {
-				c.localVersions.Store(vKey, version)
-			}
-		} else {
-			if err != nil && !errors.Is(err, ds.ErrCacheMiss) {
-				c.onError(ctx, fmt.Errorf("dsorm: read query cache version %q: %w", vKey, err))
-			}
-			// Cache miss or eviction. We must not start from 0 to avoid serving stale cache.
-			v, ok := c.localVersions.Load(vKey)
-			if ok {
-				version = v.(int64)
-			} else {
-				// Initialize with UnixMilli to ensure uniqueness across app restarts
-				version = time.Now().UnixMilli()
-			}
-			// Restore it in the cache atomically
-			newV, errI := c.Cache().Increment(ctx, vKey, version, 0)
-			if errI == nil {
-				version = newV
-				c.localVersions.Store(vKey, version)
-			} else {
-				c.onError(ctx, fmt.Errorf("dsorm: restore query cache version %q: %w", vKey, errI))
-			}
-		}
+		version, restored := c.kindVersion(ctx, ns, q.Kind())
 		cacheKey = fmt.Sprintf("qcache:%s:%s:v%d:%s", ns, q.Kind(), version, hash)
 
-		cached, err := cache.Load[queryCacheData](ctx, c.Cache(), cacheKey)
-		if err == nil {
-			keys = cached.Keys
-			next := cached.Next
-			if vals != nil {
-				v.Elem().Set(reflect.MakeSlice(v.Elem().Type(), len(keys), len(keys)))
-				if len(keys) > 0 {
-					vSlice := v.Elem()
-					for i := 0; i < vSlice.Len(); i++ {
-						if vSlice.Index(i).Kind() == reflect.Ptr && vSlice.Index(i).IsNil() {
-							newElem := reflect.New(vSlice.Index(i).Type().Elem())
-							vSlice.Index(i).Set(newElem)
-							if err := initModel(ctx, newElem.Interface()); err != nil {
-								return nil, "", err
-							}
-						}
-					}
-					if err := loadKeys(vSlice, keys); err != nil {
-						return nil, "", err
-					}
-					if err := c.GetMulti(ctx, vSlice.Interface()); err != nil {
+		if c.localCache.enabled(q.Kind()) && (vals == nil || v.Elem().Type().Elem().Kind() == reflect.Ptr) {
+			lc = c.localCache
+			if restored {
+				// The shared generation counter was lost and this client
+				// re-pinned its last known value; local entries built under it
+				// outlived the data they were built from.
+				lc.dropKind(ns, q.Kind())
+			}
+			l1Key = lc.entryKey(ns, q.Kind(), version, lc.generation(ns, q.Kind()), hash)
+			if e := lc.get(ctx, l1Key, q.Kind()); e != nil && (vals == nil || e.props != nil) {
+				if vals != nil {
+					if err := c.rehydrate(ctx, v, e); err != nil {
 						return nil, "", err
 					}
 				}
+				return e.keys, q.endCursor(len(e.keys), e.next), nil
 			}
-			return keys, q.endCursor(len(keys), next), nil
 		}
 	}
 
+	// Collapse concurrent identical misses, so a cold burst costs one query
+	// rather than one per request.
+	if lc != nil && vals != nil {
+		e, shared, err := lc.flight.Do(l1Key, func() (*localEntry, error) {
+			keys, next, err := c.queryRun(ctx, q, cacheKey, v, true)
+			if err != nil {
+				return nil, err
+			}
+			entry, err := lc.newEntry(l1Key, q.Kind(), keys, next, v.Elem())
+			if err != nil {
+				// Serve the result; just don't cache it.
+				c.onError(ctx, err)
+				return &localEntry{keys: keys, next: next, kind: q.Kind()}, nil
+			}
+			lc.add(l1Key, entry)
+			return entry, nil
+		})
+		switch {
+		case err != nil && !shared:
+			return nil, "", err
+		case err != nil:
+			// The call we waited on failed, possibly only because its own
+			// request was cancelled. Don't fail this request for another
+			// request's reason; run the query here instead.
+		case e == nil, shared && e.props == nil:
+			// Nothing we can build entities from; run the query here.
+		case shared:
+			if err := c.rehydrate(ctx, v, e); err != nil {
+				return nil, "", err
+			}
+			return e.keys, q.endCursor(len(e.keys), e.next), nil
+		default:
+			// We did the work; v is already populated.
+			return e.keys, q.endCursor(len(e.keys), e.next), nil
+		}
+	}
+
+	keys, next, err := c.queryRun(ctx, q, cacheKey, v, vals != nil)
+	if err != nil {
+		return nil, "", err
+	}
+	return keys, q.endCursor(len(keys), next), nil
+}
+
+// queryRun executes a query that the local cache could not answer: it consults
+// the shared query cache, falls back to the datastore, and hydrates vals when
+// asked. v is the pointer-to-slice given to [Client.Query] and is only touched
+// when hydrate is set.
+func (c *Client) queryRun(ctx context.Context, q *QueryBuilder, cacheKey string, v reflect.Value, hydrate bool) ([]*datastore.Key, string, error) {
+	if cacheKey != "" {
+		if cached, err := cache.Load[queryCacheData](ctx, c.Cache(), cacheKey); err == nil {
+			if hydrate {
+				if err := c.hydrateKeys(ctx, v, cached.Keys); err != nil {
+					return nil, "", err
+				}
+			}
+			return cached.Keys, cached.Next, nil
+		}
+	}
+
+	var keys []*datastore.Key
 	it := c.client.Run(ctx, q)
 	for {
 		k, err := it.Next(nil)
@@ -1216,7 +1259,7 @@ func (c *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals
 		return nil, "", err
 	}
 
-	if c.queryCache {
+	if cacheKey != "" {
 		if err := cache.Save(ctx, c.Cache(), cacheKey, queryCacheData{
 			Keys: keys,
 			Next: next,
@@ -1225,29 +1268,80 @@ func (c *Client) Query(ctx context.Context, q *QueryBuilder, cursor string, vals
 		}
 	}
 
-	if vals != nil {
-		v.Elem().Set(reflect.MakeSlice(v.Elem().Type(), len(keys), len(keys)))
-		if len(keys) > 0 {
-			vSlice := v.Elem()
-			for i := 0; i < vSlice.Len(); i++ {
-				if vSlice.Index(i).Kind() == reflect.Ptr && vSlice.Index(i).IsNil() {
-					newElem := reflect.New(vSlice.Index(i).Type().Elem())
+	if hydrate {
+		if err := c.hydrateKeys(ctx, v, keys); err != nil {
+			return nil, "", err
+		}
+	}
+	return keys, next, nil
+}
 
-					vSlice.Index(i).Set(newElem)
-					if err := initModel(ctx, newElem.Interface()); err != nil {
-						return nil, "", err
-					}
-				}
-			}
-			if err := loadKeys(vSlice, keys); err != nil {
-				return nil, "", err
-			}
-			if err := c.GetMulti(ctx, vSlice.Interface()); err != nil {
-				return nil, "", err
+// hydrateKeys sizes the destination slice to keys and loads the entities.
+func (c *Client) hydrateKeys(ctx context.Context, v reflect.Value, keys []*datastore.Key) error {
+	v.Elem().Set(reflect.MakeSlice(v.Elem().Type(), len(keys), len(keys)))
+	if len(keys) == 0 {
+		return nil
+	}
+	vSlice := v.Elem()
+	for i := 0; i < vSlice.Len(); i++ {
+		if vSlice.Index(i).Kind() == reflect.Ptr && vSlice.Index(i).IsNil() {
+			newElem := reflect.New(vSlice.Index(i).Type().Elem())
+			vSlice.Index(i).Set(newElem)
+			if err := initModel(ctx, newElem.Interface()); err != nil {
+				return err
 			}
 		}
 	}
-	return keys, q.endCursor(len(keys), next), nil
+	if err := loadKeys(vSlice, keys); err != nil {
+		return err
+	}
+	return c.GetMulti(ctx, vSlice.Interface())
+}
+
+// rehydrate builds fresh entities from a local cache entry. It mirrors the
+// load path — initModel, loadModel, OnLoad, LoadKey — so a rehydrated entity
+// is indistinguishable from a freshly loaded one: it carries this request's
+// context, the property list it was built from as its change-tracking
+// baseline, and its key, and is therefore safe to mutate and Put. Each call
+// decodes its own copy; entities are never shared between callers.
+func (c *Client) rehydrate(ctx context.Context, v reflect.Value, e *localEntry) error {
+	slice := v.Elem()
+	slice.Set(reflect.MakeSlice(slice.Type(), len(e.keys), len(e.keys)))
+	elemType := slice.Type().Elem()
+	if elemType.Kind() != reflect.Ptr {
+		return fmt.Errorf("dsorm: local query cache: must be slice of pointer not '%v'", elemType.Kind())
+	}
+	for i, k := range e.keys {
+		if i >= len(e.props) || e.props[i] == nil {
+			// The entity did not exist when the query ran; leave the nil that
+			// GetMulti would have left.
+			continue
+		}
+		var pl datastore.PropertyList
+		if err := ds.UnmarshalPropertyList(e.props[i], &pl); err != nil {
+			return fmt.Errorf("dsorm: local query cache decode %q: %w", e.kind, err)
+		}
+		elem := reflect.New(elemType.Elem())
+		val := elem.Interface()
+		if err := initModel(ctx, val); err != nil {
+			return err
+		}
+		if err := loadModel(ctx, val, pl); err != nil {
+			return err
+		}
+		if ol, ok := val.(OnLoad); ok {
+			if err := ol.OnLoad(ctx); err != nil {
+				return err
+			}
+		}
+		if kl, ok := val.(datastore.KeyLoader); ok {
+			if err := kl.LoadKey(k); err != nil {
+				return err
+			}
+		}
+		slice.Index(i).Set(elem)
+	}
+	return nil
 }
 
 // Transaction wraps a datastore transaction with dsorm functionality
@@ -1867,8 +1961,17 @@ func invalidateKinds(ctx context.Context, c *Client, kinds []kindNS) error {
 		go func(k kindNS) {
 			defer wg.Done()
 			vKey := kindVersionKey(k.ns, k.kind)
+			// The local generation counter advances on every write regardless
+			// of whether the shared counter can be bumped, so this instance
+			// always reads its own writes.
+			if c.localCache.enabled(k.kind) {
+				c.localCache.bumpGeneration(k.ns, k.kind)
+			}
 			newV, err := c.Cache().Increment(ctx, vKey, 1, 0)
 			if err != nil {
+				// The pinned version is no longer trustworthy; make the next
+				// query re-read it rather than serve the pre-write generation.
+				forgetVersion(ctx, vKey)
 				mu.Lock()
 				if _, ok := causes[k.ns]; !ok {
 					causes[k.ns] = err
@@ -1878,6 +1981,7 @@ func invalidateKinds(ctx context.Context, c *Client, kinds []kindNS) error {
 				return
 			}
 			c.localVersions.Store(vKey, newV)
+			noteVersion(ctx, vKey, newV)
 		}(k)
 	}
 	wg.Wait()

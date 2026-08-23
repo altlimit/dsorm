@@ -13,6 +13,10 @@ var (
 	mCacheHit  = stats.Int64("cache_hit", "Cache hits", stats.UnitDimensionless)
 	mCacheMiss = stats.Int64("cache_miss", "Cache misses", stats.UnitDimensionless)
 
+	mLocalCacheHit   = stats.Int64("local_cache_hit", "Local query cache hits", stats.UnitDimensionless)
+	mLocalCacheMiss  = stats.Int64("local_cache_miss", "Local query cache misses", stats.UnitDimensionless)
+	mLocalCacheEvict = stats.Int64("local_cache_eviction", "Local query cache evictions", stats.UnitDimensionless)
+
 	// Tag Keys
 	KeyKind, _ = tag.NewKey("kind")
 
@@ -32,8 +36,43 @@ var (
 			Aggregation: view.Sum(),
 			TagKeys:     []tag.Key{KeyKind},
 		},
+		{
+			Name:        "dsorm/local_cache_hit",
+			Description: "Local query cache hits",
+			Measure:     mLocalCacheHit,
+			Aggregation: view.Sum(),
+			TagKeys:     []tag.Key{KeyKind},
+		},
+		{
+			Name:        "dsorm/local_cache_miss",
+			Description: "Local query cache misses",
+			Measure:     mLocalCacheMiss,
+			Aggregation: view.Sum(),
+			TagKeys:     []tag.Key{KeyKind},
+		},
+		{
+			Name:        "dsorm/local_cache_eviction",
+			Description: "Local query cache evictions",
+			Measure:     mLocalCacheEvict,
+			Aggregation: view.Sum(),
+			TagKeys:     []tag.Key{KeyKind},
+		},
 	}
 )
+
+// RecordLocalCacheStats records local query cache activity for a kind. The
+// measures live here so that registering [AllViews] covers every dsorm cache
+// layer; the cache itself is implemented in the parent package.
+func RecordLocalCacheStats(ctx context.Context, kind string, hits, misses, evictions int64) error {
+	return stats.RecordWithTags(ctx,
+		[]tag.Mutator{
+			tag.Upsert(KeyKind, kind),
+		},
+		mLocalCacheHit.M(hits),
+		mLocalCacheMiss.M(misses),
+		mLocalCacheEvict.M(evictions),
+	)
+}
 
 func cacheStatsByKind(ctx context.Context, items []cacheItem) error {
 	cacheStats := make(map[string]*[2]int64)

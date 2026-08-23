@@ -8,6 +8,7 @@
 
 - **Auto-Caching**: Transparently caches keys/entities in Memory, Redis, or Memcache.
 - **Query Caching**: Generation-based query cache layer with auto-invalidation on Puts/Deletes.
+- **In-Process Query Cache**: Optional per-kind L1 cache of decoded query results, invalidated exactly by the same generation counters.
 - **Model Hooks**: `BeforeSave`, `AfterSave`, `OnLoad`, `BeforeDelete`, `AfterDelete` lifecycle methods.
 - **Key Mapping**: Use struct tags (e.g., `model:"id"`) to map keys to struct fields.
 - **Field Encryption**: Built-in encryption for sensitive string fields via `model:"name,encrypt"` tag.
@@ -296,6 +297,98 @@ never serves stale results.
 
 Note that `WithNoCache` (or `DSORM_NO_CACHE`) turns the query cache off — it has
 nowhere to store generations — and reports that through the same handler.
+
+### 9. In-Process Query Cache (L1)
+
+`dsorm.WithLocalQueryCache` adds an in-process cache of **decoded query
+results** on top of the query cache. It is aimed at the handful of kinds that
+are read on every request and written rarely — a tenant record, its active
+theme, its plugin list.
+
+Without it, each such query costs three round trips to the shared cache: the
+kind's generation counter, the cached key set, then the entity bodies. A local
+hit skips the last two and the decode, leaving one round trip. That remaining
+read is not an oversight — it is what keeps invalidation exact.
+
+```go
+client, _ := dsorm.New(ctx,
+    dsorm.WithQueryCache(time.Hour),
+    dsorm.WithLocalQueryCache(dsorm.LocalCacheConfig{
+        Kinds:      []string{"Tenant", "Theme", "Plugin"}, // opt-in, per kind
+        MaxBytes:   32 << 20,
+        MaxEntries: 4096,
+    }),
+)
+```
+
+Entries are keyed by namespace, kind, the kind's generation counter, and the
+query hash, so any write anywhere in the fleet makes every instance compute a
+key it does not have. There is no TTL-based staleness in the normal case.
+
+**Opt in per kind.** There is deliberately no "all kinds" setting. Version
+scoping means any write to a kind in a namespace drops that kind's entire local
+cache for that namespace — ideal for read-often/write-rarely kinds,
+pathological for write-hot ones.
+
+**Entities are rebuilt, never shared.** Results are held in their cached wire
+form and a fresh struct is built per call, so an entity served from the local
+cache is indistinguishable from a freshly loaded one — correct key, correct
+change-tracking baseline, `IsNew()` false, `OnLoad` invoked, and the *current*
+request's context. It is safe to mutate and `Put`:
+
+```go
+themes, _, _ := dsorm.Query[*Theme](ctx, client, q, "") // served locally
+themes[0].Name = "updated"
+client.Put(ctx, themes[0])                              // BeforeSave sees the right old value
+```
+
+**Bounded and observable.** A byte budget and an entry cap bound the cache
+(`MaxBytes` defaults to 32MiB, `MaxEntries` to 4096), tracked incrementally so
+the read path never scans. Concurrent identical misses collapse into one query.
+`client.LocalCacheStats()` reports per-kind hits, misses, evictions, and drops —
+a kind with a high eviction count is being squeezed out of the budget and will
+not hit well no matter how rarely it is written.
+
+The cache is dropped for a kind whenever it is written, and dropped entirely
+when the shared cache is flushed or loses a generation counter (a restart, a
+failover, an eviction) — in that case the client re-pins its last known counter,
+which is correct for the shared cache but would otherwise leave local entries
+reachable with data that outlived them. `LocalCacheConfig.TTL` (defaulting to
+the query cache TTL) is a backstop for the same case, not the primary
+invalidation mechanism.
+
+It requires `WithQueryCache`; without generation counters there is nothing to
+invalidate it, and it reports that through `WithOnErrorFunc` and stays off.
+
+### 10. Per-Request Generation Reads
+
+A page that queries five cached kinds still pays five round trips for five small
+integers. `dsorm.WithRequestScope` reads each kind's generation counter at most
+once per request, and `Client.PrefetchVersions` fetches them for several kinds
+in a single batch:
+
+```go
+func middleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        ctx := dsorm.WithRequestScope(r.Context())
+        client.PrefetchVersions(ctx, tenant, "Tenant", "Theme", "Plugin")
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+}
+```
+
+That takes a warm page from one round trip per kind to one per request. A kind
+that was not prefetched still works: its counter is read on first use and pinned
+from then on.
+
+The trade is explicit. Two queries of the same kind within one request see the
+same generation counter, so a write by another instance landing between them is
+not observed until the next request. In exchange the request is a consistent
+snapshot — a header and a footer rendering the same kind cannot disagree. The
+request's own writes are always visible: every write updates the pinned counter
+for the kinds it touched, and clears it if the counter could not be bumped. A
+scope older than 30 seconds stops pinning, so a context that outlives its
+request loses the optimization rather than serving stale data indefinitely.
 
 ## Configuration
 

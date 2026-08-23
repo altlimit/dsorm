@@ -107,6 +107,15 @@ func (q *QueryBuilder) Stream() *QueryBuilder {
 	return q
 }
 
+// clone returns a shallow copy of the builder. Query executes against a clone
+// so that running a query never mutates the caller's builder: Start and
+// KeysOnly write to it, and reusing a single package-level builder across
+// requests is the natural way to issue a repeated, cacheable query.
+func (q *QueryBuilder) clone() *QueryBuilder {
+	c := *q
+	return &c
+}
+
 // Data Getters for drivers
 func (q *QueryBuilder) Kind() string                { return q.kind }
 func (q *QueryBuilder) Filters() []ds.Filter        { return q.filters }
