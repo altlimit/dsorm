@@ -2,6 +2,8 @@ package cloudflare_test
 
 import (
 	"context"
+	"encoding/binary"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"testing"
@@ -57,6 +59,29 @@ func TestIncrement(t *testing.T) {
 	}
 	if got, err := c.Increment(ctx, "counter", -2, 0); err != nil || got != 6 {
 		t.Fatalf("decrement = %d, %v; want 6, nil", got, err)
+	}
+}
+
+func TestIncrementReadBack(t *testing.T) {
+	c := newTestCache(t)
+	ctx := context.Background()
+
+	for i, n := range []int64{1, 1284, 1793414972625, -7} {
+		key := fmt.Sprintf("readback%d", i)
+		if _, err := c.Increment(ctx, key, n, 0); err != nil {
+			t.Fatalf("incr %d: %v", n, err)
+		}
+		items, err := c.GetMulti(ctx, []string{key})
+		if err != nil {
+			t.Fatalf("GetMulti after incr %d: %v", n, err)
+		}
+		it := items[key]
+		if it == nil || it.Flags != 0 || len(it.Value) != 8 {
+			t.Fatalf("GetMulti after incr %d = %+v; want 8-byte value, no flags", n, it)
+		}
+		if got := int64(binary.LittleEndian.Uint64(it.Value)); got != n {
+			t.Errorf("read back %d; want %d", got, n)
+		}
 	}
 }
 

@@ -3,6 +3,7 @@ package redis_test
 import (
 	"context"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -35,6 +36,7 @@ func TestRedisCache(t *testing.T) {
 
 	t.Run("TestNewCache", NewCacheTest())
 	t.Run("TestIncrement", IncrementTest())
+	t.Run("TestIncrementReadBack", IncrementReadBackTest())
 }
 
 func NewCacheTest() func(t *testing.T) {
@@ -120,5 +122,38 @@ func IncrementTest() func(t *testing.T) {
 
 		// Cleanup
 		vClient.Do(ctx, vClient.B().Del().Key("test:incr").Build())
+	}
+}
+
+// IncrementReadBackTest checks that a counter written by Increment reads back
+// through GetMulti as its decimal text, whatever its length. Counters have no
+// flags header, so stripping one used to error on short values and truncate
+// longer ones.
+func IncrementReadBackTest() func(t *testing.T) {
+	return func(t *testing.T) {
+		if goodClient == nil {
+			t.Skip("no redis client")
+		}
+		ctx := context.Background()
+		const key = "test:incr:readback"
+
+		for _, n := range []int64{1, 1284, 1793414972625, -7} {
+			_ = goodClient.DeleteMulti(ctx, []string{key})
+			if _, err := goodClient.Increment(ctx, key, n, time.Minute); err != nil {
+				t.Fatalf("Increment %d failed: %v", n, err)
+			}
+			items, err := goodClient.GetMulti(ctx, []string{key})
+			if err != nil {
+				t.Fatalf("GetMulti after Increment %d failed: %v", n, err)
+			}
+			it := items[key]
+			if it == nil {
+				t.Fatalf("GetMulti after Increment %d: missing item", n)
+			}
+			if want := strconv.FormatInt(n, 10); string(it.Value) != want || it.Flags != 0 {
+				t.Errorf("read back flags=%d value=%q; want flags=0 value=%q", it.Flags, it.Value, want)
+			}
+		}
+		_ = goodClient.DeleteMulti(ctx, []string{key})
 	}
 }

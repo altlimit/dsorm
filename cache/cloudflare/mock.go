@@ -151,13 +151,21 @@ func (m *mockStore) dispatch(tenant, op string, req *batchRequest) (*batchRespon
 		}
 
 	case opIncrement:
+		// Counters are stored like any other item: a zero flags header followed
+		// by the 8-byte little-endian value. A bare 8-byte value is the
+		// pre-header layout and is still accepted.
 		var n int64
-		if e, ok := bucket[req.Key]; ok && !e.expired(now) && len(e.blob) == 8 {
-			n = int64(binary.LittleEndian.Uint64(e.blob))
+		if e, ok := bucket[req.Key]; ok && !e.expired(now) {
+			switch len(e.blob) {
+			case 12:
+				n = int64(binary.LittleEndian.Uint64(e.blob[4:]))
+			case 8:
+				n = int64(binary.LittleEndian.Uint64(e.blob))
+			}
 		}
 		n += req.Delta
-		blob := make([]byte, 8)
-		binary.LittleEndian.PutUint64(blob, uint64(n))
+		blob := make([]byte, 12)
+		binary.LittleEndian.PutUint64(blob[4:], uint64(n))
 		entry := mockEntry{blob: blob}
 		if req.TTLMs > 0 {
 			entry.expireAt = expiryFrom(now, req.TTLMs)

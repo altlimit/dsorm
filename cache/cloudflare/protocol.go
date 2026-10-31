@@ -15,7 +15,8 @@ import "encoding/binary"
 // A stored value ("blob") is the same wire layout the other dsorm cache
 // backends use: a 4-byte little-endian uint32 flags header followed by the
 // raw value bytes. The Durable Object treats blobs as opaque except for the
-// increment op, which interprets the value as an 8-byte little-endian int64.
+// increment op, which interprets the value as an 8-byte little-endian int64
+// and stores it behind a zero flags header.
 const (
 	opGet       = "get"
 	opSet       = "set"

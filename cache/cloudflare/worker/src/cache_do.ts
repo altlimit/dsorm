@@ -12,7 +12,7 @@ import { DurableObject } from "cloudflare:workers";
  *
  * Stored values ("blobs") are opaque to the DO (a 4-byte LE flags header plus
  * the value bytes, produced by the Go client) except for `incr`, which treats
- * the value as an 8-byte little-endian int64. Blobs travel as base64 strings
+ * the value as an 8-byte little-endian int64 behind a zero flags header. Blobs travel as base64 strings
  * because the Go client encodes []byte as base64 JSON.
  */
 type CacheEnv = Record<string, unknown>;
@@ -225,21 +225,28 @@ function expiryFrom(now: number, ttlMs?: number): number | null {
   return ttlMs && ttlMs > 0 ? now + ttlMs : null;
 }
 
-/** Decode a base64 blob as an 8-byte little-endian int64; 0 if not 8 bytes. */
+/**
+ * Decode a counter blob: a 4-byte flags header followed by an 8-byte
+ * little-endian int64. A bare 8-byte value, as written before the header was
+ * added, is also accepted. Anything else decodes as 0.
+ */
 function readLE64(b64: string): bigint {
-  const bytes = base64ToBytes(b64);
+  let bytes = base64ToBytes(b64);
+  if (bytes.length === 12) bytes = bytes.subarray(4);
   if (bytes.length !== 8) return 0n;
   let n = 0n;
   for (let i = 7; i >= 0; i--) n = (n << 8n) | BigInt(bytes[i]);
   return BigInt.asIntN(64, n);
 }
 
-/** Encode an int64 as a base64 8-byte little-endian blob. */
+/**
+ * Encode an int64 as a counter blob: a zero flags header followed by the
+ * 8-byte little-endian value, so a get returns it like any other item.
+ */
 function writeLE64(n: bigint): string {
-  const u = BigInt.asUintN(64, n);
-  const bytes = new Uint8Array(8);
-  let v = u;
-  for (let i = 0; i < 8; i++) {
+  const bytes = new Uint8Array(12);
+  let v = BigInt.asUintN(64, n);
+  for (let i = 4; i < 12; i++) {
     bytes[i] = Number(v & 0xffn);
     v >>= 8n;
   }

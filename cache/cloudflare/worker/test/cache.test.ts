@@ -65,6 +65,14 @@ describe("CacheDO contract", () => {
     expect((await op("t5", "incr", { key: "c", delta: -10 })).value).toBe(-2);
   });
 
+  it("increment stores the counter behind a zero flags header", async () => {
+    await op("t6", "incr", { key: "c", delta: 1284 });
+    const got = await op("t6", "get", { keys: ["c"] });
+    const bytes = Uint8Array.from(atob(got.items[0].b), (ch) => ch.charCodeAt(0));
+    // [4-byte flags = 0][8-byte LE int64 = 1284]
+    expect(Array.from(bytes)).toEqual([0, 0, 0, 0, 0x04, 0x05, 0, 0, 0, 0, 0, 0]);
+  });
+
   it("tenants are isolated", async () => {
     await op("ta", "set", { items: [{ k: "shared", b: b64("a") }] });
     await op("tb", "set", { items: [{ k: "shared", b: b64("b") }] });

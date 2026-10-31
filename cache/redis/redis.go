@@ -387,6 +387,17 @@ func (b *backend) GetMulti(ctx context.Context, keys []string) (map[string]*dsor
 			continue
 		}
 
+		// Counters written by Increment are raw INCRBY integers with no flags
+		// header. A stored item always starts with the header, whose bytes are
+		// never all ASCII digits for the flags dsorm uses, so the two can't be
+		// confused.
+		if isInteger(cacheItem) {
+			dsoItem := &dsorm.Item{Key: key, Value: cacheItem}
+			dsoItem.SetCASInfo(append([]byte(nil), cacheItem...))
+			result[key] = dsoItem
+			continue
+		}
+
 		if got := len(cacheItem); got < 4 {
 			me[i] = fmt.Errorf("redis: cached item should be atleast 4 bytes, got %d", got)
 			hasErr = true
@@ -416,6 +427,22 @@ func (b *backend) GetMulti(ctx context.Context, keys []string) (map[string]*dsor
 		return result, me
 	}
 	return result, nil
+}
+
+// isInteger reports whether b is a decimal integer as Redis INCRBY stores it.
+func isInteger(b []byte) bool {
+	if len(b) > 0 && b[0] == '-' {
+		b = b[1:]
+	}
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *backend) Increment(ctx context.Context, key string, delta int64, expiration time.Duration) (int64, error) {
