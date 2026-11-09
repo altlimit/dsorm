@@ -3,6 +3,7 @@ package cloudflare_test
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/http/httptest"
 	"os"
@@ -44,6 +45,26 @@ func TestNewCacheValidation(t *testing.T) {
 				t.Errorf("NewCache(%q) err = %v, wantErr %v", tt.url, err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestDeleteMissingKeyIsCacheMiss(t *testing.T) {
+	c := newTestCache(t)
+	ctx := context.Background()
+
+	if err := c.DeleteMulti(ctx, []string{"missing"}); !errors.Is(err, ds.ErrCacheMiss) {
+		t.Errorf("DeleteMulti(missing) = %v, want ds.ErrCacheMiss", err)
+	}
+
+	// A partial delete is still a miss, and the present key is still removed.
+	if err := c.SetMulti(ctx, []*ds.Item{{Key: "present", Value: []byte("v")}}); err != nil {
+		t.Fatalf("SetMulti: %v", err)
+	}
+	if err := c.DeleteMulti(ctx, []string{"present", "missing"}); !errors.Is(err, ds.ErrCacheMiss) {
+		t.Errorf("DeleteMulti(present, missing) = %v, want ds.ErrCacheMiss", err)
+	}
+	if items, err := c.GetMulti(ctx, []string{"present"}); err != nil || len(items) != 0 {
+		t.Errorf("GetMulti after delete = %v, %v; want empty, nil", items, err)
 	}
 }
 

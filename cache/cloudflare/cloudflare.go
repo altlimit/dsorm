@@ -311,7 +311,7 @@ func (b *backend) DeleteMulti(ctx context.Context, keys []string) error {
 		removed += resp.Count
 	}
 	if removed != len(keys) {
-		return fmt.Errorf("cloudflare: expected to remove %d keys, but only removed %d", len(keys), removed)
+		return fmt.Errorf("cloudflare: expected to remove %d keys, but only removed %d: %w", len(keys), removed, dsorm.ErrCacheMiss)
 	}
 	return nil
 }

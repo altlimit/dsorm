@@ -346,7 +346,7 @@ func (b *backend) DeleteMulti(ctx context.Context, keys []string) error {
 		return err
 	}
 	if num != int64(len(keys)) {
-		return fmt.Errorf("redis: expected to remove %d keys, but only removed %d", len(keys), num)
+		return fmt.Errorf("redis: expected to remove %d keys, but only removed %d: %w", len(keys), num, dsorm.ErrCacheMiss)
 	}
 	return nil
 }

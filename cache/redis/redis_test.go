@@ -2,6 +2,7 @@ package redis_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strconv"
 	"testing"
@@ -37,6 +38,17 @@ func TestRedisCache(t *testing.T) {
 	t.Run("TestNewCache", NewCacheTest())
 	t.Run("TestIncrement", IncrementTest())
 	t.Run("TestIncrementReadBack", IncrementReadBackTest())
+	t.Run("TestDeleteMissingKey", DeleteMissingKeyTest())
+}
+
+func DeleteMissingKeyTest() func(t *testing.T) {
+	return func(t *testing.T) {
+		ctx := context.Background()
+		key := "delete-missing-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+		if err := goodClient.DeleteMulti(ctx, []string{key}); !errors.Is(err, dso.ErrCacheMiss) {
+			t.Errorf("DeleteMulti(missing) = %v, want ds.ErrCacheMiss", err)
+		}
+	}
 }
 
 func NewCacheTest() func(t *testing.T) {

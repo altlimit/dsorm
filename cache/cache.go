@@ -9,6 +9,7 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -26,7 +27,8 @@ type Cache interface {
 	// Set stores a single item in the cache with the given expiration.
 	Set(ctx context.Context, key string, value []byte, expiration time.Duration) error
 
-	// Delete removes a single key from the cache.
+	// Delete removes a single key from the cache. If the key is not found, the
+	// returned error matches ds.ErrCacheMiss under errors.Is on every backend.
 	Delete(ctx context.Context, key string) error
 
 	// Increment atomically increments a key's integer value by delta.
@@ -85,7 +87,14 @@ func (w *wrapper) Set(ctx context.Context, key string, value []byte, expiration 
 }
 
 func (w *wrapper) Delete(ctx context.Context, key string) error {
-	return w.c.DeleteMulti(ctx, []string{key})
+	err := w.c.DeleteMulti(ctx, []string{key})
+	// Some backends report per-key errors in a MultiError, which errors.Is can't
+	// see into. With only one key, its error is the whole result.
+	var me ds.MultiError
+	if errors.As(err, &me) && len(me) == 1 {
+		return me[0]
+	}
+	return err
 }
 
 func (w *wrapper) Increment(ctx context.Context, key string, delta int64, expiration time.Duration) (int64, error) {
