@@ -92,9 +92,10 @@ func (c *Client) Mutate(ctx context.Context, muts ...*Mutation) ([]*datastore.Ke
 		lockCacheItems = append(lockCacheItems, moreLockCacheItems...)
 
 		defer func() {
-			// Optimistcally remove the locks.
+			// Optimistically remove the locks. One already gone is fine
+			// (onlyCacheMisses).
 			if err := c.cacher.DeleteMulti(ctx,
-				releaseCacheKeys); err != nil {
+				releaseCacheKeys); err != nil && !onlyCacheMisses(err) {
 				c.onError(ctx, errors.Wrap(err, "Mutate cache.DeleteMulti"))
 			}
 		}()

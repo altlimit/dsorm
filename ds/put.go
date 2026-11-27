@@ -126,9 +126,9 @@ func (c *Client) putMulti(ctx context.Context,
 		lockCacheKeys, lockCacheItems := getCacheLocks(c.cachePrefix, keys)
 
 		defer func() {
-			// Remove the locks.
+			// Remove the locks. One already gone is fine (onlyCacheMisses).
 			if err := c.cacher.DeleteMulti(ctx,
-				lockCacheKeys); err != nil {
+				lockCacheKeys); err != nil && !onlyCacheMisses(err) {
 				c.onError(ctx, errors.Wrap(err, "putMulti cache.DeleteMulti"))
 			}
 		}()
