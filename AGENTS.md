@@ -300,3 +300,9 @@ Run all tests (requires Docker Compose for emulator + Redis):
 cd test && docker compose up -d
 cd .. && go test -v ./...
 ```
+
+The Redis backend also has cluster-mode tests (`cache/redis/cluster_test.go`),
+run when `REDIS_CLUSTER_ADDR` points at a cluster node; the file shows how to
+start a one-node cluster. Keep them passing: a cluster client refuses any single
+command whose keys hash to different slots, so a multi-key operation must be
+sent as one command per key through `DoMulti`, never as one `MGET` or `DEL`.

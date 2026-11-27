@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -340,10 +341,21 @@ func (b *backend) DeleteMulti(ctx context.Context, keys []string) error {
 	default:
 	}
 
-	resp := b.client.Do(ctx, b.client.B().Del().Key(keys...).Build())
-	num, err := resp.AsInt64()
-	if err != nil {
-		return err
+	// One DEL per key, pipelined, rather than one DEL naming every key: a
+	// cluster client refuses a command whose keys sit in different slots, and
+	// unrelated keys almost never share one. DoMulti sends the batch in one round
+	// trip to a single server and fans it out by node on a cluster.
+	cmds := make(valkey.Commands, 0, len(keys))
+	for _, key := range keys {
+		cmds = append(cmds, b.client.B().Del().Key(key).Build())
+	}
+	var num int64
+	for _, resp := range b.client.DoMulti(ctx, cmds...) {
+		n, err := resp.AsInt64()
+		if err != nil {
+			return err
+		}
+		num += n
 	}
 	if num != int64(len(keys)) {
 		return fmt.Errorf("redis: expected to remove %d keys, but only removed %d: %w", len(keys), num, dsorm.ErrCacheMiss)
@@ -362,14 +374,17 @@ func (b *backend) GetMulti(ctx context.Context, keys []string) (map[string]*dsor
 	default:
 	}
 
-	resp := b.client.Do(ctx, b.client.B().Mget().Key(keys...).Build())
-	results, err := resp.ToArray()
-	if err != nil {
-		return nil, err
+	// One GET per key, pipelined, rather than an MGET: a cluster client refuses a
+	// command whose keys sit in different slots (it panics before sending), and
+	// unrelated keys almost never share one. DoMulti sends the batch in one round
+	// trip to a single server and fans it out by node on a cluster.
+	cmds := make(valkey.Commands, 0, len(keys))
+	for _, key := range keys {
+		cmds = append(cmds, b.client.B().Get().Key(key).Build())
 	}
-
-	if len(results) != len(keys) {
-		return nil, fmt.Errorf("redis: len(results) != len(keys) (%d != %d)", len(results), len(keys))
+	resps := b.client.DoMulti(ctx, cmds...)
+	if len(resps) != len(keys) {
+		return nil, fmt.Errorf("redis: len(results) != len(keys) (%d != %d)", len(resps), len(keys))
 	}
 
 	result := make(map[string]*dsorm.Item)
@@ -377,7 +392,7 @@ func (b *backend) GetMulti(ctx context.Context, keys []string) (map[string]*dsor
 	hasErr := false
 
 	for i, key := range keys {
-		cacheItem, err := results[i].AsBytes()
+		cacheItem, err := resps[i].AsBytes()
 		if err != nil {
 			if valkey.IsValkeyNil(err) {
 				continue // cache miss, skip
@@ -475,5 +490,17 @@ func (b *backend) Flush(ctx context.Context) error {
 		return ctx.Err()
 	default:
 	}
-	return b.client.Do(ctx, b.client.B().Flushdb().Build()).Error()
+	if b.client.Mode() != valkey.ClientModeCluster {
+		return b.client.Do(ctx, b.client.B().Flushdb().Build()).Error()
+	}
+	// A cluster's keys are spread over its primaries, and a command without a
+	// key goes to just one node, so flush each node. A replica refuses the write
+	// (READONLY) and follows its primary's flush anyway.
+	for addr, node := range b.client.Nodes() {
+		err := node.Do(ctx, node.B().Flushdb().Build()).Error()
+		if err != nil && !strings.HasPrefix(err.Error(), "READONLY") {
+			return fmt.Errorf("redis: flush %s: %w", addr, err)
+		}
+	}
+	return nil
 }

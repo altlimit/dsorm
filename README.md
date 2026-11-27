@@ -29,7 +29,7 @@ go get github.com/altlimit/dsorm
 
 Initialize the client with your context. `dsorm` automatically detects the best cache backend:
 - **App Engine**: Uses Memcache.
-- **Redis (`REDIS_ADDR` env)**: Uses Redis.
+- **Redis (`REDIS_ADDR` env)**: Uses Redis. A standalone server and a Redis Cluster (for example Memorystore for Redis Cluster) both work; a cluster is detected on connect.
 - **Default**: Uses in-memory cache.
 
 ```go
